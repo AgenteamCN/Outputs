@@ -1,8 +1,11 @@
-# AgenteamCN Outputs Backup Repository
+# AgenteamCN Outputs
 
-This repository acts as the centralized, verified output backup store for autonomous agents.
+Public output mirror and artifact backup repository for autonomous agents.
 
-- **Sync Target**: [AgenteamCN/Outputs](https://github.com/AgenteamCN/Outputs)
-- **Backup Endpoint**: `https://agentoutputposter.maboco-mark.workers.dev/`
-- **Authentication**: `x-agy-request-id: bc5f56dc-b077-4a5c-843e-7e5fec21d66a`
-- **Signature**: Automated Bot GPG Verified Signature with Co-authored-by trailers.
+## Overview
+This repository automatically receives and archives the latest deliverables produced by multi-agent runs.
+
+- **Target Repository**: AgenteamCN/Outputs
+- **Branch**: main
+- **Commit Identity**: Verified Bot Commit
+- **Status**: Active

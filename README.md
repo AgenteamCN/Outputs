@@ -1,107 +1,69 @@
-# Radar 输出格式重构与体积警报分级设计报告
+# 修复报告：统一红色复制按钮为 "Copy Raw" 并保障原始敏感信息原样复制
 
-## 1. 任务背景与核心痛点
-在原有 `scripts/radar.ts` 架构守卫检查中：
-1. **冗余噪音过大**：每个超过软阈值（12KB / 400L）的文件都会打印一遍长达数百字符的拆分规范说明。当多个文件触发时，长达上千行的重复文案导致 CI 日志刷屏，且淹没了关键的文件路径与体积数据。
-2. **文案歧义与缺乏分级**：提示文案统一标记为 `modified file notice(s)`，未明确区分增量检测与全量扫描；同时缺少将 **拦截级硬报错（Hard Limit Exceeded）** 与 **非拦截级软提示（Soft Info Notices）** 清晰分层聚合的展示机制。
+## 1. 问题根因分析
 
----
+在最近的提交中，针对任务输入复制功能存在以下几个核心问题：
 
-## 2. 方案实现与架构调整
+1. **按钮文案不统一**：
+   - Composer 界面红色按钮为 `"Copy Input to Clipboard"`。
+   - Inspector 界面红色按钮为 `"Copy Real Input"`。
+   - 用户期望将带有危险警示色（红底 `primer-btn-danger`）的原生复制按钮统一命名为 **"Copy Raw"**，明确传达“此按钮代表用户完全知情、将不经脱敏直接复制原始完整内容”的语义。
 
-### 2.1 数据结构解耦 (`scripts/radar/radarConstantsAndFs.ts`)
-引入专用的 `FileVolumeMeta` 接口，并在 `RadarScanResult` 中显式分离硬性体积违规与软性通知：
-```typescript
-export interface FileVolumeMeta {
-  rel: string;
-  byteSize: number;
-  kbFormatted: string;
-  lineCount: number;
-  exceedsHardLine: boolean;
-  exceedsHardByte: boolean;
-}
+2. **用户 Prompt 正文中形似 Key/Token 的内容被误隐藏**：
+   - 之前在 `parsePromptWithGithubAuth` 中对截取出的 `remainder`（即用户输入正文）调用了 `redactInlinePrivateKeys`。
+   - `redactInlinePrivateKeys` 随后被挂接到了 `redactSensitiveText`，导致用户输入正文中的 GitHub Token (`ghp_...`)、Worker Token (`bk_...`)、JWT (`eyJ...`)、URL 参数密钥 (`?key=...`) 等全部被强制替换成了 `[REDACTED_...]`。
+   - 当点击红色复制按钮时，虽然前面的 `# 1. Auth Configuration` 恢复了真实的认证凭据，但正文中的密钥却依然被脱敏覆盖，导致实际外发的内容被破坏。
 
-export interface RadarScanResult {
-  errors: string[];
-  hardCeilingViolations: FileVolumeMeta[];
-  softLimitNotices: FileVolumeMeta[];
-  tsCount: number;
-  jsCount: number;
-  subsystemStats: Map<string, SubsystemCount>;
-  tsResult: TypeScriptCheckResult;
-}
-```
+3. **无 Auth 场景下逻辑拧巴**：
+   - 原 Inspector 红色复制按钮判断 `if (!parsedInput.hasGithubAuth)` 时直接返回 `baseText`。
+   - 但因为此前入库 `TaskRecord.fullPrompt` 时也经过了 `formattedDisplayPrompt` 脱敏处理，导致无 GitHub Auth 的任务在普通复制和红色复制时均被误脱敏。
+   - 实际上红色按钮的职责非常明确纯粹：**无论任务是否包含 GitHub Auth，用户发出去什么内容，红色按钮就原封不动地复制什么内容**（包含 GitHub Auth 时完整拼接未经脱敏的用户正文与真实凭据；不包含时直接输出用户原始正文，零脱敏）。
 
-### 2.2 聚合扫描与降序排序 (`scripts/radar.ts`)
-1. **聚合分类**：在文件遍历阶段，体积超标的逻辑分支将违规对象分别注入 `hardCeilingViolations` 与 `softLimitNotices`。
-2. **体积降序**：对两个列表均按 `byteSize` 降序（相等时按 `lineCount` 降序）排序，优先暴露出最接近或超出上限的临界模块。
-3. **两列对齐输出**：实现 `formatVolumeList` 辅助方法，统一计算路径最大宽度（`padEnd`），输出整洁的 `- <path>  (<size> KB, <lines> lines)`。
-4. **统一指引提炼**：拆分指导建议仅在各自 Section 顶部打印一次，彻底根除 90+ 次冗余长句复制。
+4. **超大文件拆分与解耦**：
+   - `TaskComposerView.tsx` 原为 938 行（34KB+），`TaskInspectorView.tsx` 原为 665 行（22KB+），超出了单一职责及避免超大文件（600~800 行、12~16KB+）的工程要求。
 
 ---
 
-## 3. 多场景实机验证
+## 2. 核心修改与架构解耦
 
-### 场景 1：全仓纯净态扫描 (`pnpm check`)
-```text
-======================================================================
- ROCKET COMPANION GEN-3 SEMANTIC ARCHITECTURE RADAR (8226ms)
-======================================================================
- TypeScript Coverage : 1350/1350 files (100.0% TS | 0 Engine JS remaining)
- TypeScript Strict   : PASS ("/work/RocketCompanion/node_modules/.bin/tsc" --noEmit)
- Volume Guardrails   : SoftInfo=400L/12KB | HardError=800L/18KB | MaxLine<=400chars
- Hard Boundaries     : 0 Circular Deps | 0 Value Re-Exports | 0 Upward Imports | Any<=5
- Anti-Fake-Split     : 0 Multi-Stmt Lines | HostPen<=105 | PassThru<=40 (4 audit targets; pass --audit)
- Engine Subsystems   : src(1ts), ai(20ts), audio(38ts), camera(11ts), effects(8ts), entities(103ts), game(160ts), input(3ts), loader(10ts), network(96ts), physics(23ts), replay(106ts), utils(3ts)
- UI Subsystems       : entry(2ts), ui-core(533ts), ui-system(20ts), ui-tuner(213ts)
-----------------------------------------------------------------------
- INFO (Non-blocking) : 442 existing file(s) in 12KB..18KB / 400..800L range — Status: ACCEPTABLE (pass --all-info to list).
-----------------------------------------------------------------------
- STATUS: GREEN -- 100% TS, tsc --noEmit clean, hard boundaries & volume caps verified.
-======================================================================
-```
+### 2.1 修复 `githubAuthBlock.ts` 避免正文误脱敏
+- 修改 `parsePromptWithGithubAuth`：不再对 `remainder` 或 `safeRaw` 调用 `redactInlinePrivateKeys`。返回的 `userBody` 保持 100% 原始正文内容。
+- 新增并导出 `buildRawPromptWithAuth(prompt, includeGithubAuth, authBlock)` 工具函数：
+  - 若任务包含 GitHub Auth 或勾选了插入凭据，按结构提取未经任何脱敏破坏的 `userBody`，与真实的 `authBlock` 完整拼接后输出；
+  - 若任务不包含 GitHub Auth，直接返回纯原始正文，不做任何脱敏替换。
 
-### 场景 2：触发软阈值提示（`pnpm run radar --all-info` 或修改文件）
-说明指引单次输出，列表按体积降序规整对齐，退出状态码为 `0`：
-```text
-[-] INFO: Volume Soft Threshold Notices (Status: ACCEPTABLE — 442 files):
-    Files exceeding soft bounds (> 12.0 KB or > 400 lines). Non-blocking.
-    Refactoring guidance: No immediate action required. Do NOT artificially compress
-    code or shorten names. If adding features later, split by domain/pure pipelines.
+### 2.2 统一红色复制按钮为 "Copy Raw"
+- **TaskComposerView**：
+  - 红色按钮统一改名为 `"Copy Raw"`（点击后显示 `"Copied"` 1.5s）。
+  - 处理函数更新为 `handleCopyRawToClipboard`，使用 `buildRawPromptWithAuth` 产出完整 Raw Prompt。
+- **TaskInspectorView**：
+  - 红色按钮统一改名为 `"Copy Raw"`（点击后显示 `"Copied"` 1.5s）。
+  - 保留普通白色按钮 `"Copy Input"` 负责复制截屏视图 (`formattedDisplayPrompt`)。
 
-    - src/game/modes/FreeplayMode.ts                                                          (17.9 KB, 433 lines)
-    - src/ui-core/stores/quickNotificationStore.ts                                            (17.4 KB, 500 lines)
-    - src/ui-tuner/components/review/RapidReviewTriageBar.tsx                                 (17.3 KB, 452 lines)
-    - src/ui-tuner/components/review/reviewLedgerStore.ts                                     (17.1 KB, 519 lines)
-...
-----------------------------------------------------------------------
- STATUS: GREEN -- 100% TS, tsc --noEmit clean, hard boundaries & volume caps verified.
-======================================================================
-```
-
-### 场景 3：硬阈值违规拦截注入测试（模拟超过 18KB / 800L）
-雷达精准拦截，报告置顶标红，退出状态码为 `1`：
-```text
-[!] ERROR: Hard Limit Exceeded (Status: NOT ACCEPTABLE — 1 file):
-    Violations exceed hard ceilings (> 18.0 KB or > 800 lines). Build rejected.
-    Action required: Must split strictly by functional domain, pure logic pipeline,
-    or independent UI Slot before commit.
-
-    - src/game/modes/FreeplayMode.ts (27.5 KB, 934 lines)
-----------------------------------------------------------------------
- STATUS: FAILED -- Build rejected due to architecture or volume violations.
-======================================================================
-```
-
-### 场景 4：硬报错与软提示共存测试
-硬性错误置顶拦截，软性提示紧随其后统揽，状态码严格为 `1`。
+### 2.3 模块化解耦超大组件
+1. **抽离 `TaskInputSnapshotPanel.tsx`**（位于 `src/components/inspector/`）：
+   - 将 Inspector 的 Raw Snapshot Box（包含状态 Badge、普通 `Copy Input`、红色 `Copy Raw`、以及展示 pre 文本）解耦至独立组件中。
+   - `TaskInspectorView.tsx` 行数从 665 行精简至 **529 行**，远低于 600 行警戒线。
+2. **抽离 `TaskComposerCollapsedSettings.tsx`**（位于 `src/components/composer/`）：
+   - 将 Composer 在右侧栏收起状态下的紧凑标题与 Tag Presets 区域抽离为独立组件。
+   - `TaskComposerView.tsx` 行数从 938 行精简至 **799 行**。
 
 ---
 
-## 4. Git 提交、PR 与自动化合并信息
-- **工作分支**：`z/agy/rc/radar-output-compact`
-- **提交方式**：GitHub Verified Bot Commit (`verified: true`)
-- **Commit SHA**：`17303919aa9c8acf61d13568412dfdac29d4b35a`
-- **Pull Request**：[#7](https://github.com/Antigravi-ty/RocketCompanion/pull/7)
-- **合并状态**：已合并至主基准分支 `alpha`（Merge commit: `f5e8c9f8de5e901c3278fd88e2d872eef9784ceb`）
-- **CI 验证**：`pnpm check`（`radar` + `typecheck`）100% 通过。
+## 3. 验证与测试
+
+- **单元逻辑验证**：
+  - 测试正文包含 `ghp_...`、`bk_...`、`?key=...` 且无 Auth 场景：`parsePromptWithGithubAuth` 严格保留原始未脱敏正文；`buildRawPromptWithAuth` 返回完整无脱敏字符串。
+  - 测试正文包含 `[REDACTED_GITHUB_AUTH_AND_COMMIT_PREFERENCE]` 场景：`buildRawPromptWithAuth` 正确将真实认证块与完整未脱敏正文拼接。
+  - 测试正文包含完整 `# 1. Auth Configuration` 块场景：`buildRawPromptWithAuth` 保持完整原样。
+- **生产构建验证**：
+  - 执行 `pnpm build`：TypeScript 严格类型检查与 Vite 生产打包 100% 通过（2231 modules transformed，0 errors）。
+
+---
+
+## 4. GitHub Verified Bot Commit 信息
+
+- **Commit SHA**: `1ad46ab21cbd6d3f56e8bd1977bda6893755f8d1`
+- **Branch**: `a2`
+- **Verified Signature**: `true` (`antigravity-fine-grained-token[bot]`)
+- **Co-authored-by**: `Mark <29165094+MaBoCoMark@users.noreply.github.com>`

@@ -1,2 +1,2 @@
-# Concurrent Test Output from worker thread 1
+# Concurrent Test Output from worker thread 2
 Timestamp: test run

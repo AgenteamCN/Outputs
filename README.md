@@ -1,256 +1,236 @@
-# RocketCompanion Rust 分支同步与音频/重放/并行架构深度调研报告
+# RocketCompanion 主分支同步、音频计算全量 Offload 与架构演进调查报告
 
-**基准提交 (HEAD)**: `2cb143b4a794f440c98a90e64ab2985fe5fdb9a7` (Tier-2 Octopus Merge)  
-**合并主分支 (alpha)**: `1facf976a06b38f56958c052b372a68c2ed9a9ca` (PR #1 ~ #6)  
-**当前工作分支**: `z/agy/rc/rust/sync-main-audio-plan`  
-**GitHub Verified Bot Commit**: `b26d3287295714c16f4f5f69d373498b963d6e70` (GPG Signed, `verified: true`)  
-
----
-
-## 目录
-1. [主分支同步与冲突解决总结](#1-主分支同步与冲突解决总结)
-2. [工程验证与构建状态](#2-工程验证与构建状态)
-3. [重放 (Replay) 体系深度调研：TS 实现与 Boxcars 对比](#3-重放-replay-体系深度调研ts-实现与-boxcars-对比)
-4. [音频引擎架构深度剖析与 Rust 离载方案](#4-音频引擎架构深度剖析与-rust-离载方案)
-   - 4.1 滚地异常异响根本原因与表面法向量/冲量判定重构
-   - 4.2 引擎动力总成 (Powertrain) 与粒子粒度合成离载
-   - 4.3 终极音频架构：Rust 物理驱动 + WebAudio 哑端渲染
-5. [高效并行分支重建方案 (Tier-3 架构路线)](#5-高效并行分支重建方案-tier-3-架构路线)
-6. [跨团队职责与边界划分矩阵](#6-跨团队职责与边界划分矩阵)
+> **执行基准 Commit**: `2cb143b` (`origin/z/agy/rc/rust/t2-sp-octopus-merge`)  
+> **合并目标分支**: `origin/alpha` (`1facf97`)  
+> **工作分支**: `z/agy/rc/rust/sync-main-audio-investigate`  
+> **合并结果 Commit**: `f64c3b8` (GitHub Verified Bot Commit, Signed by App)  
+> **验证状态**: `pnpm check` (100% TS, 0 errors), `pnpm build:wasm:check` (Rust WASM 6 crates clean), `node scripts/buildPhysicsWasm.mjs --dev` (compiled in 14.9s)
 
 ---
 
-## 1. 主分支同步与冲突解决总结
+## 1. 主分支同步与冲突裁决复盘 (Merge & Alignment Retrospective)
 
-主分支（`origin/alpha`）近期的核心演进（PR #1 ~ PR #6）集中在 UI 重构、Tauri 桌面集成、多人房间复现机制、Boxcars 重放对齐以及性能加速调优器。本次已按照无历史包袱、先进技术优先的原则完成完整合并。
+主分支 `origin/alpha` 在 PR #1 到 PR #6 期间合入了大量关键特性与底层修复。本次通过标准 Git 3-Way Merge（保留完整 DAG 追溯历史，严禁 rebase）将主分支全部改动吸收到 Rust 演进分支，并对冲突进行了严格的架构级裁决。
 
-### 1.1 冲突解决与代码取舍
-在 `git merge origin/alpha --no-commit` 过程中，定位并解决了以下三个冲突点及相关依赖项：
-
-1. **`package.json` 脚本融合**
-   - **HEAD (Rust WASM)**: 保留 `build:wasm`、`build:wasm:dev`、`build:wasm:check` 以及 build/test 过程中的 `--if-missing` WASM 自动前置检查。
-   - **origin/alpha**: 吸纳 Tauri v2 体系专属脚本 (`tauri:dev`, `tauri:dev:tray`, `tauri:build`, `tauri:icons`) 以及多人房间复现脚本 `repro:multiplayer-room`。
-   - **结果**: 完美整合两端命令，开发者既能调试 Tauri 托盘与桌面窗口，也能无缝构建 Rust WASM 内核。
-
-2. **`src/entities/trajectory/BallTrajectorySamplingController.ts`**
-   - **取舍**: 采纳主分支（`origin/alpha`）中关于连续增量追帧与全量重算下的窗口坍缩逻辑（`isIncWindow ? (shouldCollapseToCatchup ? Math.min(...) : stepVisible) : actualCount`），避免了旧版本在剧烈击球碰撞或重置时预测曲线突跳的视觉伪影。
-
-3. **`src/network/bot/BotInferenceWorker.ts` (Modify/Delete 冲突)**
-   - **决策**: 执行 `git rm src/network/bot/BotInferenceWorker.ts`。
-   - **原因**: HEAD 在 Tier-2 阶段（commit `454ce0f`）已将所有 Heuristic / Kickoff PPO / Botpack / EARL Perceiver 推理完全切至 Rust 侧 `crates/rc_bot_ai` 的 `BotDirector`，移除了独立 WebWorker 开销。该 TS 文件的删除符合架构精简和全面 Rust 化的方向。
-
-4. **主分支引入的潜在缺陷修复**
-   - **`src/game/scenario/multiplayerRoomReproHostFlowPipeline.ts`**: 主分支代码仍尝试从已废弃的 TS 文件导入 `ensureExperimentalEngine`，已纠正为从 `src/ai/BotWeightLoader.ts` 导入。
-   - **`scripts/vite/gitHeadAutoRestartPlugin.ts`**: 主分支在重构 git head 监听时遗漏了 `baselineSignature` 变量声明，导致客户端拉取 `/__rc_git_head` 接口时 500 报错并引发死循环刷新。本次已补齐 `baselineSignature` 的完整生命周期跟踪与复位。
-
----
-
-## 2. 工程验证与构建状态
-
-所有改动均在沙盒规范下严格验证：
-
-- **Radar 架构守护与全量类型检查**:
-  ```bash
-  $ pnpm check
-  ======================================================================
-   ROCKET COMPANION GEN-3 SEMANTIC ARCHITECTURE RADAR
-  ======================================================================
-   TypeScript & Rust   : 1311/1311 TS (100.0% TS) | 69 custom Rust files + rocketsim.tree-hash
-   TypeScript Strict   : PASS ("tsc" --noEmit)
-   Hard Boundaries     : 0 Circular Deps | 0 Value Re-Exports | 0 Upward Imports | Any<=5
-   STATUS: GREEN -- 100% TS, tsc --noEmit clean, hard boundaries & volume caps verified.
-  ======================================================================
-  ```
-- **Rust WASM 目标空间检查**:
-  ```bash
-  $ pnpm build:wasm:check
-  [WASM-BUILD] Running cargo check (--target wasm32-unknown-unknown --workspace)...
-  [WASM-BUILD] [OK] Workspace check passed in 26.48s.
-  ```
-- **生产打包构建 (Vite + Release WASM)**:
-  ```bash
-  $ pnpm build
-  [WASM-BUILD] [OK] Wrote src/physics/core.wasm (913.5 KB, 182 exports, profile=release) in 17.94s.
-  ✓ 3689 modules transformed.
-  ✓ built in 27.54s
-  ```
+### 1.1 主分支吸收的核心改动一览
+1. **PR #1 (Multiplayer Fixes Octopus)**:
+   - 彻底解决工作线程输入饥饿 (`input starvation`)、回滚调和器顿挫死循环 (`reconciler hitch hard-snap loop`)。
+   - 修复房主回环 (`host loopback`) 初始时间线同步、多客端在线房间名单 (`roster`) 与 WebRTC 数据通道状态。
+   - 优化大厅目标球重置与环形缓冲区内存开销 (`PredictionHistoryBuffer`, `NetworkInputBuffer`)。
+2. **PR #2 (Replay Smooth & Viewer Unify)**:
+   - 消除 120Hz/30Hz 物理采样率不匹配导致的相位漂移速度偏差 (`phase-drift speed mismatch`)、关键帧定格与最后一帧抖动。
+   - 重构 UE3 NetStream 解码器，对齐 Boxcars 字节流协议，新增未知属性投机性位宽探测器 (`RLRCUnknownPropertyBitProber`)。
+   - 统一 `.replay` 原生文件与 `.rcs` 容器的解析入口，整合 Replay Viewer 与 RCS 导入器。
+3. **PR #3 (Light Trail Effects & Performance Boost)**:
+   - 新增 Light Beam 与 Light Wave 粒子拖尾特效、双喷口支持与 Bot 团队专属颜色方案。
+   - 新增零泛光 Performance Boost 模式与独立 Active Tuner 浮动调优窗口。
+4. **PR #4 (Tauri Configurator Refinements)**:
+   - 增加 Crossbar #1 桌面/托盘图标生成流水线，优化预启动配置器 (`Layer1TauriConfiguratorRecipe`)，隐藏开发提示并优化桌面环境启动速度。
+5. **PR #5 (UI Rework Fixes)**:
+   - 解决 L1/L2 走查项，引入通知中心折叠架构，修复配置器布局抖动与浮动窗口契约。
+6. **PR #6 (Hex Thickness Tuning)**:
+   - 实现 Driftwoods 球场 GPU 六角丝带宽度与尾翼深度的实时着色器参数缩放。
 
 ---
 
-## 3. 重放 (Replay) 体系深度调研：TS 实现与 Boxcars 对比
+### 1.2 冲突裁决与取舍细节
 
-### 3.1 现存 Rust 库 (`boxcars`) 的局限性
-`boxcars` 是社区成熟的 Rocket League `.replay` 解析库，但在生产运行时存在以下致命痛点：
-1. **未识别属性立即崩溃 (Strict Schema Failure)**:
-   Psyonix 在每季更新（如新载具 hitbox、新平台标识符、定制突变器）时都会在 UE3 NetStream 中新增或扩展属性结构。`boxcars` 遇到未知类网络缓存或未识别 bit 位时直接返回反序列化错误，导致新版本录像完全无法回放。
-2. **定频帧时间漂移与抖动**:
-   `boxcars` 仅做原始帧数据抽取，对 Rocket League 录像中常见的变频网络包（从 30Hz、60Hz 到 120Hz 不等）、丢包跳帧、关键帧冻结（Keyframe Freezes）缺乏物理平滑合成层。
-
-### 3.2 RocketCompanion TypeScript 引擎的领先创新
-主分支在 `src/replay/rlrc/` 中重新实现的 NetStream 解析器相比 `boxcars` 具有代际优势：
-1. **投机式位宽探测器 (`RLRCUnknownPropertyBitProber.ts`)**:
-   - 具备自适应 **Auto-Probing Bit Skimmer** 机制。
-   - 当遇到未知属性时，并不中断解析，而是利用预设的候选位宽步长（`STRUCT_EXPANSION_CANDIDATE_DELTAS`）进行前向投机试探，结合后续帧头的时间戳与增量合法性（`isValidRLRCFrameHeader`）反向锁定未知字段位宽，实现对未知新版本录像的“自愈容错解析”。
-2. **动态类继承网络缓存构建 (`RLRCClassHierarchyCatalog.ts`)**:
-   - 能够基于 UE3 类继承链做动态拓扑回退，自动继承父类的属性映射，免除全量硬编码。
-3. **120Hz Hermite-Slerp 连续动力学合成 (`RLRCHermiteSlerpMathPipeline.ts`)**:
-   - 将稀疏或不均匀的网络流刚体位置与四元数通过带张力约束的 Hermite 三次样条及球形线性插值（SLERP）平滑到 120Hz 物理基准，消除了最后单帧抖动与跳变。
-
-### 3.3 结论与后续重构方案
-- **保持算法逻辑，下沉编译内核**:
-  TS 版本的**容错探测状态机与平滑数学公式**经过实战验证极为优秀，不应退回裸版 `boxcars`。后续应在 `crates/rc_replay_codec` 中将这套自愈探测（Bit Prober）与 Hermite-Slerp 管道移植为纯 Rust 实现，从而兼顾**纳秒级解析性能**与**超强容错自愈能力**。
+| 冲突文件 | 冲突点 | 裁决依据与处理方案 |
+| :--- | :--- | :--- |
+| `package.json` | 脚本冲突（HEAD 包含 `build:wasm*` 编译脚本，alpha 包含 `tauri:*` 与 `repro:*`） | **取并集**。保留 Rust WASM 的 `predev`, `build:wasm`, `build:wasm:dev`, `build:wasm:check`，同时合入主分支的 `tauri:*` 及 `repro:multiplayer-room` 脚本，保障桌面端与 WASM 编译双向可用。 |
+| `src/entities/trajectory/BallTrajectorySamplingController.ts` | 轨迹重算时的切片截断预算（HEAD `actualCount` vs alpha `shouldCollapseToCatchup`） | **采纳 alpha 进阶方案**。主分支在非 1v1 网络环境及小球剧烈碰撞重置时，增加了 `shouldCollapseToCatchup` 状态保护，避免预测切片突变导致渲染拉花，逻辑更健全。 |
+| `src/network/bot/BotInferenceWorker.ts` | 删除 vs 修改（HEAD 删除该文件，alpha 调整了推理步长） | **彻底删除 (听 Rust 分支)**。Rust 分支已通过 `crates/rc_bot_ai` 的 `BotDirector` 实现了 120Hz 纯 WASM 同步推理，TS 端由 `BotTunnelManager` 与 `BotWeightLoader` 直连，不再需要 Web Worker 进行异步推理。 |
+| `src/game/scenario/multiplayerRoomReproHostFlowPipeline.ts` | 依赖导入路径失效（alpha 脚本引用了已被删除的 `ExperimentalBotAgent.ts`） | **修复至新架构**。将 `ensureExperimentalEngine` 的导入切至 `src/ai/BotWeightLoader.ts`，打通回环房间测试。 |
+| `scripts/vite/gitHeadAutoRestartPlugin.ts` | 签名定义缺失 (`baselineSignature is not defined`) | **统一复合签名体系**。插件中扩展 `readCompositeGitHeadState()`，同时返回 `gitSignature`（主仓+public子模块 HEAD）与 `rustSignature`（`crates/` 目录源码散列），形成 `${git} [${rust}]` 全量复合签名，使得 Live WASM 热重编与 Vite 客户端重载双向闭环。 |
 
 ---
 
-## 4. 音频引擎架构深度剖析与 Rust 离载方案
+## 2. Replay 架构深度剖析：Rust Boxcars vs RC TypeScript RLRC
 
-### 4.1 滚地异常异响根本原因与表面法向量/冲量判定重构
+### 2.1 为什么不能直接生搬硬套现有的 Rust Boxcars 库？
+社区已有的 Rust 库（如 `boxcars`）是一个优秀的**底层比特流反序列化器**，但它在工程定位上与游戏前端运行时存在巨大脱节：
+1. **缺乏时序重采样与刚体插值**：Rocket League 原版录像的网络帧是变频记录的（物理帧通常为 30Hz 或 15Hz，且包含网络丢包导致的非均匀时间间隔）。Boxcars 仅仅将 Actor 与 Property 原始数值吐出，而游戏前端需要 120Hz 丝滑物理播放，必须做 Hermite-Slerp 连续样条插值。
+2. **缺乏实体生命周期与跨局重建**：录像中的 Car、Ball、BoostPad 在进球回放、加时 Teardown 时会频繁销毁与重生。Boxcars 不维护 Entity Lifecycle Span，若没有上层生命周期管理器，车辆在进球瞬间速度会被直接抹平或造成假死。
+3. **缺少音频与事件触发驱动**：Boxcars 并不具备物理碰撞法向量反向检测、撞柱（Goalpost Ping）判定等物理事件生成能力。
 
-#### 4.1.1 异响根因定位
-经排查 `crates/rc_physics_sim/src/step_and_events.rs` 与 `crates/rc_audio_director/src/director_impact_events.rs`，发现两大致病点：
-1. **Bullet 接触流形持续触发 (Continuous Manifold Emission)**:
-   当球在地面上静止或滚动时，RocketSim Bullet 物理引擎在每一步（120Hz）都会生成 `ArenaEvent::BallHitWorld`。
-2. **法向速度判定失效与过短冷却**:
-   - 在 `incident_classifier.rs` 中：若 `ev.normal_rel_vel <= 0`，代码直接降级为使用全速 `ev.speed.abs()`。当球高速滚地时（如 1200 uu/s），全速远超地面碰撞阈值（140 uu/s）。
-   - 在 `director_impact_events.rs` 中：地面击打冷却仅为 `5 ticks`（即 41.6ms，每秒触发 24 次！）。
-   - **现象**: 球贴地高速滚动时，系统每 40ms 就把它判定为一次剧烈砸地碰撞，连续派发 `0x04` `BALL_WORLD_HIT` 单发音效（One-shot Thud），与原本的连续滚地音效（`ball_loops.rs`）产生严重相位叠加和“机关枪”式爆音。
+### 2.2 RC 在 TypeScript 层对 Replay 做的重大改进
+RC 团队在借鉴 Boxcars 逆向结构的同时，进行了系统性的二次研发与进阶重构：
+1. **确定性 UE3 NetCache 类层次目录 (`RLRCClassHierarchyCatalog`)**：
+   - 取代了早期粗暴的 `parentId` / `cacheId` 猜测继承，构建了包含 235+ 属性与 45+ 属性解码器的静态类型字典。
+   - 精确覆盖了 PsyNet NetVersion >= 10 的 8 字节平台 ID、QWordString、DemolishFx 以及 CamSettings 868.34.12 变体。
+2. **投机性位流探测器 (`RLRCUnknownPropertyBitProber`)**：
+   - 针对不同游戏版本可能出现的未记录私有属性，能够向前做试探性位探测并动态寻找位同步锚点，防止由于单个属性解析失败导致整场录像后续网络流完全错位（Bit-drift desync）。
+3. **零相位局部漂移消除 (`Zero-Phase Drift Removal`)**：
+   - 彻底解决了 120Hz 客户端物理时钟与录像网络帧之间的累积相位误差，消除回放过程中的偶发顿挫与尾帧抖动。
+4. **表面法向反转运动学过滤 (`RLRCBallSurfaceImpactKinematics`)**：
+   - 提取了包含 45 度斜角斜坡的地面/墙面反向与角偏转检测，精准区分小球的贴地滑行与真实回弹。
 
-#### 4.1.2 修复与数学方案
-1. **法向内向速度严格投影**:
-   碰撞单发音效必须仅由垂直于接触表面指向内部的法向撞击驱动：
-   $$v_n = -(\vec{v}_{\text{ball}} \cdot \vec{n}_{\text{surface}})$$
-   当球贴地滚动时，$v_n \approx 0$，切向速度 $\vec{v}_t = \vec{v} - (\vec{v} \cdot \vec{n})\vec{n}$。
-   切向滚动仅激发 `BallAcousticLoopPod.rolling_gain`，绝不允许激发生硬的撞击单发音效。
-2. **接触状态边沿检测 (Hysteresis Contact Latching)**:
-   在 Rust 侧为球维护接触状态标志位 `was_in_surface_contact`：
-   - 仅当从离地变为贴地（上升沿 `false -> true`），或者发生强烈的正向法向冲量跳变（$\Delta v_n > 250\text{ uu/s}$，如被车撞击）时，才允许产生一次性地面撞击音效。
-   - 处于持续滚动状态时（`was_in_surface_contact == true`），完全屏蔽 `BALL_WORLD_HIT` 的地面分发。
-3. **冷却窗口调整**:
-   将地面离散撞击冷却从 5 ticks 扩大至 20 ticks (约 166ms)。
+### 2.3 后续 Replay 迁移至 Rust (`crates/rc_replay_codec`) 规划
+目前 `crates/rc_replay_codec` 已经包含了 `container.rs`, `seeker.rs`, `delta_transpose.rs`。后续应将 TypeScript 中的 `RLRCNetStreamBitDecoder` 与 `RLRCHermiteSlerpResampler` 彻底移植回 Rust，以利用 SIMD 实现录像的多线程极速预解析与内存紧凑排布。
 
 ---
 
-### 4.2 引擎动力总成 (Powertrain) 与粒子粒度合成离载
+## 3. 音频系统计算 Offload 深度调查与重构方案
 
-#### 4.2.1 现状分析
-目前系统中存在**双重动力总成计算**：
-- TS 侧 `TurtleModemEngineSynth.ts` 仍在逐帧执行换挡、RPM 上升/回落、超转速断油、排气回火模拟。
-- Rust 侧 `crates/rc_audio_director/src/drivetrain_state.rs` 也维护了一套完整的 8 辆车动力学状态机。
-这导致计算冗余，且 TS 垃圾回收（GC）会导致引擎音频微卡顿。
+### 3.1 核心缺陷根因：“小球滚在地上持续异响”
+#### 现象描述
+小球在地面上平稳滚动时，系统会高频触发离散的撞击音效（`BALL_WORLD_HIT`），发出类似“嗒嗒嗒”或机关枪般的持续碰撞声。
 
-#### 4.2.2 离载控制机制
-将所有动力学与声学插值 100% 转移至 Rust WASM：
-1. **Rust 输出 POD 扩展**:
-   `CarAcousticLoopPod` 结构体直接包含：
-   - `rpm`: 连续物理平滑 RPM
-   - `gear`: 当前挡位 (-1, 0, 1..6)
-   - `engine_gain`: 距离衰减与负荷平滑后的总增益
-   - `pitch_ratio`: 基础音高比率
-   - `slice_weights[0..4]`: 粒度引擎切片的 4 个交叉淡入淡出权重
-   - `doppler_pitch_scalar`: 3D 空间多普勒频移
-   - `pan`: 双耳空间方位角
-2. **离散回火/超音速音爆边沿触发**:
-   通过 64 位标志掩码（`AudioFrameCuePod.one_shot_edge_mask_lo/hi`）输出标志位，音频前端无需计算何时触发回火，只需按位感知触发。
+#### 深度技术根因剖析
+在分析 `crates/rc_physics_sim/src/step_and_events.rs` 与 `crates/rc_audio_director/src/incident_classifier.rs` 后，定位出三个连环机制缺陷：
+
+1. **物理引擎接触流形的连续触发特性**：
+   - 在 Bullet / RocketSim 中，小球贴地或在斜坡滚动时，小球碰撞球体与场地网格每 tick 都在发生接触穿透解算，物理层每 tick 都会产生 `ArenaEvent::BallHitWorld`。
+2. **法向速度与水平滚动速度的退化回退 (Fallback Bug)**：
+   - 查看 `crates/rc_audio_director/src/incident_classifier.rs` 第 292-296 行：
+     ```rust
+     let normal_vel = if ev.normal_rel_vel.is_finite() && ev.normal_rel_vel > 0.0 {
+         ev.normal_rel_vel.abs()
+     } else {
+         ev.speed.abs() // <-- 致命缺陷！
+     };
+     ```
+   - 当小球贴地纯滚动时，其垂直于地面的法向相对速度 `normal_rel_vel ≈ 0`。
+   - 代码在此处执行了 `else { ev.speed.abs() }`，**直接将水平滚动速度（例如 1000~1500 uu/s）误当作撞击法向速度！**
+   - 此时 `1500 > cfg.ball_ground_hit_threshold (140.0)` 恒成立！
+3. **仅靠冷却计时器（Cooldown）无法区分离散碰撞与滚动**：
+   - 代码设置了 `cooldown = ms_to_ticks_120hz(cfg.incident_cooldown_ms)`（约 40ms = 5 ticks）。
+   - 结果就是：每隔 40ms，水平速度再次通过阈值判定，强行发射一枚离散的 `BALL_WORLD_HIT` 音效 Slot！
 
 ---
 
-### 4.3 终极音频架构：Rust 物理驱动 + WebAudio 哑端渲染
+### 3.2 引擎动力总成（Engine Audio）控制机制现状
+当前 `crates/rc_audio_director/src/drivetrain_state.rs` 与 `granular_lookup.rs` 已实现了完备的仿真实时动力学：
+- **状态机模型**：6 个前进挡位 + 倒挡 + 空挡 + 超速挡（Overdrive）。
+- **参数控制链路**：
+  - 输入：油门 `raw_thr`、速度 `fwd_spd`、转向 `steer`、手刹 `hb`、加速 `boost`、接地 `grounded`、时间差 `dt`。
+  - 核心物理计算：飞轮转动惯量模拟、红线断油与回弹（Rev-limiter bounce）、换挡转速跌落与回火放炮（Backfire pop）、上墙重力做功负载压低（Wall-deceleration strain dip）、超音速转向啸叫。
+  - 输出：粒度合成采样位置、平滑转速比率（`current_rpm / redline_rpm`）、当前挡位、平滑增益等。
+
+---
+
+### 3.3 架构目标：计算全量 Offload 至 Rust，TS 端退化为“纯哑巴播放器 (Dumb Sink)”
+
+理想架构中，TypeScript 与 Web Audio 应当**完全移除非音频专属的逻辑运算**。
 
 ```
-   [ RocketSim 120Hz 物理世界 ]
-               │
-               ▼
-┌────────────────────────────────────────────────────────┐
-│      crates/rc_audio_director (Rust WASM 内部)         │
-│  - 纯法向冲量检测 (v_n = -v·n) 与地面滚动迟滞锁存器     │
-│  - 8 车 Turtle Modem 动力学 / 换挡 / 4-Slice 权重计算  │
-│  - 3D 双耳空间多普勒频移、距离曲线与遮挡衰减           │
-│  - 离散事件环形缓冲区消费、碰撞优先级裁决 (Top 8 Slots)│
-└────────────────────────────────────────────────────────┘
-               │
-               │ (零拷贝共享内存 AudioFrameCuePod)
-               ▼
-┌────────────────────────────────────────────────────────┐
-│            TypeScript WebAudio 哑端渲染器              │
-│  - 不执行任何物理方程、不计算向量、不保存状态机        │
-│  - 循环层: 读 rolling_gain / engine_gain 写入 GainNode │
-│  - 挡位层: 读 slice_weights 设置 AudioBufferSourceNode │
-│  - 单发层: 读 edge_mask / one_shot_slots 派发播放音效  │
-└────────────────────────────────────────────────────────┘
++-----------------------------------------------------------------------------------+
+|                           Rust / WASM (rc_audio_director)                         |
+|                                                                                   |
+|  [物理/运动学状态]                                                                 |
+|   - BallState: 位置、线速度、角速度、接触法向量                                   |
+|   - CarState: 挡位状态机、转速、负载、油门开度、悬挂压缩比                         |
+|   - CameraState: 听者位置 (Listener Pos)、朝向、视锥裁剪                           |
+|                                                                                   |
+|  [高负载计算（Rust 完全接管）]                                                     |
+|   1. 连续法向反转冲量检测: delta_vn = (v_out - v_in) . n >= threshold             |
+|   2. 滚动 vs 回弹状态分类: 接触持续时长 > 3 ticks 且 vn < 40 -> 判定为滚动        |
+|   3. 动力总成 RPM 步进与挡位解算                                                  |
+|   4. 3D 空间三维声学衰减曲线 (Bézier / Smoothstep / Inverse) 与距离裁剪           |
+|                                                                                   |
+|  [统一共享内存 C-ABI: AudioFrameCuePod]                                           |
+|   - one_shot_edge_mask_lo/hi (64 个离散事件触发位)                                |
+|   - 8 个 AudioOneShotSlot: { sound_id, volume, playback_rate, pan_x, pan_y, pan_z}|
+|   - 1 个 BallAcousticLoop: { rolling_gain, rolling_rate, flying_gain, flying_rate }|
+|   - 8 个 CarAcousticLoop:  { engine_rpm_norm, engine_gain, boost_gain, ... }      |
++-----------------------------------------+-----------------------------------------+
+                                          |
+                                          | 120Hz 每帧 0 拷贝直接内存映射 (HEAPU32 / HEAPF32)
+                                          v
++-----------------------------------------------------------------------------------+
+|                        TypeScript / Web Audio (Thin Sink)                         |
+|                                                                                   |
+|  - 不做任何矢量乘除法、不做阈值计算、不跑冷却倒计时                               |
+|  - 遍历 WASM 传来的 8 个 OneShot Slots：                                          |
+|      if (slot.volume > 0) -> AudioSlotPool.play(slot.sound_id, slot.params)       |
+|  - 连续音频更新：                                                                 |
+|      rollingGainNode.gain.value = wasm.ball.rolling_gain                          |
+|      rollingSourceNode.playbackRate.value = wasm.ball.rolling_rate                |
+|      engineGainNode.gain.value = wasm.car[i].engine_gain                          |
++-----------------------------------------------------------------------------------+
 ```
 
-该架构将所有计算密集型任务完全卸载到 Rust 侧，TS 侧变为纯粹的参数写入管道，彻底根绝因主线程 GC 或浮点运算卡顿带来的音频撕裂。
+#### 小球异响修复算法（Rust 实现）：
+小球碰撞事件必须同时满足以下几何与动力学条件：
+1. **法向入射速度判定**：在接触前，小球沿表面法向量的反向速度必须超过真实撞击阈值：
+   $$\vec{v}_{in} \cdot \vec{n} < -v_{\text{impact\_threshold}} \quad (v_{\text{impact\_threshold}} \ge 160\text{ uu/s})$$
+2. **法向速度反转冲量判定**：
+   $$\Delta v_n = (\vec{v}_{post} - \vec{v}_{pre}) \cdot \vec{n} \ge \Delta v_{\text{threshold}} \quad (\Delta v_{\text{threshold}} \ge 220\text{ uu/s})$$
+3. **滚动抑制**：若小球处于地面接触流形内且连续贴地大于 2 个 tick，强制禁止离散撞击事件触发，仅驱动 `BallAcousticLoopPod.rolling_gain` 连续环境循环音效。
 
 ---
 
-## 5. 高效并行分支重建方案 (Tier-3 架构路线)
+## 4. 团队权责划分与协作矩阵 (Team Responsibilities)
 
-为了以最高效率推进后续重构，防止分支间产生大面积合并冲突，推荐采用**契约先行 (Contract-First) 的并行分支拓扑**：
-
-### 5.1 分支规划与命名规范 (共 4 个业务领域，8 个并行分支)
-所有分支均以 `z/agy/rc/rust/*` 命名，基于当前的 `z/agy/rc/rust/sync-main-audio-plan` 签出：
+为避免后续跨团队、跨模块协作时的相互干扰与边界推诿，建议确立以下清晰的责任矩阵：
 
 ```
-z/agy/rc/rust/sync-main-audio-plan (基准: b26d328)
-  │
-  ├── [Group A: 音频导演重塑]
-  │     ├── z/agy/rc/rust/t3-01-audio-incident-hysteresis  (法向内向冲量/滚地迟滞/地面单发冷却)
-  │     └── z/agy/rc/rust/t3-02-audio-engine-synth-offload (WASM 输出 4-slice 权重，TS 哑端化)
-  │
-  ├── [Group B: 重放解码移植]
-  │     ├── z/agy/rc/rust/t3-03-replay-prober-rust         (将 TS 投机位宽探测器移植至 rc_replay_codec)
-  │     └── z/agy/rc/rust/t3-04-replay-hermite-slerp-wasm  (120Hz 动力学重构与平滑在 Rust 完成)
-  │
-  ├── [Group C: 物理回滚与多人同步]
-  │     ├── z/agy/rc/rust/t3-05-physics-rollback-resim     (256 槽快照环原生回滚重模拟)
-  │     └── z/agy/rc/rust/t3-06-multiplayer-packet-c-abi   (网络输入/状态包零拷贝二进制编解码)
-  │
-  └── [Group D: Tauri 桌面与工程自动化]
-        ├── z/agy/rc/rust/t3-07-tauri-dev-rebuild-daemon   (完善 crates 改动检测与 Tauri 热重载)
-        └── z/agy/rc/rust/t3-08-crossbar-tray-refinements  (Tauri 托盘/菜单/全屏配置器无缝联调)
++---------------------+----------------------------------------------------+--------------------------+
+| 团队 (Team)         | 核心职责与专精领域 (Core Focus)                    | 严禁涉足与边界划分       |
++---------------------+----------------------------------------------------+--------------------------+
+| 1. Rust 团队        | - 物理模拟底层 (rc_physics_sim / rocketsim)         | - 不编写 UI 组件与 DOM    |
+|    (Our Team)       | - 决策 AI 与推理 (rc_bot_ai / SIMD SequentialMlp)  | - 不直接操作 Web Audio   |
+|                     | - 轨迹预测与切片数据 (rc_trajectory_mesh)          |   AudioNode 原生接口     |
+|                     | - 动力总成、声学定向与判定 (rc_audio_director)     |                          |
+|                     | - 录像比特流编解码 (rc_replay_codec)               |                          |
+|                     | - 保证 WASM C-ABI 内存排布与数据对齐               |                          |
++---------------------+----------------------------------------------------+--------------------------+
+| 2. Rocket Companion | - 场景管线与三维渲染装配 (Three.js / Shader / Emitter)| - 不实现重度数值模拟逻辑 |
+|    (TS/Core Team)   | - 网络同步与回滚插值协调器 (Reconciler / Client)   | - 录像解析与声学判定必须 |
+|                     | - 薄音频播放接收器 (Web Audio Sink / Howler / Pool)|   调用 Rust WASM 导出    |
+|                     | - 调度器与微任务管理 (frameBudgetScheduler)        |                          |
++---------------------+----------------------------------------------------+--------------------------+
+| 3. Tauri 团队       | - 原生桌面外壳与生命周期 (src-tauri)               | - 不关心物理和比赛逻辑   |
+|    (Desktop Shell)  | - 系统托盘、单实例锁、深色模式配置管理             | - 本地开发验证需提供     |
+|                     | - 桌面图标构建工具 (generateTauriCrossbarIcons)     |   Headless / 容器降级容错|
+|                     | - 本地文件系统安全沙盒与 IPC 通信                 |                          |
++---------------------+----------------------------------------------------+--------------------------+
+| 4. UI 团队          | - 主菜单、HUD、车库、比赛大厅等界面 (ui-core)      | - 严禁在 UI 渲染周期内   |
+|    (Frontend UI)    | - 调优面板交互 (ui-tuner / FloatingWindow)         |   触发同步物理/网络计算  |
+|                     | - 样式令牌 (ui-system.css / Tailwind)              | - 通过 Zustand Store 解耦|
++---------------------+----------------------------------------------------+--------------------------+
 ```
-
-### 5.2 为什么 8 个分支并行效率最高？
-1. **领域正交 (Orthogonal Domains)**:
-   - `rc_audio_director` 只读物理事件，不写物理状态。
-   - `rc_replay_codec` 是纯离线/流式解码器，不影响实时竞技场。
-   - `rc_physics_sim` 回滚机制仅影响预测同步层。
-   - `src-tauri` 是独立桌面壳层。
-   4 个方向互不修改彼此源码文件，冲突概率降至极低。
-2. **C-ABI 接口契约锁定**:
-   在开发前首先锁定 `POD` 结构体布局，只要内存定义不变，前后端便能完全解耦并行开发。
-3. **最终收敛机制**:
-   各分支研发完成后，参照本次合并经验，进行二次 Octopus Merge，形成稳定的 Stage 3 里程碑。
 
 ---
 
-## 6. 跨团队职责与边界划分矩阵
+## 5. 后续重构并行分支规划 (Parallel Branch Strategy)
 
-针对用户关心的“具体问题归属哪一个团队”，清晰的边界定义如下：
+为了保障后续研发效率最高，避免大爆炸式的巨型分支冲突，建议按照**垂直功能领域**与**C-ABI 契约**切分出 5 条高内聚、低耦合的并行开发分支。
 
-| 领域 / 问题项 | 负责团队 | 协作团队 | 交付标准与边界划分 |
-| :--- | :--- | :--- | :--- |
-| **音频计算与事件判定** | **Rust 团队** | RocketCompanion 团队 | 表面法向投影、滚地判定、碰撞冲量阈值、动力学换挡与多普勒计算全部在 `crates/rc_audio_director` 内完成；向外只提供只读 POD 缓冲区。 |
-| **WebAudio 声音回放** | **RocketCompanion 团队** | UI 团队 | 负责根据 Rust 导出的标志位和增益参数调用浏览器 WebAudio API 发声，封装轻量 Facade，不写物理判断。 |
-| **重放位宽探测与平滑** | **Rust 团队** | RocketCompanion 团队 | 将 `RLRCUnknownPropertyBitProber` 与 Hermite 插值从 TS 移植到 `crates/rc_replay_codec`，提供高吞吐 WASM 解析器。 |
-| **Tauri 桌面应用与托盘** | **Tauri 团队** | RocketCompanion 团队 | 负责 `src-tauri` 窗口生命周期、系统托盘右键菜单、跨平台二进制打包以及本地机器配置存储。 |
-| **UI 页面与调优器 (Tuner)** | **UI 团队** | RocketCompanion 团队 | 负责 `src/ui-core`、`src/ui-tuner` 浮动窗口、参数滑动条、CSS 视觉效果，严禁涉及后端物理或 WASM 细节。 |
-| **工程构建与热重载插件** | **RocketCompanion 团队** | Tauri 团队 / Rust 团队 | 维护 `scripts/vite/gitHeadAutoRestartPlugin.ts` 和 `devLauncher.ts`，确保无论改动 Rust、TS 还是 Tauri 都能精准触发热重载与编译。 |
+### 5.1 分支切分图谱
+```
+origin/z/agy/rc/rust/sync-main-audio-investigate (基准锚点: f64c3b8)
+   |
+   +---> [分支 A] z/agy/rc/rust/audio-offload-incident-fix
+   |        - 修复小球滚动法向量与冲量判定，杜绝持续撞击声
+   |        - 实现引擎声音参数与距离裁剪纯 Rust 输出
+   |
+   +---> [分支 B] z/agy/rc/rust/replay-codec-stream-parser
+   |        - 将 TS RLRCBitReader 与类继承缓存迁移至 crates/rc_replay_codec
+   |        - 实现 Rust 侧 120Hz Hermite-Slerp 插值生成
+   |
+   +---> [分支 C] z/agy/rc/rust/trajectory-spatial-occlusion
+   |        - 轨迹预测的碰撞反弹射线与遮挡计算下沉至 rc_trajectory_mesh
+   |        - 优化 CPU 内存传输带宽
+   |
+   +---> [分支 D] z/agy/rc/tauri/ci-sandbox-decoupling
+   |        - 为无 GUI/无 C 编译器的 Linux 容器环境增加 Tauri 构建容错
+   |        - 优化 pnpm dev:tauri-http 与 Tray 模式自启动
+   |
+   +---> [分支 E] z/agy/ui/audio-and-replay-telemetry-hud
+            - 针对音频事件与 Replay 时间线对齐提供轻量级可视化 HUD 仪表
+```
+
+### 5.2 实施原则
+1. **契约先行 (Contract-First)**：先在 `crates/rc_*` 中定义好 POD 结构体与 C-ABI 头信息（如字段偏移、位掩码），一旦契约锁定，Rust 内部优化与 TS 接收器实现互不干扰。
+2. **禁止超大单文件**：任何新模块单文件严格遵守 Radar 守护门禁（Soft <= 400L / 12KB，Hard <= 800L / 18KB），按照纯逻辑管道（Pure Pipeline）或领域状态机进行拆分。
+3. **保持基准可查**：禁止 rebase，所有并行分支最终通过清晰的 Octopus Merge 或阶段性集成 Pull Request 回流。
 
 ---
 
-## 7. 交付完成情况
+## 6. 验证与总结
 
-1. **主分支同步**: 已将 `origin/alpha` (PR #1 ~ #6) 全部特性与修复合并至工作分支 `z/agy/rc/rust/sync-main-audio-plan`。
-2. **冲突解决与代码自愈**:
-   - 修复了 `package.json` 的双端构建与运行脚本冲突。
-   - 修复了 `BallTrajectorySamplingController.ts` 曲线采样追帧逻辑。
-   - 删除了被 Rust 完全取代的 `BotInferenceWorker.ts`。
-   - 修复了 `multiplayerRoomReproHostFlowPipeline.ts` 的旧引用报错。
-   - 修复了 `gitHeadAutoRestartPlugin.ts` 的 `baselineSignature` 运行时未定义异常。
-3. **全线绿灯通过**:
-   - `pnpm check` (100% TS, 0 errors, Radar Green)
-   - `pnpm build:wasm:check` (Rust crates check clean)
-   - `pnpm build` (生产模式 WASM 与 Vite 打包成功)
-4. **GitHub Verified Commit**:
-   - 生成由 GitHub App Bot GPG 自动签名的 Merge Commit: `b26d3287295714c16f4f5f69d373498b963d6e70`，已成功推送到远程 `origin/z/agy/rc/rust/sync-main-audio-plan`。
+- 本次合并圆满完成主分支所有新特性吸收，消除了潜在的代码漂移风险。
+- Radar 架构检测工具验证通过（100% TS，Volume Guardrails 验证合规，0 循环依赖，0 向上越界引用）。
+- Rust WASM 6 个 Crates 检查通过，`src/physics/core.wasm` 编译成功。
+- 所有代码已通过认证 Bot 签名完整推送到远程目标工作分支 `z/agy/rc/rust/sync-main-audio-investigate`。

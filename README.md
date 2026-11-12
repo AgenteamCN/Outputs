@@ -1,69 +1,69 @@
-# 修复报告：统一红色复制按钮为 "Copy Raw" 并保障原始敏感信息原样复制
+# Fix Summary: Unify "Copy Raw", Preserve Unredacted Input Keys, and View Decoupling
 
-## 1. 问题根因分析
+## 1. 问题分析与修复背景
 
-在最近的提交中，针对任务输入复制功能存在以下几个核心问题：
-
-1. **按钮文案不统一**：
-   - Composer 界面红色按钮为 `"Copy Input to Clipboard"`。
-   - Inspector 界面红色按钮为 `"Copy Real Input"`。
-   - 用户期望将带有危险警示色（红底 `primer-btn-danger`）的原生复制按钮统一命名为 **"Copy Raw"**，明确传达“此按钮代表用户完全知情、将不经脱敏直接复制原始完整内容”的语义。
-
-2. **用户 Prompt 正文中形似 Key/Token 的内容被误隐藏**：
-   - 之前在 `parsePromptWithGithubAuth` 中对截取出的 `remainder`（即用户输入正文）调用了 `redactInlinePrivateKeys`。
-   - `redactInlinePrivateKeys` 随后被挂接到了 `redactSensitiveText`，导致用户输入正文中的 GitHub Token (`ghp_...`)、Worker Token (`bk_...`)、JWT (`eyJ...`)、URL 参数密钥 (`?key=...`) 等全部被强制替换成了 `[REDACTED_...]`。
-   - 当点击红色复制按钮时，虽然前面的 `# 1. Auth Configuration` 恢复了真实的认证凭据，但正文中的密钥却依然被脱敏覆盖，导致实际外发的内容被破坏。
-
-3. **无 Auth 场景下逻辑拧巴**：
-   - 原 Inspector 红色复制按钮判断 `if (!parsedInput.hasGithubAuth)` 时直接返回 `baseText`。
-   - 但因为此前入库 `TaskRecord.fullPrompt` 时也经过了 `formattedDisplayPrompt` 脱敏处理，导致无 GitHub Auth 的任务在普通复制和红色复制时均被误脱敏。
-   - 实际上红色按钮的职责非常明确纯粹：**无论任务是否包含 GitHub Auth，用户发出去什么内容，红色按钮就原封不动地复制什么内容**（包含 GitHub Auth 时完整拼接未经脱敏的用户正文与真实凭据；不包含时直接输出用户原始正文，零脱敏）。
-
-4. **超大文件拆分与解耦**：
-   - `TaskComposerView.tsx` 原为 938 行（34KB+），`TaskInspectorView.tsx` 原为 665 行（22KB+），超出了单一职责及避免超大文件（600~800 行、12~16KB+）的工程要求。
+### 1.1 问题根本原因 (Root Cause)
+在原先的实现中，用户点击红色复制按钮（用于导出带鉴权凭据的原始 Input）时出现了敏感信息被意外遮蔽或截断的问题：
+1. **前端 Prompt 解析脱敏过度**：`src/utils/githubAuthBlock.ts` 中解析 Prompt 时，对用户自定义输入的 body 内容（`remainder`）调用了 `redactInlinePrivateKeys` 等脱敏过滤，导致用户自行输入的密钥、API Key、Worker Token 被替换为 `[REDACTED_SECRET]`。
+2. **Rust 后端存储脱敏破坏 Input 原文**：在 `src-tauri/src/google_api/client.rs` 与 `output_recovery.rs` 中，后端在收到 `req.prompt` 构造任务记录以及拉取恢复任务交互时，错误地对 `req.prompt` 与 `existing.full_prompt` 调用了 `redact_sensitive_blocks`，导致原本用户发出的输入内容在后端被二次遮蔽。
+3. **按钮命名与行为不一致**：部分视图命名为 "Copy Input to Clipboard"，部分为 "Copy Real Input"，未能统一明确为 **"Copy Raw"**。红色警示样式表示该操作会原样导出完整凭据与敏感字段。
+4. **组件单文件膨胀与耦合严重**：`TaskComposerView.tsx`（>800 lines, 29KB）与 `TaskInspectorView.tsx`（>660 lines, 23KB）超过了模块化标准（<600 lines, <16KB 规范），业务横幅、动作栏、标签栏混杂在一起，后续改动易相互干扰。
 
 ---
 
-## 2. 核心修改与架构解耦
+## 2. 解决方案与修改内容
 
-### 2.1 修复 `githubAuthBlock.ts` 避免正文误脱敏
-- 修改 `parsePromptWithGithubAuth`：不再对 `remainder` 或 `safeRaw` 调用 `redactInlinePrivateKeys`。返回的 `userBody` 保持 100% 原始正文内容。
-- 新增并导出 `buildRawPromptWithAuth(prompt, includeGithubAuth, authBlock)` 工具函数：
-  - 若任务包含 GitHub Auth 或勾选了插入凭据，按结构提取未经任何脱敏破坏的 `userBody`，与真实的 `authBlock` 完整拼接后输出；
-  - 若任务不包含 GitHub Auth，直接返回纯原始正文，不做任何脱敏替换。
+### 2.1 彻底保留原始输入凭据与密钥
+- **Rust 后端 (`src-tauri/src/google_api`)**:
+  - 在 `response_parser.rs` 中导出 `pub fn collapse_github_auth_header_block`。
+  - 在 `client.rs`（创建任务与合并交互）与 `output_recovery.rs`（恢复输出交互）中，将 Prompt 的脱敏由全局敏感字段替换 `redact_sensitive_blocks` 调整为仅折叠 GitHub Auth 头部块 `collapse_github_auth_header_block`。
+  - 用户正文中的 API 密钥、私钥、Token 原封不动保存在 `full_prompt`，真正做到“发出去是什么东西，复制出来就是什么东西”。
+- **前端工具库 (`src/utils`)**:
+  - `src/utils/githubAuthBlock.ts`: 移除对 `remainder` 正文的 `redactInlinePrivateKeys` 篡改，实现 `buildRawPromptWithAuth` 恢复真实完整的 GitHub Auth 头。
+  - `src/utils/rawPromptCopy.ts`: 新建统一的异步 Raw 复制工具函数 `copyRawTaskPrompt(prompt, includeGithubAuth)`，自动处理缓存与 Safari/WebKit 瞬态激活兼容。
 
 ### 2.2 统一红色复制按钮为 "Copy Raw"
-- **TaskComposerView**：
-  - 红色按钮统一改名为 `"Copy Raw"`（点击后显示 `"Copied"` 1.5s）。
-  - 处理函数更新为 `handleCopyRawToClipboard`，使用 `buildRawPromptWithAuth` 产出完整 Raw Prompt。
-- **TaskInspectorView**：
-  - 红色按钮统一改名为 `"Copy Raw"`（点击后显示 `"Copied"` 1.5s）。
-  - 保留普通白色按钮 `"Copy Input"` 负责复制截屏视图 (`formattedDisplayPrompt`)。
+- 统一在 `TaskComposerView`（底部动作栏）与 `TaskInspectorView`（输入快照面板）中将红色按钮文案与 `aria-label` / `title` 命名为 **"Copy Raw"**。
+- 灰色按钮保持为安全或折叠后的普通复制（"Copy Input"）。
 
-### 2.3 模块化解耦超大组件
-1. **抽离 `TaskInputSnapshotPanel.tsx`**（位于 `src/components/inspector/`）：
-   - 将 Inspector 的 Raw Snapshot Box（包含状态 Badge、普通 `Copy Input`、红色 `Copy Raw`、以及展示 pre 文本）解耦至独立组件中。
-   - `TaskInspectorView.tsx` 行数从 665 行精简至 **529 行**，远低于 600 行警戒线。
-2. **抽离 `TaskComposerCollapsedSettings.tsx`**（位于 `src/components/composer/`）：
-   - 将 Composer 在右侧栏收起状态下的紧凑标题与 Tag Presets 区域抽离为独立组件。
-   - `TaskComposerView.tsx` 行数从 938 行精简至 **799 行**。
-
----
-
-## 3. 验证与测试
-
-- **单元逻辑验证**：
-  - 测试正文包含 `ghp_...`、`bk_...`、`?key=...` 且无 Auth 场景：`parsePromptWithGithubAuth` 严格保留原始未脱敏正文；`buildRawPromptWithAuth` 返回完整无脱敏字符串。
-  - 测试正文包含 `[REDACTED_GITHUB_AUTH_AND_COMMIT_PREFERENCE]` 场景：`buildRawPromptWithAuth` 正确将真实认证块与完整未脱敏正文拼接。
-  - 测试正文包含完整 `# 1. Auth Configuration` 块场景：`buildRawPromptWithAuth` 保持完整原样。
-- **生产构建验证**：
-  - 执行 `pnpm build`：TypeScript 严格类型检查与 Vite 生产打包 100% 通过（2231 modules transformed，0 errors）。
+### 2.3 拆分解耦超大组件文件 (低耦合、按功能区域拆分)
+严格限制所有文件在 600 行以内、16KB 以内：
+1. **`src/components/composer/ComposerBanners.tsx`** (350 lines, 12KB):
+   - 提取草稿编辑横幅 (`editingSavedDraft`)、Hook 状态警示横幅 (`!enableToolHooks`)、GitHub Auth 状态横幅、凭据缺失警示横幅以及多轮 Continuation 冲突提示。
+2. **`src/components/composer/ComposerActionBar.tsx`** (128 lines, 3.9KB):
+   - 提取底部字数统计、红色 **"Copy Raw"** 按钮、"Save as Draft" 与 "Dispatch Task" 调度按钮。
+3. **`src/components/composer/TaskComposerCollapsedSettings.tsx`** (154 lines, 4.8KB):
+   - 提取折叠侧边栏状态下的标题与标签输入卡片。
+4. **`src/components/composer/TaskComposerView.tsx`** (精简至 370 lines, 13KB):
+   - 聚焦于主编辑器输入框、快捷代码片段插入以及状态调度。
+5. **`src/components/inspector/TaskInspectorTabBar.tsx`** (223 lines, 6.5KB):
+   - 提取检查器顶栏 Tab 切换、轮次导航 (Round Prev/Next)、刷新与重试操作。
+6. **`src/components/inspector/TaskInputSnapshotPanel.tsx`** (148 lines, 4.4KB):
+   - 提取输入快照查看器，集成灰色 "Copy Input" 与红色 **"Copy Raw"**。
+7. **`src/components/inspector/TaskInspectorView.tsx`** (精简至 358 lines, 12KB):
+   - 专注文档流编排与各子面板调度。
 
 ---
 
-## 4. GitHub Verified Bot Commit 信息
+## 3. 文件尺寸合规核验
 
-- **Commit SHA**: `1ad46ab21cbd6d3f56e8bd1977bda6893755f8d1`
-- **Branch**: `a2`
-- **Verified Signature**: `true` (`antigravity-fine-grained-token[bot]`)
-- **Co-authored-by**: `Mark <29165094+MaBoCoMark@users.noreply.github.com>`
+| 文件路径 | 行数 | 文件大小 | 状态 |
+| :--- | :--- | :--- | :--- |
+| `src/components/composer/TaskComposerView.tsx` | 370 行 | 13 KB | ✅ 严格符合要求 (<600 lines, <16KB) |
+| `src/components/composer/ComposerBanners.tsx` | 350 行 | 12 KB | ✅ 符合要求 |
+| `src/components/composer/ComposerActionBar.tsx` | 128 行 | 3.9 KB | ✅ 符合要求 |
+| `src/components/composer/TaskComposerCollapsedSettings.tsx` | 154 行 | 4.8 KB | ✅ 符合要求 |
+| `src/components/inspector/TaskInspectorView.tsx` | 358 行 | 12 KB | ✅ 符合要求 |
+| `src/components/inspector/TaskInspectorTabBar.tsx` | 223 行 | 6.5 KB | ✅ 符合要求 |
+| `src/components/inspector/TaskInputSnapshotPanel.tsx` | 148 行 | 4.4 KB | ✅ 符合要求 |
+| `src/utils/rawPromptCopy.ts` | 50 行 | 1.5 KB | ✅ 符合要求 |
+| `src/utils/githubAuthBlock.ts` | 251 行 | 7.7 KB | ✅ 符合要求 |
+
+---
+
+## 4. 构建与验证
+
+- `pnpm build`: 执行 `tsc && vite build`，2235 模块完整编译通过，零类型错误，产物正常输出。
+- GitHub GraphQL Verified Commit 已创建并同步至远端分支 `a2`：
+  - **Commit OID**: `6753e645249468424b28818b774d8a4d3a0a06f7`
+  - **Commit URL**: https://github.com/Antigravi-ty/agyPreviewInstant/commit/6753e645249468424b28818b774d8a4d3a0a06f7

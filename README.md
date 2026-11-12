@@ -1,67 +1,90 @@
-# Rocket Companion Rust 线头清理与规划审查报告
+# Rocket Companion Rust 重构与音频引擎规划审计及分支裁决报告
 
-## 1. 三个分支线头的对比裁决与云端清理
+## 1. 三线头基准分支裁决与云端清理结果
 
-对仓库内三个待决提交进行了完整父提交、文件差异及构建门禁核查（三者共同父提交均为 `2cb143b` Tier-2 Octopus Merge 与 `1facf97` alpha PR #6）：
+针对提供的三个待决策 Commit：
+- `ec3e076688954389e8afd983e0a1fe71e3a1a8e2`（`origin/z/agy/rc/rust/alpha-merge-and-audio-arch`）
+- `b26d3287295714c16f4f5f69d373498b963d6e70`（`origin/z/agy/rc/rust/sync-main-audio-plan`）
+- `f64c3b85875e8444a133a194be26b8ece8a202f7`（`origin/z/agy/rc/rust/sync-main-audio-investigate`）
 
-| 提交 / 分支 | 状态与决策 | 核查事实 |
-| :--- | :--- | :--- |
-| `b26d3287295714c16f4f5f69d373498b963d6e70`<br>(`z/agy/rc/rust/sync-main-audio-plan`) | **保留（唯一基准）** | 正确保留了 PR #1 多人开球防重入修复（`RuntimeKickoffSignalSubController.ts`）、PR #6 Vite 插件 `signature` 修复（`gitHeadAutoRestartPlugin.ts`）以及 Tier-2 Rust WASM 开球管线（`kickoff_ppo.rs`、`kickoff_v1_v2_obs.rs`、`kickoffEpisodePrimitives.ts` 等）。实测 `pnpm check`（GREEN，1311/1311 TS，`tsc --noEmit`，0 环依赖）与 `pnpm build:wasm:check`（7 个 crates 全部通过）均通过。 |
-| `ec3e076688954389e8afd983e0a1fe71e3a1a8e2`<br>(`z/agy/rc/rust/alpha-merge-and-audio-arch`) | **已从云端删除（HTTP 204）** | 合并冲突解决存在多处严重回退：在 `RuntimeKickoffSignalSubController.ts` 丢失了 PR #1 多人联机修复；在 `kickoff_ppo.rs`、`kickoff_v1_v2_obs.rs`、`kickoffEpisodePrimitives.ts` 等文件回退了 Tier-2 Rust WASM 改造；将 `replayViewerBaselineScenario.ts` tick 从 485 回退到 450；且在仓库根目录直接提交了 `ARCHITECTURE_MERGE_AND_AUDIO_REPORT.md`。 |
-| `f64c3b85875e8444a133a194be26b8ece8a202f7`<br>(`z/agy/rc/rust/sync-main-audio-investigate`) | **已从云端删除（HTTP 204）** | 与 `b26d328` 仅差 1 个文件（`scripts/vite/gitHeadAutoRestartPlugin.ts`），缺失 `signature` 属性导致 Vite 插件存在类型与运行时隐患。 |
+### 最终裁决：**仅保留 `b26d328` (`z/agy/rc/rust/sync-main-audio-plan`)，已从云端删除其余两个分支**
 
-> 注：`b26d328` 当前仅落后 `origin/alpha`（`f5e8c9f`，PR #7 `refactor(radar)`）1 个非功能性提交，后续可直接合入 `alpha`。
+1. **`b26d328` (`z/agy/rc/rust/sync-main-audio-plan`) — 底子最正常（唯一保留）**
+   - 正确合并了 `2cb143b`（Tier-2 Octopus Merge）与 `alpha`（`1facf97`）。
+   - 完整保留了 `alpha` 主线在 `src/game/runtime/RuntimeKickoffSignalSubController.ts` 中修复网络回放倒带与开球死锁的关键提交（`39cdc82`、`815f67d`）。
+   - 正确修复了 `scripts/vite/gitHeadAutoRestartPlugin.ts` 的 `signature` 属性冲突。
+   - 实测 `pnpm check` 全绿：`1311/1311 TS`，`tsc --noEmit` 通过，0 循环依赖、0 越权引用。
+2. **`f64c3b8` (`z/agy/rc/rust/sync-main-audio-investigate`) — 已从 GitHub 云端删除**
+   - 合并 `alpha` 时遗漏 `scripts/vite/gitHeadAutoRestartPlugin.ts` 的 `signature` 字段，存在编译与热重载运行时缺陷。
+3. **`ec3e076` (`z/agy/rc/rust/alpha-merge-and-audio-arch`) — 已从 GitHub 云端删除**
+   - 合并质量存在 4 项严重问题：
+     - **回退了 `alpha` 修复**：`src/game/runtime/RuntimeKickoffSignalSubController.ts` 被错误覆盖回 `2cb143b` 合并前版本，直接丢失了 `39cdc82` 与 `815f67d` 修复；
+     - **夹带无关改动**：在 merge commit 中混入了 `crates/rc_bot_ai/src/kickoff_ppo.rs`、`kickoff_v1_v2_obs.rs`、`kickoffEpisodePrimitives.ts`、`kickoffGhostPrecomputePipeline.ts`、`replayViewerBaselineScenario.ts` 等非合并改动；
+     - **破坏 Vite 插件状态更新**：将 `gitHeadAutoRestartPlugin.ts` 中的 `let baselineSignature` 改为 `const baselineSignature` 并删去了重置赋值；
+     - **污染仓库根目录**：将 `ARCHITECTURE_MERGE_AND_AUDIO_REPORT.md`（257 行）直接提交进了主仓库。
 
----
-
-## 2. 原规划书（`RC-RUST-AUDIO-INVESTIGATION-AND-ROADMAP-2026`）合理性审查
-
-### 2.1 准确且合理的核心结论
-1. **音频 `cue.cars` 断层属实**：`src/audio/WasmAudioDirectorBridge.ts:77` 定义了 `AUDIO_CUE_CARS_WORD_OFFSET = 22`，但全仓无任何读取；`crates/rc_audio_director` 每帧计算了 8 辆车的切片、增益、滤波和 LOD，TS 侧 `GameAudioSubsystem.ts` 与 `TurtleModemEngineSynth.ts` 仍在主线程重复计算。
-2. **Rust Pure-Offload 方向正确**：所有动力学、切片插值、3D 衰减、LOD 留在 Rust，WebAudio 退化为纯执行驱动器（Dumb Driver）。
-3. **碰撞抖动的物理根因正确**：Bullet 在球贴地静止或滚动时每 tick 触发 `BallHitWorld`，必须依靠法向速度 $v_n$、方向余弦 $\cos\theta = |\vec{v}\cdot\vec{n}|/|\vec{v}|$ 与 $\ge 60\text{ms}$ 防抖锁存来区分撞击与滚动/带球。
-
-### 2.2 与代码库事实不符 / 不合理之处（必须修正）
-1. **运行时碰撞音频 Bug 定位偏差**：
-   - 原报告将 `crates/rc_audio_director/src/incident_classifier.rs:292` 的 `ev.speed.abs()` fallback 当作运行时真凶。
-   - **事实**：`AudioDirectorInstance::consume_event_buffer()` 实际调用的是 `director_impact_events.rs` 的 `handle_ball_world_or_post_hit()`，**并未调用 `incident_classifier.rs`**（后者目前仅被 `lib.rs` 单元测试调用）。
-   - `director_impact_events.rs` 虽未 fallback 到 `ev.speed`，但它**完全忽略了 `step_and_events.rs:124` 已经算好并写入 `custom_float` 的 `dir_dot`（$\cos\theta$）**，且使用硬编码 `< 5` tick（41.6ms）冷却、缺乏按表面锁存与带球抑制；同时 `step_and_events.rs` 在球贴地滚动时每 tick 都向 256 槽位事件环写入无效 `BallHitWorld`。需要同步修复 `director_impact_events.rs` 与 `step_and_events.rs`，并清理/统一 `incident_classifier.rs` 的重复逻辑。
-2. **TS 音频删除清单与实际文件不符**：
-   - 原报告要求“彻底删除 `TurtleModemDrivetrainModel.ts` 与 `TurtleModemGranularVoiceGraph.ts`”以及“废除 `RemoteEngineAudioLodController.ts`”。
-   - **事实**：`TurtleModemDrivetrainModel.ts` 与独立的 `RemoteEngineAudioLodController.ts` **在 Tier-2 已经不存在**（`RemoteEngineAudioLodController` 是 `TurtleModemEngineSynth.ts:349` 内的类）；而 `TurtleModemGranularVoiceGraph.ts` 是 **WebAudio 40 切片节点图（`AudioBufferSourceNode` + `GainNode` + `BiquadFilterNode`）**，不能整文件删除，而应保留其作为 Dumb WebAudio 节点图，由 `cue.cars[i]` 直接喂入参数，裁撤 `TurtleModemEngineSynth.ts` 与 `turtleModemSynthAcousticPipeline.ts` 中的动力学/RPM/切片查找/LOD 计算。
-3. **Tier 4（轨迹预测）几乎整组与 Tier-2 重复，且 `t4-15` 张冠李戴**：
-   - 原报告规划 `t4-09`..`t4-13`（定义 Vertex POD、Rust 生成带状网格与索引、拦截求解器、删除 `TrajectoryTubeMeshBuilder.ts`、Three.js 零拷贝绑定）。
-   - **事实**：`TrajectoryTubeMeshBuilder.ts` 已不存在；`crates/rc_trajectory_mesh` 已经实现了 `tube_extruder.rs`、`intercept_solver.rs`、`sampler_and_anomaly.rs`、`bounce_and_anchors.rs`，`src/physics/core.js` 已导出 `_physics_getTrajectoryPositionsPtr` 等全部零拷贝指针。
-   - `t4-15-hex-thickness-tuning-port` 将 PR #6（`DriftwoodsHexGeometryProcessor.ts` 中球场六边形墙面 `Woods_Field_Walls_Hexes` 的 GPU 着色器属性）误认为轨迹丝带宽度，属于概念混淆。
-4. **Tier 5（回放）与 Tier 6（联机）低估了现有 Rust 资产**：
-   - `crates/rc_replay_codec` 已实现 `container.rs`（RLRC 容器）、`delta_transpose.rs`、`seeker.rs`（Hermite-Slerp）、`anomaly.rs`；真正缺失的是 `src/replay/`（106 个 TS 文件）中的 **UE3 `.replay` NetStream 位流读取与 Actor/Property 通道解码**。
-   - `crates/rc_physics_sim/src/reconciler.rs` 已实现 **256 帧快照环形缓冲（`SNAPSHOT_RING_CAPACITY = 256`）与 1024 帧多车控制环（`CONTROLS_RING_CAPACITY = 1024`）**，并非原报告所说的“仅有数据结构定义（15%）”。真正缺的是把 `src/network/`（95 个 TS 文件）中的预测协调、RTT/时钟平滑、房间状态编解码与 `reconciler.rs` 接通并裁撤 TS 冗余。
-5. **32 分支规划过于碎片化**：为凑 4×8=32 把已完成的轨迹/回滚基础设施重复列入，会带来不必要的合并与维护开销。
+> 注：原报告中声明“推荐工作分支 `z/agy/rc/rust/audio-recreate-plan`（已基于 `sync-main-audio-plan` 切出）”，经核查远端尚不存在该分支，后续应直接基于 `z/agy/rc/rust/sync-main-audio-plan`（`b26d328`）切出。
 
 ---
 
-## 3. 修正后的并行推进计划（3 个 Tier / 16 个正交分支）
+## 2. 原规划报告（`RC-RUST-AUDIO-INVESTIGATION-AND-ROADMAP-2026`）合理性审计
 
-所有分支基于 `z/agy/rc/rust/sync-main-audio-plan`（`b26d328`）创建，遵循 `<400L`、`0 环依赖`、`pnpm check` + `pnpm build:wasm:check` 门禁。
+对照 `b26d328` 真实代码库逐项核验后，原报告**在 Tier 3 音频问题诊断上基本准确，但在代码路径定位上有遗漏，且 Tier 4 / Tier 5 / Tier 6 存在大量与现有代码严重不符的“重复规划”和“文件名幻觉”**，需要重构。
 
-### Tier 3：音频闭环与碰撞防抖（6 个分支）
-1. `z/agy/rc/rust/t3-01-contact-rolling-gate`：在 `rc_physics_sim/src/step_and_events.rs` 对 `BallHitWorld` 增加法向速度与 `dir_dot` 门控，避免滚动时每 tick 污染事件环。
-2. `z/agy/rc/rust/t3-02-director-debounce-and-unify`：在 `rc_audio_director/src/director_impact_events.rs` 接入 `ev.custom_float`（`dir_dot`）与 $\ge 60\text{ms}$ 表面防抖锁存，清理 `incident_classifier.rs` 中的 `ev.speed` fallback 与重复分类路径。
-3. `z/agy/rc/rust/t3-03-ground-dribble-friction-model`：实现车-球相对速度 $< 250\text{ UU/s}$ 贴地带球摩擦判据，抑制离散碰撞音并平滑过渡到球体滚动音环。
-4. `z/agy/rc/rust/t3-04-audio-contact-unit-tests`：覆盖高速平滚、垂直砸地、浅角滑行、带球、60ms 防抖窗口的 Rust 单元测试（直接测试 `AudioDirectorInstance` 运行时路径）。
-5. `z/agy/rc/rust/t3-05-wasm-car-cue-bridge-cutover`：在 `WasmAudioDirectorBridge.ts` 接入 `AUDIO_CUE_CARS_WORD_OFFSET`，将 `CarAcousticLoopPod` 直接映射驱动 `TurtleModemGranularVoiceGraph`（保留为 Dumb WebAudio Driver）。
-6. `z/agy/rc/rust/t3-06-retire-ts-engine-synth-and-lod`：裁撤 `TurtleModemEngineSynth.ts` / `turtleModemSynthAcousticPipeline.ts` 中的 TS 动力学、切片查找与 `RemoteEngineAudioLodController` 计算，对齐 `StadiumBusBlendPod`。
+### 2.1 核验准确的部分
+- **音频“半下沉”架构现状属实**：`src/audio/WasmAudioDirectorBridge.ts`（第 77 行）确实定义了 `AUDIO_CUE_CARS_WORD_OFFSET = 22`，但全仓库无任何读取代码；TS 侧 `TurtleModemEngineSynth.ts`、`TurtleModemGranularVoiceGraph.ts`、`turtleModemSynthAcousticPipeline.ts` 与 `VehicleAudioManager.ts` 仍在主线程重复计算 40 切片混合与动力学，而 Rust `rc_audio_director` 已算完所有 `cars[8]` 数据。
+- **碰撞抖动根因方向正确**：`crates/rc_audio_director/src/incident_classifier.rs`（第 292–296 行）确实存在 `ev.normal_rel_vel <= 0.0` 时错误 fallback 到 `ev.speed.abs()` 的问题，导致高速平滚时触发高阈值地板撞击音。
 
-### Tier 4：回放 UE3 NetStream 下沉（5 个分支）
-7. `z/agy/rc/rust/t4-01-ue3-bitstream-reader`：在 `rc_replay_codec` 中实现无锁 UE3 `BitReader`。
-8. `z/agy/rc/rust/t4-02-netstream-actor-channel-decoder`：实现 UE3 NetStream Actor/Component 属性通道解码器。
-9. `z/agy/rc/rust/t4-03-replay-header-meta-and-touch-stats`：解析 `.replay` 头部元数据、玩家/GUID 与触球时间线统计。
-10. `z/agy/rc/rust/t4-04-replay-wasm-streaming-bridge`：实现流式 WASM 解码管线，对接现有 `container.rs` / `seeker.rs`。
-11. `z/agy/rc/rust/t4-05-retire-ts-netstream-parsers`：废弃并移除 `src/replay/` 下冗余的 TS 位宽试探器与老解析器。
+### 2.2 失真或不合理的部分（必须修正）
+1. **碰撞抖动漏掉了真正运行的 `AudioDirectorInstance` 路径**：
+   - `crates/rocketsim_wasm/src/lib.rs` 实际绑定运行的是 `AudioDirectorInstance`（`crates/rc_audio_director/src/director_impact_events.rs` 中的 `handle_ball_world_or_post_hit`），而非 `incident_classifier.rs` 的 `process_physics_incidents`。
+   - `director_impact_events.rs` 的真实问题是：使用 `ev.normal_rel_vel.max(ev.impulse)`、硬编码 `< 5` ticks（41.6ms）冷却，且**完全没有使用** `crates/rc_physics_sim/src/step_and_events.rs`（第 124 行）已经算好并写入 `custom_float` 的 `dir_dot`（$\cos\theta$）来做浅角滚动过滤。两条路径必须同时修复。
+2. **Tier 3（分支 01~08）存在不存在的文件名且拆分过碎**：
+   - 原计划点名要删除 `RemoteEngineAudioLodController.ts` 与 `TurtleModemDrivetrainModel.ts`，但 `src/audio/`（共 26 个文件）中**根本不存在这两个文件**。实际需清理/瘦身的是 `TurtleModemEngineSynth.ts`、`TurtleModemGranularVoiceGraph.ts`、`turtleModemSynthAcousticPipeline.ts`、`VehicleAudioManager.ts` 以及依赖 `TurtleModemEngineSynth` 的 `AudioMenuPreviewPlayer.ts`。
+   - 将同一组滚动判据、防抖和单元测试硬拆为 `t3-01`~`t3-04` 四个分支属于过度碎片化，合并为一个内聚分支即可。
+3. **Tier 4（轨迹预测）几乎全部重复规划**：
+   - `crates/rc_trajectory_mesh/src/` 已经完整实现 `tube_extruder.rs`、`intercept_solver.rs`、`sampler_and_anomaly.rs`、`bounce_and_anchors.rs`、`ground_reachability.rs`、`aerial_reachability.rs`，且 `crates/rocketsim_wasm/src/exports/trajectory_exports.rs` 已导出零拷贝顶点/法线/UV/索引指针。
+   - 原报告中点名要移除的 `TrajectoryTubeMeshBuilder.ts` 在 `src/` 中不存在；而 `t4-15-hex-thickness-tuning-port` 属于 Driftwoods 球场 GPU Hex Ribbon 着色器缩放特性，与轨迹网格毫无关系。
+4. **Tier 5（回放系统）混淆了自研二进制流与 UE3 `.replay` 解析**：
+   - `crates/rc_replay_codec/src/` 已经实现 `container.rs`、`delta_transpose.rs`、`seeker.rs`、`anomaly.rs` 及 `replay_exports.rs`，原计划的 `t5-20`、`t5-23` 属于重复建设。
+   - 真正仍留在 `src/replay/`（106 个 TS 文件）的硬骨头是 **UE3 `.replay` NetStream 位流/Actor 通道解析** 及 `ReplayTouchTimelineAnalyzer.ts`。
+5. **Tier 6（网络预测与回滚）严重低估 Rust 现有资产**：
+   - 原报告称“Multiplayer 完成度 15%，仅有数据结构定义”，与代码库严重不符。
+   - `crates/rc_physics_sim/src/reconciler.rs` 与 `crates/rocketsim_wasm/src/exports/reconciler_exports.rs` 已经实现了 `CONTROLS_RING_CAPACITY`、`ReconcileControlEntryPod`、`ReconcileOutcomePod`、`_physics_reconcileRollbackToTick` 和 `step_reconciler_range`。因此 `t6-25`~`t6-27` 已在 Rust 侧完成，真正缺口是 `src/network/`（95 个 TS 文件）全面切换消费这些 WASM 导出并下线 TS 冗余逻辑。
 
-### Tier 5：联机预测与状态同步下沉 + 终局审计（5 个分支）
-12. `z/agy/rc/rust/t5-01-reconciler-wasm-bridge-cutover`：将 `src/network/` 客户端预测与回滚逻辑接通至已有的 `rc_physics_sim/src/reconciler.rs`（256 帧快照环 + 1024 控制环）。
-13. `z/agy/rc/rust/t5-02-rtt-clock-and-smoothing-rust`：物理时钟、RTT 抖动平滑与视觉纠偏衰减下沉至 Rust。
-14. `z/agy/rc/rust/t5-03-room-state-pod-codec`：联机房间 8 车状态紧凑二进制打包编解码。
-15. `z/agy/rc/rust/t5-04-retire-ts-network-reconciler`：精简重构 `src/network/`（95 文件），移除 TS 侧重复预测/回滚状态机。
-16. `z/agy/rc/rust/t5-05-multiplayer-soak-and-radar-audit`：双世界/多车浸泡测试、`pnpm check` 与 `pnpm build:wasm:check` 全量验收。
+---
+
+## 3. 修正后的精简并行分支规划（16 分支，基于 `b26d328`）
+
+将原虚胖的 32 分支精简为 **4 个 Tier、16 个高内聚正交分支**：
+
+### Tier 3：音频引擎全下沉与碰撞抖动根治（5 分支）
+1. `z/agy/rc/rust/t3-01-ball-contact-rolling-and-debounce`
+   - 同时修复 `director_impact_events.rs`（live 路径）与 `incident_classifier.rs`：删除 `ev.speed` fallback；接入 `ev.custom_float`（`dir_dot < 0.15` 浅角抑制）；将地板/墙面碰撞冷却统一提升至 `≥ 60ms`（8 ticks）；加入地面带球低相对速度抑制；补充覆盖高速平滚、浅角擦碰、带球、60ms 防抖的 Rust 单元测试。
+2. `z/agy/rc/rust/t3-02-wasm-car-cue-bridge-cutover`
+   - 在 `WasmAudioDirectorBridge.ts` 接入 `AUDIO_CUE_CARS_WORD_OFFSET = 22`，读取 `AudioFrameCuePod.cars[8]` 并直接映射至 WebAudio `AudioParam`。
+3. `z/agy/rc/rust/t3-03-retire-ts-turtle-modem-synth`
+   - 下线 `TurtleModemEngineSynth.ts`、`TurtleModemGranularVoiceGraph.ts`、`turtleModemSynthAcousticPipeline.ts` 中的 TS 动力学与切片计算，将 `VehicleAudioManager.ts` 与 `AudioMenuPreviewPlayer.ts` 改造为纯 Dumb Driver。
+4. `z/agy/rc/rust/t3-04-stadium-anthem-thin-driver`
+   - 对齐 `StadiumBusBlendPod` 与 `wasmAudioOneShotDispatcher.ts`，清理 TS 侧残留混音与衰减计算。
+5. `z/agy/rc/rust/t3-05-audio-radar-and-e2e-verify`
+   - 音频子系统体积/边界/无死代码清理，确保 `pnpm check` 与音频行为验收通过。
+
+### Tier 4：轨迹预测 TS 侧零拷贝收口（2 分支）
+6. `z/agy/rc/rust/t4-01-trajectory-ts-zero-copy-audit`
+   - 核验 Three.js 侧是否已 100% 直读 `trajectory_exports.rs` 共享内存指针，清理残留 TS 几何包装代码。
+7. `z/agy/rc/rust/t4-02-trajectory-120hz-benchmark`
+   - 建立 120Hz 连续采样与零拷贝渲染基准测试。
+
+### Tier 5：UE3 `.replay` NetStream Rust 化（5 分支）
+8. `z/agy/rc/rust/t5-01-ue3-bitstream-reader`：在 `rc_replay_codec` 中实现 UE3 无锁 `BitReader` 与头部元数据解码。
+9. `z/agy/rc/rust/t5-02-ue3-actor-channel-parser`：实现 UE3 NetStream Actor/Component 属性通道解码器。
+10. `z/agy/rc/rust/t5-03-touch-timeline-analyzer-rust`：将 `src/replay/ReplayTouchTimelineAnalyzer.ts` 下沉至 Rust。
+11. `z/agy/rc/rust/t5-04-replay-wasm-streaming-bridge`：实现大 `.replay` 文件流式 WASM 解码桥接。
+12. `z/agy/rc/rust/t5-05-retire-ts-netstream-parsers`：分批 `git rm` `src/replay/`（106 TS 文件）中已被替代的位流解析器。
+
+### Tier 6：联机回滚全面切换至 `rc_physics_sim::reconciler`（4 分支）
+13. `z/agy/rc/rust/t6-01-ts-network-reconciler-cutover`：让 `src/network/` 全面切换消费 `_physics_reconcileRollbackToTick` 与 `step_reconciler_range`，移除 TS 侧重复状态回滚推导。
+14. `z/agy/rc/rust/t6-02-rtt-and-clock-sync-rust`：将 RTT 抖动平滑与物理时钟同步下沉至 `rc_physics_sim`。
+15. `z/agy/rc/rust/t6-03-room-state-pod-codec`：联机房间 8 车状态紧凑二进制协议收口。
+16. `z/agy/rc/rust/t6-04-multiplayer-soak-and-final-radar`：双世界/多车浸泡测试与全局 `pnpm check` 终局验收。

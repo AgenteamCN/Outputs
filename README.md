@@ -1,54 +1,55 @@
-# Track D Deliverable Report: Unified RoomReplicationBus & Hot-Swappable Activity Orchestrator
+# Track C: Dynamic Training Pack (.rcd) Implementation & Architecture Report
 
-- **Branch**: `z/agy/rc/track-d-replication-bus`
-- **Verified Bot Commit**: `cf5cfeee60fc0cd54eb2dcdc13dbc2aa845d80a1` (`isValid: true`, `state: VALID`)
-- **Verification**:
-  - `npx prettier --check` on all 14 Track D files: **PASS**
-  - `pnpm run check` (Radar 2.0 + `tsc --noEmit`): **PASS (GREEN)** — `1359/1359` TS files, `0` circular deps, `0` upward imports, `0` orphan modules, `0` TypeScript errors.
-  - Node runtime assertions (`ReplicationBusProtocol`, `AdaptiveReplicationPacer`, `SyncAuthorityRouter`, `ReplicationStateInterpolator`, `RoomActivityOrchestrator`, `HostWorkerMessageRouter`): **ALL PASSED**.
+- **Branch**: `z/agy/rc/track-c-dynamic-training`
+- **Verified Commit**: `5aab06257b65d6a39128dcb498e23eb62e794efa` (`verified: true`, `state: VALID`)
 
 ---
 
-## 1. Implemented Modules & Architecture
+## 1. Implemented Architecture & Deliverables
 
-### A. Dual-Mode Replication Protocol (`src/network/protocol/`)
-- **`ReplicationBusProtocol.ts`**:
-  - Dual replication modes: `REPLICATION_MODES.CONTINUOUS` (`'continuous'`, 60/120Hz) and `REPLICATION_MODES.SPARSE` (`'sparse'`, frozen frame + 2Hz 16-byte Ping-Pong).
-  - Dynamic packet section bitmask (`REPLICATION_PACKET_FLAGS`: `STATE_SNAPSHOT`, `USER_INPUT`, `CLOCK_AND_SCORE`, `TELESTRATOR_SYNC`, `CSR_SUMMARY`, `SPARSE_FROZEN`, `FOLLOW_HOST_CAMERA`, `EDGE_LOCK_ACTION`) and `resolvePacketFlagsForActivity(...)` so Match, Freeplay, Replay, and Sandbox only carry the sections they need.
-  - Hot-switch & CSR contracts: `RoomActivitySwitchPayload`, `StatePausedAckPayload`, `CsrStateBroadcastPayload`.
-  - Exact 16-byte binary Ping-Pong codec: `encodeSparsePingPong16B`, `isSparsePingPong16B`, `decodeSparsePingPong16B` (`PING_PONG_16B_MAGIC = 0x52`, `PING_PONG_16B_SIZE = 16`).
-- **`HostWorkerProtocol.ts`**:
-  - Added `ROOM_ACTIVITY_SWITCH`, `REPLICATION_MODE_SET`, `STATE_PAUSED_ACK`, and `ROOM_CSR_STATE_BROADCAST` to `HOST_WORKER_MSG_TYPES`.
+### 1.1 Independent StateSession + Linked-List `.rcd` Pack Schema
+- `dynamicTrainingPackTypes.ts`:
+  - Separates recorded physics slices (`DynamicTrainingStateSession`, 4s @ 120Hz = 480 frames) from pack definitions (`DynamicTrainingPackRecord` / `RCDPackArchive`).
+  - Uses `prevShotId` linked-list ordering (`sortDynamicShotsByPrevLink`, `relinkDynamicShotChain`) so shots reference independent `sessionId` entries without duplicating heavy frame data during editing.
+  - Defines per-car takeover rules (`DynamicCarTakeoverRule`: `'player' | 'disappear' | 'as-previous' | 'model' | 'no-input'`).
+- `dynamicTrainingPackCodec.ts`:
+  - Self-contained `.rcd` (`RCDPack`) JSON encoder/decoder that bundles pack metadata, ordered shot references, and all referenced `DynamicTrainingStateSession` payloads on export, and hydrates them back into the session pool on import.
+- `dynamicTrainingPackStorage.ts` & `dynamicTrainingPackStore.ts`:
+  - IndexedDB async storage (`rc-dynamic-training-db`) with `state_sessions`, `dynamic_packs`, and `shot_stats` object stores + in-memory fallback.
+  - Supports `captured_from_replay` default folder, `moveShotBetweenPacks`, `duplicateDynamicShotToPack`, reference-counted `deleteShotWithSessionCheck`, and persistent attempt/goal/timeout stats.
 
-### B. Dual WebRTC DataChannel Multiplexing & Adaptive Pacing (`src/network/transport/webrtc/` + `src/network/transport/`)
-- **`HandshakeSession.ts`**:
-  - Host now creates both `'game_net'` (`ordered: false, maxRetransmits: 0`, unreliable snapshot/input channel) and `'game_ctrl'` (`ordered: true`, reliable control/signaling channel) during `createOfferToken`.
-- **`DataChannelTransport.ts` & `dataChannelFramingPipeline.ts`**:
-  - `bindDataChannel` routes `'game_ctrl'` to `bindControlDataChannel` while maintaining `'game_net'` for high-frequency snapshots/inputs.
-  - `transmitReliableControlFrame` prefers `'game_ctrl'`, falling back to `'game_net'` or `BroadcastChannel` if `'game_ctrl'` is not open.
-  - `handleIncomingMessage` handles 16-byte binary sparse Ping-Pong frames (`isSparsePingPong16B`) and `room_activity_switch` / `replication_mode_set` / `state_paused_ack` / `room_csr_state_broadcast` control frames.
-- **`AdaptiveReplicationPacer.ts`**:
-  - Congestion-aware downscaling (120Hz -> 60Hz -> 30Hz) based on `rttMs`, `packetLossRate`, and `bufferedAmountBytes`, plus 2Hz (`500ms`) sparse Ping-Pong cadence.
-- **`P2PWebRTCChannel.ts`**:
-  - Exposed `sendReliableControl`, `sendRoomActivitySwitch`, `sendStatePausedAck`, `sendCsrStateBroadcast`, and `setReplicationMode`.
+### 1.2 4s Replay Capture & Exact Countdown-to-Intervene Takeover
+- `DynamicTrainingSliceExtractor.ts`:
+  - Extracts the 4-second (480 frames @ 120Hz) pre-roll `DynamicTrainingStateSession` before the cursor/intervene point from `RLRCConvertedReplaySession`, and hydrates sessions back to `RLRCFrame120Hz[]` + `RLRCPlayerSlotMeta[]`.
+- `RLRCReplayTypes.ts`, `RLRCInterveneTargetFrameApplier.ts`, `RLRCInterveneNonPovSyncPipeline.ts`, `RLRCInterveneTakeoverSubController.ts`:
+  - **Countdown vs. Intervene Fix**: During `preroll-countdown` (`countdownRemainingTicks > 0`), all active cars remain visible and follow their original recorded state. At the exact moment `launchShotNow()` begins accepting user input (`countdownRemainingTicks === 0`), cars configured as `'disappear'` are deactivated and `'bot-takeover'` / `'model'` slots begin AI control.
+  - **Per-Slot Takeover Routing**: Added `perSlotModes` and `perSlotModelIds` to `RLRCInterveneLaunchConfig` and `decideControlsForSlot(..., modelId)`.
 
-### C. Entity Authority Routing & Steady-State Interpolation (`src/network/sync/`)
-- **`SyncAuthorityRouter.ts`**:
-  - Entity-level physical authority routing (`'host' | 'peer' | 'replay_readonly' | 'takeover_handoff'`) with `applyActivitySwitch`, `beginTakeoverHandoff`, `commitTakeoverHandoff`, `revertToReplayReadonly`, `canAcceptClientInput`, and `followHostEnabled` / `latestCsrSummary` state for Client-Side Rendering (CSR) / Follow-Host mode.
-- **`ReplicationStateInterpolator.ts`**:
-  - Reuses `interpolateRigidBodyHermiteSlerp` and `vDist` from `src/replay/rlrc/synthesis/RLRCHermiteSlerpMathPipeline.ts` (cycle-free) for smooth Hermite + SLERP rigid-body resampling, teleport snapping (`maxTeleportDistanceUu = 450`), and frozen-frame hold in `'sparse'` mode.
+### 1.3 Dynamic Training Mode Runner & Simplified Judge
+- `DynamicTrainingJudge.ts`:
+  - Simplified outcome evaluator strictly checking **Goal scored** (team 0 / team 1) or **Timeout** (`1..60s`).
+  - Optional controllable-car-only spawn variation (`applyOptionalCarSpawnVariationToFrame`), disabled by default to preserve scenario determinism.
+- `DynamicTrainingMode.ts` & `GameModeManager.ts`:
+  - Registered under `'dynamic-training-pack'`. Drives 4s pre-roll countdown, exact intervene takeover, live 120Hz stepping, and Goal/Timeout persistence.
 
-### D. Hot-Swappable Activity Orchestrator (`src/network/server/`)
-- **`activities/ActivityKernel.ts`**:
-  - Defines `RoomActivityKernel` and `ActivityKernelContext`, plus lightweight default kernels (`MatchActivityKernel`, `FreeplayActivityKernel`, `ReplayActivityKernel`, `SandboxActivityKernel`) ready for Track E to expand.
-- **`RoomActivityOrchestrator.ts`**:
-  - Manages active kernel hot-swapping (`switchActivity` with epoch increment and `STATE_PAUSED_ACK` barrier clearing), `setReplicationMode`, `recordStatePausedAck`, and `buildCsrBroadcast`.
-- **`HostWorkerMessageRouter.ts`, `workerReplayAndDiagnosticsRouter.ts`, `AuthoritativeServerHost.ts`**:
-  - Wired `RoomActivityOrchestrator` into `HostWorkerMessageRouter` (`MSG.ROOM_ACTIVITY_SWITCH`, `MSG.REPLICATION_MODE_SET`, `MSG.STATE_PAUSED_ACK`, `MSG.ROOM_CSR_STATE_BROADCAST`) and exposed `switchActivity`, `setReplicationMode`, `sendStatePausedAck`, and `broadcastCsrSummary` on `AuthoritativeServerHost`.
+### 1.4 Developer Sandbox UI & Replay Importer Integration
+- `DynamicTrainingPackFloatingWindow.tsx`, `DynamicTrainingPackManagerSection.tsx`, `DynamicTrainingShotEditorCard.tsx` (following `src/ui-core/AGENTS.md` layer rules):
+  - Pack selector, `.rcd` import/export, create pack, shot list with Move / Duplicate / Delete (with double-check confirmation).
+  - Shot editor: Timeout, Countdown (`0..3s`), Intervene Offset (frames), Per-Car Takeover Matrix (`Player` / `As Previous` / `Disappear` / `AI Model` / `No Input`), optional POV spawn variation toggle, and Play/Restart/Stop controls.
+- `ReplayToRcsImporterFloatingWindow.tsx`, `replayToRcsImporterStore.ts`, `RLRCReplaySessionController.ts`, `runtimeDynamicTrainingBridge.ts`:
+  - Added **"Put 4s Pre-Roll into Dynamic Training Pack (.rcd)"** button to capture directly from any loaded `.replay` cursor frame into `captured_from_replay`.
 
 ---
 
-## 2. Open Design Items for Cross-Team Alignment (Track E / F / UI)
-1. **Follow-Host CSR Notification & Opt-In UX**: The protocol and `SyncAuthorityRouter` now carry `followHostEnabled` and `CsrStateBroadcastPayload`, while the low-priority persistent notification ("Completely Follow Host" toggle) should be wired in `ui-core` / `ui-system` once the overlay team finalizes the notification slot.
-2. **Training/Freeplay Packet Compression**: `ACTIVITY_DEFAULT_PACKET_FLAGS` omits `CLOCK_AND_SCORE` for `freeplay`; Track E can further customize `FreeplayActivityKernel` and `DevSandboxKernel` inside `src/network/server/activities/` without touching the bus layer.
-3. **Headless Multi-Client Repro**: `scripts/runMultiplayerRoomRepro.mjs` can be extended in Track E (`branch18`) to exercise `ROOM_ACTIVITY_SWITCH` (`freeplay -> match -> replay -> freeplay`) across headless Chrome peers.
+## 2. Verification Results
+- `pnpm run format:check`: **PASS**
+- `pnpm run check` (`radar` + `tsc --noEmit`): **PASS** (1364/1364 TS files, 0 circular deps, 0 boundary violations, 0 tsc errors)
+- `pnpm run build`: **PASS** (`vite build` succeeded cleanly)
+
+---
+
+## 3. Open Items for Follow-Up Discussion
+1. **Scratch Authoring Workflow**: Recording sequential car trajectories starting from a static ball (spawning car 1 -> recording -> spawning car 2 at a chosen timestamp/pose while keeping car 1's recorded actions) requires a multi-pass recording state machine on top of `DynamicTrainingStateSession`.
+2. **Per-Slot Multi-Model Inference**: `perSlotModelIds` is now plumbed through `RLRCInterveneNonPovSyncPipeline` to `decideControlsForSlot(..., modelId)`, but `RLRCInterveneEnvPortBuilder` / `BotCoordinator` currently routes a single active bot policy; multi-model simultaneous inference per slot needs `BotCoordinator` support if different cars use different models (e.g., Nexto vs. Necto) in the same shot.
+3. **Online Multiplayer Takeover**: Assigning or swapping which connected client controls which `slotIndex` in a `.rcd` session depends on Track D/F `RoomReplicationBus` authority routing.
+4. **Spawn Variation Policy**: Currently off by default for dynamic packs; decide whether controllable-car-only jitter should ever be enabled per-pack or kept strictly opt-in per-shot.

@@ -1,74 +1,63 @@
-# Track A（3D Telestrator & Drawing Sandbox）问题定位、修复与使用说明
+# 调查报告：agyPreviewInstant 最新版本无法调用 API 原因排查
 
-## 一、为什么之前“画不出 Stroke、看不到 1-6、永远像 Direction Adjust”？
+## 结论摘要
 
-经过对 `origin/z/agy/rc/track-a-telestrator-sandbox` 的排查，之前确实不是单纯“没做完”，而是**模式状态机与 HUD/相机管线之间有 4 处关键断链**，导致功能在运行时直接失效：
-
-1. **最大元凶：`DrawingSandboxMode` 在第 1 帧就自动退出了（导致画不出 Stroke + 永远只能拖动旋转视角）**
-   - 此前点击 Sandboxes 菜单里的 `Drawing Sandbox` 只调用了 `modeManager.setMode('drawing-sandbox')`，**没有同步写入 `runtime.match.state.mode = 'drawing-sandbox'` 和 `appStore.matchMode`**。
-   - 结果下一帧 `GameModeManager.getActiveMode()` 读到 `match.state.mode` 还是 `'freeplay'`，立刻把模式切回 `FreeplayMode`，触发了 `DrawingSandboxMode.onLeave()`：
-     - 指针事件被解绑（`handlePointerDown/Move/Up` 全部失效，所以画不出任何 Stroke）；
-     - `freeController.shouldSuppressDrag` 被清空，于是 `FreeCameraController` 接管了鼠标左键拖拽，表现出来就是**无论点 Pen 还是 Compass，拖动鼠标都在旋转视角**，看起来就像“永远处于 Direction Adjust”。
-2. **两侧 1-6 玩家条（`EdgePlayerHudStrip`）被 `InGameHUD` 过滤掉了**
-   - `DrawingSandboxMode` 虽然推送了 6 辆车的 Roster 到 `globalHudTransientChannel`，但：
-     - `InGameHUD.tsx` 的 `showEdgeRosterStrips` 只对 `match` / `exp-multi-bots` / `replay-viewer` 开放，没包含 `drawing-sandbox`；
-     - `TelemetryStage.ts` 与 `hudRosterResolverPipeline.ts` 每帧都会重算并覆盖 Roster，因为缺少 `drawing-sandbox` 分支，每帧都把 6 辆车冲刷成空数组；
-     - `useReplayPovSlotHotkeys.ts` 点击卡片时也没路由给 `useTelestratorStore.triggerSelectCameraSlot`。
-3. **相机视角切不到 2-6 号车**
-   - `GameCameraSubsystem.resolveFrameCameraMetadata()` 此前只读取 `replayPovCarIndex` 或 `activeCar (0)`，没有读取 `drawing-sandbox` 下的 `camera.focusedCarIndex`，导致即使切到 2-6 号车，镜头也依然锁死在 1 号车（index 0）。
-4. **关于 `[FLOATING WINDOW SCHEMA ERROR]` 报错**
-   - 报错来自 `PerformanceBoostTunerFloatingWindow.tsx`（`alpha` 分支上遗漏了 `hideFooter` 字段），与 `TelestratorToolbarFloatingWindow.tsx` 无关（后者已显式声明 `hideFooter: true`）。如您所说，这部分交给 UI 团队清理即可。
+1. **不是仓库代码改坏**：过去 24–48 小时（2026-11-11 至 2026-11-13）仓库内的改动（`taskStore` 切片拆分、Modal 拆分、`PrimerModalShell`、Hook 设置与剪贴板修复等）**未破坏**请求构造或调度链路。`pnpm check`（`tsc --noEmit`、`eslint`、`vitest` 13/13）与 `pnpm build` 均通过。
+2. **不是 API 协议大改版导致请求格式失效**：`agyPreviewInstant` 当前使用的 `POST https://generativelanguage.googleapis.com/v1beta/interactions`、`agent: "antigravity-preview-09-2026"`、`agent_config: { type: "antigravity", model: ... }` 及 `background: true` / `stream: true` 仍完全符合 Google AI Studio 2026-11-12/13 最新文档规范（虽然 2026 年 11 月起官方 SDK 默认切到 `v1`，但 `antigravity-preview-09-2026` 预览版托管 Agent 文档仍明确使用 `v1beta`）。
+3. **真正原因在 Google 侧（2026-11-12 起生效的配额与风控策略收紧）**：
+   - **Free Tier 配额被清零（HTTP 429 `limit: 0`）**：仓库默认模型配置为 `gemini-4-argon`（搭配 `antigravity-preview-09-2026`）。自 **2026-11-12** 起，Google 将 `gemini-4-argon` 和 `gemini-4-carbon` 在 Gemini Interactions API **Free Tier（免费层 API Key）上的配额直接设为 `0`**（`limit: 0 requests per day` / `limit: 0 input tokens per minute`），导致无论使用 `background` 还是 `stream` 模式、无论是否关闭 Hook，都会在 API 侧直接失败。
+   - **为什么感觉“只能从网页端 / App / CLI 调用”**：Antigravity App、Antigravity CLI 与 Gemini 网页端走的是**个人订阅配额（Free / Google AI Pro / Google AI Ultra）**，目前仍可调用 `gemini-4-argon`、`gemini-4-carbon` 以及 11 月 12 日新发布的 `gemini-4-hydrogen` / `Orchestrator`；而 `agyPreviewInstant` 走的是 **Google AI Studio API Key（Interactions API）** 通道，受 API 计费层级限制。
+   - **同期伴随 403 风控封禁潮**：2026-11-06 及 **2026-11-12 ~ 11-13**（随 Gemini 4 Hydrogen 发布与 Jules 11 月 12 日进入只读状态），Google 对 Antigravity 触发了大规模 `403 PERMISSION_DENIED (TOS_VIOLATION)` 误报/封禁潮，部分账号的 CLI/API 访问也被直接禁用。
 
 ---
 
-## 二、本次修复内容（分支 `z/agy/rc/track-a-telestrator-fix`）
+## 一、仓库本地排查（最近 48 小时改动检查）
 
-已基于 `origin/z/agy/rc/track-a-telestrator-sandbox` 创建新分支 `z/agy/rc/track-a-telestrator-fix` 并提交 Verified Bot Commit `ddbd338`：
+### 1. 请求构造与 API 端点检查
+在 `src-tauri/src/google_api/` 中检查了核心请求代码：
+- `client.rs`：`GOOGLE_API_BASE_URL` 为 `https://generativelanguage.googleapis.com/v1beta`，调用 `POST /interactions`、`GET /interactions/{id}`、`POST /interactions/{id}/cancel`。
+- `payload_builder.rs`：`build_create_interaction_body` 构造：
+  - `agent`: `"antigravity-preview-09-2026"`（来自 `resolvedProfile.json`）
+  - `agent_config`: `{ "type": "antigravity", "model": "gemini-4-argon" }`
+  - `background: true`（或 `stream: true`）
+  - `environment`: `{ "type": "remote", "network": { "allowlist": [{ "domain": "*" }] } }`；当关闭 Hook（`enable_tool_hooks = false`）时不会注入 `.agents/hooks.json`。
+- `stream_runner.rs`：使用 `Accept: text/event-stream` 与 `"stream": true` 请求同一端点 `/v1beta/interactions`。这解释了为何切换 Stream Mode 或关闭 Hook 均无区别——两者撞上的是同一个后端准入/配额限制。
 
-- `DrawingSandboxMode.ts`：
-  - 进入模式时同步设置 `runtime.match.state.mode = 'drawing-sandbox'` 与 `useAppStore.getState().setMatchMode('drawing-sandbox')`；
-  - 进入时强制初始化为 **Draw Mode（`drawingEnabled = true`, `directionAdjustActive = false`）**；
-  - 将工具栏浮窗初始位置下移至 `{ x: 16, y: 280 }`，避免与左上角 `EdgePlayerHudStrip` 重叠。
-- `SimulationStage.ts` & `appStoreTypes.ts`：
-  - 将 `'drawing-sandbox'` 加入 `CUSTOM_STEP_MODES` 与 `AppState['matchMode']` 联合类型，防止被 `SimulationStage` 误判或覆写。
-- `hudRosterResolverPipeline.ts` & `TelemetryStage.ts`：
-  - 为 `drawing-sandbox` 补全 6 辆车（Blue 1-3 / Orange 1-3）Roster 解析，并根据 `camera.isFreeCam` / `camera.focusedCarIndex` 高亮当前聚焦车辆。
-- `GameCameraSubsystem.ts`：
-  - 在 `drawing-sandbox` 模式下将 `obsTargetIdx` 绑定到 `camera.focusedCarIndex`，确保 1-6 切人真实跟随对应车辆。
-- `InGameHUD.tsx`、`useReplayPovSlotHotkeys.ts`、`Layer3DevSandboxesRecipe.tsx`：
-  - 在 `drawing-sandbox` 模式下显示左右两侧 `EdgePlayerHudStrip`，支持直接点击卡片切人；
-  - 从 Sandboxes 列表无论是点击整行还是点击右侧启动按钮，都会完整进入 `DrawingSandboxMode`。
+### 2. 最近 48 小时 Commit 审计（2026-11-11 ~ 2026-11-13）
+- `a5b1291`（11-13）：将 `taskStore.ts` 拆分为 `taskHydrationSlice`、`taskDraftSlice`、`taskExecutionSlice`、`taskMutationSlice`、`taskSyncSlice` 及 `taskDispatchHelpers`，对外状态与调度签名保持兼容。
+- `a685da5` / `bcf3503` / `fab1672` / `4b248dd`（11-13）：UI Modal 拆分、`PrimerModalShell`、模型/Agent 预设字段与 Rules of Hooks 修复。
+- `dd05502` / `6753e64`（11-12）：新增 Hook 自定义配置与后端 `collapse_github_auth_header_block` 保护；未改动 Interactions API 基础请求格式。
 
-**验证结果**：
-- `pnpm run check`（Radar 2.0 架构检查 + TypeScript 严格检查）：**0 Error 通过**；
-- `pnpm run build`（Vite 生产构建）：**通过**；
-- 修改文件 `prettier --check`：**通过**。
+### 3. 本地验证结果
+- 执行 `node scripts/syncPrivateProfile.mjs && pnpm check`（含 `tsc --noEmit`、`eslint src`、`vitest run` 13 个测试）：**全部通过（0 errors）**。
+- 执行 `pnpm build`：**构建成功**。
 
 ---
 
-## 三、Drawing Sandbox 操作指南
+## 二、外部 API 变化与社区已知报告
 
-1. **进入方式**：打开菜单 -> `Developer` -> `Sandboxes` -> 点击 `Drawing Sandbox`（会在场地生成 6 辆车，默认进入 **7 号自由视角 + Draw Mode**）。
-2. **画笔绘制**：
-   - 确认工具栏最上方 **Pen（画笔图标）** 为绿色高亮（进入时默认激活）；
-   - 直接在 3D 场地（地面、侧墙、斜角墙、天花板、球门内壁）按住鼠标左键拖动即可绘制；
-   - 工具栏依次支持：
-     - **模式切换**：Draw Mode（画笔）/ Direction Adjust（指南针图标，旋转视角朝向）/ Restore POV（偏移归零）；
-     - **笔型**：实线（Solid）/ 虚线（Dashed）/ 战术箭头（Arrow）；
-     - **3 档 Preset**：`100` / `70` / `50`（对应 100% / 70% / 50% 透明度，可在 `Developer Settings -> Telestrator` 调整粗细与透明度）；
-     - **6 种颜色**：深灰、白、红、黄、亮绿、暗绿；
-     - **辅助操作**：Aerial Drop Stems（空中下垂虚线开关）、Undo（或 `Ctrl+Z` / `Cmd+Z`）、Clear All。
-3. **视角与切人**：
-   - 键盘 `1`~`6` 或直接点击屏幕左右两侧的 `Blue 1-3` / `Orange 1-3` 卡片：切换到对应车辆 POV（同时自动把 Direction Adjust 偏移归零）；
-   - 键盘 `7`：切回自由视角（可用 `WASD` + `Space/I` 上升 + `V/M` 下降移动位置）；
-   - 键盘 `C`：在 1~6 号车 POV 与 7 号自由视角之间循环切换；
-   - **Direction Adjust**：点击工具栏指南针图标激活后，在画面左键拖拽可固定当前 XYZ 位置并偏移朝向（切换到车视角后偏移会持久保留）；再次点击指南针或点击 Pen 可切回画图；点击 Restore POV（或按 `1`-`7` / `C`）可一键归零。
+1. **2026-11-12 突发报告：Free Tier 调用 `antigravity-preview-09-2026` + `gemini-4-argon` / `gemini-4-carbon` 返回 429 (`limit: 0`)**
+   - Google AI Developers Forum 报告（2026-11-12）：[Question about Free Tier model availability for Gemini 4 Argon and Carbon in the Antigravity Managed Agent API](https://discuss.ai.google.dev/t/question-about-free-tier-model-availability-for-gemini-4-argon-and-carbon-in-the-antigravity-managed-agent-api/199769)
+   - 核心现象：此前 Free Tier 项目一直可以通过 `antigravity-preview-09-2026` 正常调用 `gemini-4-argon` 和 `gemini-4-carbon`；但从 **2026-11-12** 起全部开始返回 `HTTP 429`：
+     - `Rate limit exceeded for model gemini-4-argon (limit: 0 requests per day on Free Tier).`
+     - `Rate limit exceeded for model gemini-4-carbon (limit: 0 input tokens per minute on Free Tier).`
+   - 对应政策：Google 定价表本身标注 Gemini 4 Argon / Carbon "Not available on the Free tier"，11 月 12 日起后端正式将免费层配额严格执行为 `0`。
+
+2. **API 版本（`v1` vs `v1beta`）说明**
+   - Google 文档 [API versions explained](https://aistudio.google.com/api-reference/api-versions) 指出：2026 年 11 月主版本起，官方 Gen AI SDK 默认改为调用 `v1`（此前默认 `v1beta`）。
+   - 但截至 **2026-11-12 / 11-13** 的最新官方指南（[What's new in Gemini 4 Argon](https://aistudio.google.com/docs/whats-new-gemini-4-argon)、[What's new in Gemini 4 Carbon](https://aistudio.google.com/docs/whats-new-gemini-4-carbon)），调用 `antigravity-preview-09-2026` 托管 Agent **仍然明确要求使用 `v1beta`**，因此仓库继续使用 `/v1beta/interactions` 是正确的，无需改切 `v1`。
+
+3. **2026-11-12 ~ 11-13 同期 403 封禁与产品调整**
+   - 2026-11-12 Google 发布了新模型 `gemini-4-hydrogen`（搭配 Antigravity Orchestrator），同时 Jules 于 11 月 12 日进入只读状态并合并至 Antigravity。
+   - 同期论坛出现大量 `403 PERMISSION_DENIED (TOS_VIOLATION)` 报告（[Nov 12 CLI 403](https://discuss.ai.google.dev/t/appeal-submitted-antigravity-cli-403-after-headless-reviews-run-by-my-ai-assistant-all-automated-agy-use-removed/199919)、[Nov 13 False Positive 403](https://discuss.ai.google.dev/t/appeal-bug-false-positive-403-tos-violation-after-gemini-4-hydrogen-official-vs-code-extension-only/200029)）。如果任务报错为 `403` 而非 `429`，则属于账号/API Key 触发了风控限制，需通过官方申诉表单解封或更换项目 Key。
 
 ---
 
-## 四、当前仍待后续对齐/优化的部分
+## 三、排查与解决建议
 
-1. **UI 团队接管部分**：
-   - 浮窗当前为默认样式，后续由 UI 团队调整为更紧凑的居中悬浮条/外置指示器，以及修复 `alpha` 上 `PerformanceBoostTunerFloatingWindow.tsx` 缺少 `hideFooter` 的报错。
-2. **网络同步联调（待 Track D 收敛后）**：
-   - `TelestratorWireCodec.ts` 与 Hash Ack 校验已完成单机闭环，后续接入 `RoomReplicationBus` 的 Reliable 控制信道即可在视角同步前提下实现多端绘制同步。
+1. **先确认当前失败的具体 HTTP 状态码**：在 `agyPreviewInstant` 任务详情的 `Errors` 面板中查看后端返回的是 `HTTP 429` 还是 `HTTP 403` / `HTTP 400`。
+2. **若是 `HTTP 429 (limit: 0)`（最常见）**：
+   - **方案 A（继续使用 `gemini-4-argon`）**：在 Google AI Studio 为当前 API Key 所属的 Cloud 项目绑定结算账号（升级为 Paid Tier / Tier 1+）。
+   - **方案 B（不升级付费层，切换模型）**：在 `agyPreviewInstant` 的 Composer 模型选择框或 `Settings -> Agent Models` 中，将 `gemini-4-argon` 改为 `gemini-3.8-flash`（`antigravity-preview-09-2026` 的默认底层模型）或测试 `gemini-4-hydrogen`。
+3. **若是 `HTTP 403 (PERMISSION_DENIED / TOS_VIOLATION)`**：
+   - 检查 Google AI Studio / Cloud Console 项目状态是否被风控停用，或通过官方申诉通道提交恢复请求。

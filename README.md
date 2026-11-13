@@ -1,54 +1,55 @@
-# RocketCompanion Bootstrap 卡顿/刷新时序调查与修复报告
+# Track A · Telestrator Overlay v3 修复与策略说明
 
-## 1. PR 创建与合并（`alpha` 分支）
-- 已将已验证的 Commit `d69e9471bfdbcd854c778e09d708b676a6c7fa76`（分支 `z/agy/ui/fix-floating-window-schema`）创建 Pull Request 并合并进 `alpha`：
-  - **PR #11**: https://github.com/Antigravi-ty/RocketCompanion/pull/11
-  - **Merge Commit**: `e943d507b1c70d84b0b231ef457b4baaa3ab9525`
-
----
-
-## 2. Bootstrap 卡顿与分支切换刷新问题调查结论
-
-通过 Headless Chrome + CDP 对 `https://localhost:3001/` 进行全链路抓包与计时，定位到以下 4 个核心根因：
-
-### (1) 为什么经常卡在 `0%` 很久（实测冷启动 27.2s、刷新 10.0s）？
-1. **UI 与引擎模块树串行加载（~1,186 个 ESM 请求）**：`src/main.ts` 串行 `await import('./game/GameBootstrap.ts')` 和 `await import('./ui-system/index.tsx')`（后者静态引入了大量开发面板、Lab、Chart、Training Pack 解析器等组件），在 Stage 1~3 还没开始前就阻塞了 ~1,186 个模块请求；且自签名 HTTPS (`basicSsl()`) 下浏览器会绕过磁盘缓存，导致刷新也要重走 1,186 次模块请求。
-2. **`MinimumProgressLoader.onTaskStart` 未刷新百分比 DOM**：`src/main.ts` 传入 `overallPercent: 2`，但 `MinimumProgressLoader.onTaskStart` 只更新了内部属性而没有更新 `#hig-overall-percent` 和 `#hig-primary-fill`，导致进度条在加载整个模块图期间一直死锁显示 `0%`。
-3. **Vite `rc-https` / `rc-http` 未开启 `server.warmup`**：服务启动后不会后台预编译核心入口，把 27s 的冷变换开销全部压在第一个浏览器请求上。
-
-### (2) 为什么有时卡 `30%`、`60%~70% (streaming 2/3 ready)` 或 `88%`？
-1. **`~30%`（Stage 3 `physics.mesh.stream`）**：`StreamDownloadTracker.fetchBuffer` 并发拉取 16 个 `.cmf` 碰撞网格分片时，单个请求超时高达 `30000ms` 且**没有任何重试机制**，一旦单个 HTTP/2 流抖动就会干等 30s；同时每个 chunk 都直接触发 DOM 更新。
-2. **`~60% - 70%`（Stage 4 `geometry.scene.build` 显示 `Streaming ... (2/3 ready)`）**：`loadAllArenaWorldAssets` 并行跑 3 个任务（Ball 纯程序生成秒完 -> 场馆 `DriftwoodsStadiumLoader` -> 车辆与 BoostPad `BoostPadTemplateLoader`）。其中 `GLTFLoader.loadAsync` **完全没有超时与重试**，一旦某一个 GLB 请求在 HTTP/2 上卡住，就会卡在 `2/3 ready`（恰好对应权重 `50% + 30% * 2/3 = 70%`）直到 `LoadingTask` 60s 超时报错。
-3. **`~88%`（Stage 5 `shaders.prewarm`）**：实测在软件渲染（SwiftShader）或慢速 GPU 下，全主题 Shader 预热超过 30s 会触发 `LoadingTask` 超时并因 `critical: true` 直接弹出 Fatal Error 阻断进入游戏。
-
-### (3) 为什么切换分支后自动刷新 / 手动刷新同标签页容易卡住，而新开标签页没事？
-1. **时序倒置（你的直觉完全正确）**：在 `scripts/vite/gitHeadAutoRestartPlugin.ts` 中，旧逻辑在检测到 `HEAD` 变更后**先**向浏览器发送 `rc:git-head-changed`（触发 `window.location.reload()`）和 `full-reload`，**然后才**执行 `await server.restart(true)`。浏览器在旧页面立即 reload 时，正好撞上正在关闭 HTTP/2 服务并强制重打包 `node_modules/.vite` (`forceOptimize=true`) 的 Vite 进程，导致旧标签页的 HTTP/2 连接半开/挂起；而几秒后新开标签页时，Vite 已经重启完成，所以完全正常。
-2. **强制 `server.restart(true)` 浪费 5~10s**：每次切分支无论 `package.json`/`pnpm-lock.yaml` 是否变化，都传 `true` 强制清掉 `node_modules/.vite` 缓存重新用 esbuild 打包 `three`/`react` 等依赖。
-3. **同标签页刷新未清理资源**：页面刷新/关闭时没有 `pagehide` 钩子调用 `destroyEngine()`，旧 WebWorker / WebGL / AudioContext 会在刷新过渡期残留。
+- **工作分支**: `z/agy/rc/telestrator-overlay-v3`（基于 `origin/z/agy/rc/telestrator-overlay-v2`）
+- **Verified Commit**: `3d28980796909d0e1e6116943397005d68cd7427` (`signature.isValid: true`)
+- **验证结果**: `pnpm run check`（Radar 2.0 + `tsc --noEmit`）与 `pnpm run build` 均通过（0 Error）。
 
 ---
 
-## 3. 已实施的修复（新分支 `z/agy/rc/fix-bootstrap-hangs`）
+## 一、 核心问题解答：上一版粗细控制是什么策略？为什么 `v2` 改偏了？以及本次的终极解法
 
-- **Verified Bot Commit**: `d4492d95c7883b4419d98036f8234a2b63d6d6c6`（基于 `alpha` `e943d50`）
-- **改动文件**：
-  1. `scripts/vite/gitHeadAutoRestartPlugin.ts`：
-     - 检测 `package.json` / `pnpm-lock.yaml` 变化，仅在依赖变更时传 `forceOptimize=true`，常规切分支使用 `server.restart(false)` 保留 `.vite` 预打包缓存。
-     - 重启期间 `/__rc_git_head` 返回 `{ restarting: true, signature: null }`；**移除重启前的 `full-reload`**，改为等 `await server.restart(...)` 完成后再通知客户端，客户端结合 `vite:ws:disconnect` / `vite:ws:connect` 与 `/__rc_git_head` 状态确认新服务器就绪后再执行单次 `window.location.reload()`。
-  2. `vite.config.ts`：为 `rc-https` / `rc-http` 配置 `server.warmup.clientFiles`（预热 `main.ts`、`GameBootstrap.ts`、`ui-system/index.tsx`）。
-  3. `src/loader/MinimumProgressLoader.ts`：修复 `onTaskStart` 未更新 `#hig-overall-percent` 与 `#hig-primary-fill` 的问题。
-  4. `src/main.ts`、`src/game/GameBootstrap.ts`、`src/loader/engineLoadingPipeline.ts`：
-     - 将 `ui-system/index.tsx` 与引擎 Bootstrap Stages 1~3 并行重叠加载，仅在 Stage 4 需要挂载 UI 前解析 `loadMountUI`。
-     - 为模块加载阶段增加 500ms 实时耗时心跳提示；注册 `pagehide` 自动调用 `destroyEngine()` 清理 WebGL/Workers/Audio。
-     - 将 Stage 5 `shaders.prewarm` 设为 `critical: false`，慢速/软件 GPU 超时时优雅降级。
-  5. `src/loader/StreamDownloadTracker.ts`：`.cmf` 碰撞分片请求改为 `12s` 单次超时 + 最多 3 次自动重试，并对 `_notify` 增加 50ms 节流。
-  6. `src/utils/assetLoadRetry.ts`、`src/entities/stadium/driftwoods/DriftwoodsStadiumLoader.ts`、`src/entities/arena/BoostPadTemplateLoader.ts`：新增共享 `loadGltfWithRetry` / `loadTextureWithRetry`，为 Stage 4 场馆与 BoostPad GLB/纹理加载加上超时与自动重试。
+### 1. 上一版（`ddbd338`）的策略原理
+上一版 `TelestratorManager.ts` 中的 `computeScreenRelativeWorldWidth` 使用了**视锥体反投影公式**：
+```ts
+worldHeightAtDist = 2 * Math.tan(vFovRad * 0.5) * safeDist
+worldPerPx = worldHeightAtDist / viewportHeightPx
+worldWidth = widthPx * worldPerPx
+```
+- **为什么上一版手感很好**：它根据笔划起点到摄像机的距离 `safeDist` 和垂直视场角 `vFov`，把屏幕像素宽度动态换算成 3D 世界宽度（UU）。因此无论你在脚下近处画还是隔着全场远处画，屏幕上的粗细都基本一致。
+- **它的唯一短板（多端广播时）**：它除以了本地的 `viewportHeightPx`。在 Broadcast 场景下，如果 Host 是 `1080p`（`viewportHeightPx = 1080`），Viewer 是 `4K`（`2160`）或 `720p` 窗口，同样的 `8px` 在 4K 屏幕上相对于车和球会细一半，在 720p 上会粗 1.5 倍。
+
+### 2. 为什么 `v2`（`a03403a`）理解有偏差？
+`v2` 把粗细直接改成了固定的 `28 UU`（真实世界单位）。这导致：
+- 摄像机离地面很近时，28 UU 像刷墙滚筒一样巨大；
+- 摄像机在全场远端时，28 UU 细成 1~2 像素几乎看不清。
+
+### 3. 本次方案：1080p 虚拟参考高度归一化 + 逐点距离自适应（`widthRefPx`）
+我们在 `telestratorTypes.ts` 与 `telestratorStrokeGeometry.ts` 中实现了 **1080p Reference Viewport Normalization**：
+```ts
+worldHeightAtDist = 2 * Math.tan(vFovRad * 0.5) * max(120, dist(point, camPos))
+worldWidth = (widthRefPx / 1080) * worldHeightAtDist
+```
+- **跨分辨率 100% 一致**：公式完全不依赖本地 `window.innerHeight` 或 `devicePixelRatio`，而是以 `1080` 为常量基准，等价于“占屏幕垂直高度的比例”（例如 `10 px @1080p` 永远等于视口高度的 `0.926%`）。因为车和球在屏幕上的占比也是由 `worldHeightAtDist` 决定的，所以无论 720p、1080p、1440p 还是 4K，所有人看到的**线条/箭头相对于车和球的粗细完全一致**。
+- **逐点距离自适应**：不再只用起点距离，而是对曲线上的**每个顶点**分别计算到 `camPos` 的距离来生成 Ribbon 宽度，从脚下画到远端球门也不会变细；箭头长度/宽度（`arrowLengthRefPx` / `arrowWidthRefPx`）同样按 `tipPt` 距离归一化。
+- **网络协议同步**：`TelestratorWireCodec.ts`（`STROKE_HEADER_BYTES = 68`）已同步序列化 `widthRefPx`、`arrowLengthRefPx`、`arrowWidthRefPx`、`camPos` 和 `camFovDeg`。
 
 ---
 
-## 4. 验证结果
-- `pnpm check`（`radar` + `tsc --noEmit`）：**GREEN**（1355/1355 TS 文件，0 循环依赖，0 越层引用，0 TS 错误）。
-- `pnpm build`：**PASS**。
-- Headless Chrome CDP 实测对比（`https://localhost:3001/`）：
-  - 冷启动模块图阶段（`Loading Engine Core Modules...`）：从 **27.2s 降至 8.3s**（提速 **3.2x+**），且进度条立即跳出 `0%` 并持续更新耗时。
-  - 冷启动与同标签页刷新均完整跑到 **`100% READY`**（此前冷启动在 SwiftShader 下 88% 超时崩溃）。
+## 二、 其余 3 项修复清单
+
+### 1. Telestrator Floating Window 顶部 Padding、左侧锁定与 Settings 菜单不可访问
+- **顶部留白过大**：在 `TelestratorOverlaySubsystem.ts`（`spawnToolbarWindow`）和 `devFloatingPresets.ts`（`TELESTRATOR_TOOLBAR_PRESET`）中设置 `contentPadding: 4` / `{ x: 6, y: 4 }`，并去掉 `TelestratorToolbarFloatingWindow.tsx` 顶部的多余 `py-1`。
+- **工具栏跑偏 & Settings 被裁切**：
+  - 原先 `FloatingWindowInstance` 与 `FloatingWindowContent` 带有 `overflow-hidden`，导致 `absolute left-full` 的 Settings 面板和 hover 提示气泡被完全裁切且无法点击。
+  - 现改为横向 Flex 容器：左侧工具栏固定 `w-[56px] shrink-0` 永远紧贴最左侧；右侧在 `settingsOpen === true` 时内联渲染 Settings 面板（并通过 `floatingStore.updateSize` 自动将窗口从 `72px` 展开到 `336px`，关闭时恢复 `72px`），在 `settingsOpen === false` 时用 `flex-1 min-w-0` 占位符占满右侧，保证无论窗口拉多宽，左侧工具列始终贴左。
+  - Hover 提示气泡改为通过 `createPortal(..., document.body)` 挂载，彻底摆脱 `overflow-hidden` 裁切，并在靠近屏幕右边缘时自动向左翻转。
+
+### 2. 弧线过渡区 / 六边形网格墙面 / 车身无法起笔或画不上去
+- **原因**：此前 `TelestratorOverlaySubsystem.ts` 调用 `raycastScreenToArena(ndcX, ndcY, cam)` 时没有传入 `extraTargets`，只命中了 `arenaSurfaceRaycaster.ts` 里 12 个纯平数学平面（`ARENA_PLANES`），导致地面与墙面的弧线过渡区、六边形网格墙面和车身全部被跳过或穿透到后面的平面。
+- **修复**：
+  - 在 `TelestratorOverlaySubsystem.ts` 新增 `collectRaycastTargets()`，收集当前可见的车辆（`arena.cars`）、球（`arena.ball`）以及当前激活的球场模型（`driftwoodsStadium` / `throwbackStadium`）传入 `raycastScreenToArena`。
+  - 在 `arenaSurfaceRaycaster.ts` 中增加祖先可见性校验 `isObjectChainVisible`，并跳过从场外透视看向场内时命中的单向透明外墙背面（`Woods_Field_Walls` / `Woods_Field_Walls_Hexes` / `Woods_Field_Wall_Posts` 且 `worldNormal.dot(rayDir) > 0`），同时保留 `raycastArenaSurface` 作为兜底。
+
+### 3. 遮挡关系（Stroke 永远在最顶层）
+- **原因**：此前 `telestratorStrokeGeometry.ts` 中只有箭头设置了 `depthTest: false, depthWrite: false`，而实线/虚线 Ribbon 仍开启了深度测试（`renderOrder = 10`），导致画在地面或车身上的线条容易被车辆、球或弧形网格遮挡。
+- **修复**：将 Ribbon 与 Arrowhead 统一设置为 `depthTest: false`、`depthWrite: false`，并将渲染顺序提升至 `renderOrder = 1050`（Ribbon）与 `1055`（Arrowhead），高于场内所有车辆、球体与特效层，确保笔划相对于摄像机始终处于最顶层。

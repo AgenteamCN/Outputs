@@ -1,77 +1,66 @@
-# Track D (`cf5cfeee`) 合入评估与 Telemetry 数据分析报告
+# Telestrator (iPad 画笔) 卡顿与无法起笔根因分析与修复报告
 
-> **评估对象**：分支 `z/agy/rc/track-d-replication-bus`（Commit `cf5cfeee60fc0cd54eb2dcdc13dbc2aa845d80a1`）  
-> **数据包**：`rc-net-telemetry-csts-match-complete-2026-11-13T07-21-06.zip`  
-> **结论摘要**：**Track D 可以合并到主干以解锁 Track E / Track F 并行开工**；但需明确它目前交付的是**“协议契约 + 旁路基础设施 + `game_ctrl` 通道建链”**，核心调度器尚未接入现有联机热路径。Client 侧 Telemetry 数据**整体完全符合预期**。
-
----
-
-## 一、 Track D 合入前门禁与实测结果
-
-在沙盒环境对 `cf5cfeee` 执行了完整静态检查、格式化检查、生产构建与端到端基线脚本：
-
-1. **`pnpm run check`（Radar 2.0 + `tsc --noEmit`）**：**GREEN（全部通过）**
-   - TypeScript 覆盖率：`1359/1359`（100% TS）
-   - 硬边界：`0` 循环依赖、`0` 值重导出（`index.ts`）、`0` 越界向上引用
-2. **Prettier 格式化检查（针对 Track D 全部 14 个变更文件）**：**PASS**
-   - 注：仓库全局 `pnpm run format:check` 存在 205 个历史遗留未格式化文件，但 **Track D 自身新增/修改的 14 个文件 100% 符合 Prettier 规范**。
-3. **`pnpm run build`（Vite 生产构建）**：**PASS**
-4. **端到端脚本现状（供对比基线）**：
-   - `pnpm run test:baseline`：除既有的 `multiplayer_6car_loadout_stress` 2 项断言（`multiplayer_kickoff_transitioned_to_playing`、`multiplayer_no_phantom_double_jump_on_flip_e`）外，其余 1v0~3v3 矩阵、场景图几何、零运行时报错均 **PASS**。
-   - `pnpm run repro:multiplayer-room`：无新增崩溃，`CSTS` 物理频率扫频 `[60.7..141.99]Hz` 保持 `snaps=0 | starvations=0`；存在的 `3p3ai` 占位车与轨迹诊断告警为既有基线问题，非 Track D 引入。
+- **目标仓库**: `Antigravi-ty/RocketCompanion`
+- **工作分支**: `z/agy/rc/brush-diag` (基于 `2f38585cb35882063ef1d2a118bb38ca5bf6e3cd`)
+- **Verified Commit**: `da722e3867d866205f0d51a6491d2a118bb38ca5bf6e3cd` (`isValid: true`, `state: VALID`)
 
 ---
 
-## 二、 为什么“正常打完一局 Multiplayer Match 没受影响”——Track D 真实接线状态
+## 一、根因诊断（为什么有的地方极其卡顿，且无法起笔但其他笔画可以经过）
 
-通过全仓引用扫描发现，Track D 的 14 个变更文件中，**绝大多数新模块目前处于“旁路就绪（Side-by-Side Ready）”状态，尚未挂载到现有 Match 热路径上**：
+通过代码审计与无头浏览器（Chrome WebGL2 + CDP）对画面 88 个采样点进行真实指针点击/拖拽与射线探测，定位到以下核心原因：
 
-| 模块 / 能力 | 现状 | 是否影响现有 Match |
-| :--- | :--- | :--- |
-| `HandshakeSession.ts` (`game_ctrl` ordered DataChannel) | **已接入建链**：Host 创建 `game_net` + `game_ctrl`，Client 通过 `ondatachannel` 绑定到 `DataChannelTransport.controlDataChannel` | **唯一在真实对局中跑通的改动**，证明双通道握手与 `game_net` 无回归 |
-| `ReplicationBusProtocol.ts` | 定义了 `REPLICATION_MODES`、`ACTIVITY_IDS`、`REPLICATION_PACKET_FLAGS` 与 16B `SparsePingPong16B` 编解码 | 无影响（纯协议） |
-| `RoomActivityOrchestrator.ts` / `ActivityKernel.ts` | 仅在 `HostWorkerMessageRouter.ts` 的 4 个新 `MSG` 分支中被实例化调用；`buildWorkerRoomStateSummary()` 尚未填充 `activeActivityId` / `activityEpoch` / `replicationMode` | 无影响（未被触发） |
-| `AuthoritativeServerHost.ts` 新增方法 (`switchActivity`, `setReplicationMode`, `sendStatePausedAck`, `broadcastCsrSummary`) | 仅向 Worker 发送命令，**尚未将 Worker 回复转发至 `P2PWebRTCChannel`**；客户端也尚未消费 `DataChannelTransport.transportEvents` 中的这 4 类事件 | 无影响（未被调用） |
-| `SyncAuthorityRouter.ts` / `ReplicationStateInterpolator.ts` / `AdaptiveReplicationPacer.ts` | 在上述 14 个文件之外 **0 个外部调用方**；`shouldSendAdaptiveSnapshot()`、`shouldSendSparsePing()` 尚未接入主循环发包器 | 无影响（未被接入） |
+### 1. 致命性能瓶颈：CMF 碰撞网格缺失平面区域，触发了全量视觉 GLB 暴力射线检测（10–81.8 ms/次）
+- `public/arenamesh/*.cmf`（16 个分块，共 8,020 个三角形）**仅覆盖了曲面拐角、球门以及墙面与地面/天花板的圆角过渡区**，并不包含平坦地面（`y = 0`）、平坦侧墙、平坦天花板以及部分端墙（例如球门左侧区域）。
+- **旧逻辑缺陷**：`raycastScreenToArena` 在 CMF 未命中时，直接通过 `scratchRaycaster.intersectObjects(stadiumTargets, true)` 对整个高模视觉 GLB（`driftwoodsStadium` / `throwbackStadium`，包含 `Woods_Field_Walls`、`Woods_Field_Ground`、以及 8,048 面的六边形网格 `Woods_Field_Walls_Hexes` 等）做无 BVH 暴力三角形求交，然后才尝试解析平面 `ARENA_PLANES`。
+- **实测对比（x86_64 桌面无头环境）**：
+  - `cmf` / `analytical`（解析平面）：**0.0 – 1.0 ms / 次**
+  - `stadiumTargets` 暴力回退：**10 – 81.8 ms / 次**（在 iPad 120Hz/240Hz Apple Pencil 高频 `pointermove` 下相当于单次 150–300ms+，直接堵死主线程）。
+- 这完美解释了用户的直观感受：**球门（有 CMF 覆盖）不卡、球门左侧/地面/部分墙面（无 CMF 覆盖，落入高模 GLB 回退）极卡**。
 
-**架构评估**：
-- 这正是推荐的渐进式合入策略——**先锁定协议与内核契约，不破坏现有 Match**。
-- Track E（拆解 `FreeplayKernel` / `MatchKernel` / `SandboxKernel`）与 Track F（`Spectator` 观战室与接管交接）依赖的 `RoomActivityKernel`、`RoomActivityOrchestrator`、`SyncAuthorityRouter`、`ReplicationBusProtocol` 均已就位，**可以立即合并 Track D 并让 E/F 开工**。
+### 2. 为什么“卡顿的位置无法起笔，但已有笔画可以经过它”
+1. **iPad Safari 手势接管触发 `pointercancel`**：
+   - 旧代码未在画笔激活时锁定 `touch-action: none`，也未监听 `pointercancel` 或绑定 `activePointerId`。
+   - 当用户在卡顿区域（地面、平墙、球门旁）按下起笔时，主线程因 `stadiumTargets` 射线检测卡死 100–300ms，Safari 原生手势识别器判定为滚动/缩放手势并立即派发 `pointercancel` 中断输入，导致“刚起笔就断掉（无法起笔）”，且 `isDrawingPointerDown` 状态可能卡死。
+   - 而如果从**流畅区域**（如球门）起笔，`pointerdown` 在 1ms 内完成并建立笔画，随后拖过卡顿区域时虽然帧率暴跌，但浏览器不会再次从头识别手势，因此“已有笔画可以经过但极其卡顿”。
+2. **`#game-ui-root` 整块拦截点击**：
+   - 旧版 `isUiEventTarget` 匹配了 `#game-ui-root`，导致 `#game-ui-root` 内部非交互式 HUD 覆盖层（如提示、球机指示等）会静默吞掉 `pointerdown`，表现为随机盲区无法起笔。
 
----
-
-## 三、 PR 合并前针对 Track D 建议补充的测试
-
-虽然主流程无回归，但为了确保 `game_ctrl` 与新协议不是“未经实测的死代码”，建议在合入 PR 前（或作为 Track D 收尾）补齐以下 **4 项轻量验证**：
-
-1. **双 DataChannel（`game_net` + `game_ctrl`）实机连通性验证**
-   - 在真实双端 WebRTC 连接下，确认 `transport.isControlChannelOpen === true`（`control_channel_open` 事件已触发），而非静默回落到 `game_net` 或 `BroadcastChannel`。
-2. **`game_ctrl` 可靠控制帧收发往返测试**
-   - 手动调用 `channel.sendRoomActivitySwitch(...)` / `channel.sendStatePausedAck(...)`，验证对端 `DataChannelTransport.drainTransportEvents()` 能正确收到对应 `room_activity_switch` / `state_paused_ack` 事件。
-3. **16B `SparsePingPong16B` 二进制帧编解码 + 通道往返**
-   - 验证 `sendSparsePingPong16B(PING_PONG_KIND_PING, ...)` 经 WebRTC 发送 `Uint8Array(16)` 后，对端 `isSparsePingPong16B` 能准确识别并自动回传 `PONG` 更新 `simulator.handlePong()`。
-4. **`HostWorkerMessageRouter` 热切换状态机单元测试 / 烟雾测试**
-   - 依次向 Worker 发送 `ROOM_ACTIVITY_SWITCH('freeplay')` -> `('match')` -> `('replay')` -> `('freeplay')`，验证 `epoch` 递增、`MatchDomainState.stateOnlyMode` 随 `ReplayActivityKernel` 正确开启与恢复。
-   - *顺手修复建议*：在 `HostWorkerMessageRouter.ts` 的 `buildWorkerRoomStateSummary()` 中补齐 `activeActivityId`、`activityEpoch`、`replicationMode` 三个字段的赋值。
+### 3. 额外冗余计算
+- **高频 `pointermove` 同步重建网格**：iPad Apple Pencil `pointermove` 频率高达 120–240Hz，旧逻辑每次事件都同步射线检测并重建预览 Mesh 几何体，一帧内重复构建多次。
+- **无用顶点法线计算**：`telestratorStrokeGeometry.ts` 中对使用 `MeshBasicMaterial`（不受光照影响）的笔画与箭头 Mesh 调用了两次 `geometry.computeVertexNormals()`。
 
 ---
 
-## 四、 Client Telemetry 数据包分析（`rc-net-telemetry-csts-match-complete`）
+## 二、已实施的修复与模块拆分
 
-对 `telemetry.csv`（9,144 ticks，时长 `159.5s`）与 `metadata.json`（`clockPacingMode: "csts"`, `clockPacingPriority: "balanced"`）进行了逐行统计分析：
+1. **射线优先级重构 (`src/entities/telestrator/arenaSurfaceRaycaster.ts`)**
+   - 新增 `raycastScreenToArenaWithDiag` 与 `ArenaRaycastDiag` 诊断结构。
+   - 改为先同时求交 `bestDynamic`、`bestCmf` 与解析平面 `analyticalHit`（`ARENA_PLANES`），**按距离取最近命中**（避免瞄准近处地面时被远处角落的 CMF 穿透误命中）。
+   - **仅当 CMF 与解析平面均未命中时**才回退到 `stadiumTargets`（高模视觉网格），彻底消除地面与平坦墙面的暴力求交卡顿。
 
-### 1. 核心指标结论：**完全符合预期，表现优秀**
-- **链路与抖动**：`meanRttMs = 19.1ms`（max `50ms`），`jitterMs` 均值 `1.20ms`（max `9.2ms`）。
-- **时钟平滑度**：`physicsRateHz` 均值 `119.96Hz`，标准差仅 `0.287Hz`；`meanBufferTicks = 3.68`（target `3.09`），`p95BufferAbsError = 1.95 ticks`。
-- **预测与回滚精度**：
-  - **`tier3HardSnapCount = 0`**（全程零硬切闪现）。
-  - **`localPosErrorUu`**：99%+ 的 tick 为 `0.00 uu`，仅 21 个 tick > `1 uu`（max `34.73 uu`），碰撞后 2~4 tick 内收敛回 `0`。
-  - **`ballPosErrorUu`**：99%+ 的 tick 为 `0.00 uu`，仅 58 个 tick > `1 uu`（max `83.01 uu`），快速收敛。
-- **边界事件解释（均为正常现象）**：
-  - `remotePosErrorMaxUu = 4608.01`（`index=7178`）与开局 `index=0`（`2672.76`）：均为单 tick 远程车瞬移（开球/重置），下一 tick（`index=7179`）立即归 `0.00`。
-  - 3 次 `clientTickDiff > 1300` 跳跃（`index=2000, 3050, 7892`）：均伴随 `eventFlags=129`，对应进球回放 / 开球阶段切换。
-  - `starvationCount = 57`（`0.62%`）、`hardResyncCount = 1`：在 159.5s 对局中处于健康阈值内。
+2. **iPad 触摸/手写笔与输入稳定性 (`src/game/subsystems/TelestratorOverlaySubsystem.ts`, `src/game/subsystems/telestratorOverlayHelpers.ts`)**
+   - 移除 `#game-ui-root` 整块 UI 拦截，仅拦截真正的交互控件及浮动窗口（`button, input, ..., .floating-window, .hud-tools, .hig-dual-card`）。
+   - 画笔接管期间通过 `TelestratorBodyTouchLock` 自动锁定 `document.body.style.touchAction = 'none'` 与 `userSelect = 'none'`，退出时恢复。
+   - 增加 `e.isPrimary`、`activePointerId` 单指锁与 `pointercancel` 处理。
+   - 对 `pointermove` 进行每帧一次的 `requestAnimationFrame` 合批（在 `update()` 与 `handlePointerUp()` 时 `flushPendingMove()`），消除 120/240Hz 重复几何重建。
 
-### 2. 一个可顺手记录的调优观察（非阻塞，与 Track D 无关）
-- 在 `5,010` 次 Tier-2 回滚（占总 tick 54.8%）中，有 **95.4%（4,781 次）是在 `localPosErrorUu == 0 && ballPosErrorUu == 0` 的情况下，仅因 `remotePosErrorUu` 微小漂移（中位数 `1.59 uu`，P25 `1.12 uu`）触发的**。
-- 后续在调优 CSTS Reconciler 时，可考虑适当放宽远程车辆的 Tier-2 触发死区，以进一步降低不必要的全量回滚开销。
+3. **移除冗余几何计算 (`src/entities/telestrator/telestratorStrokeGeometry.ts`)**
+   - 移除 `MeshBasicMaterial` 笔画 Mesh 上多余的 `geometry.computeVertexNormals()` 调用。
+
+4. **指针/瞄准实时诊断与 Dump (`src/entities/telestrator/telestratorPointerDiag.ts`, `src/entities/telestrator/telestratorTypes.ts`)**
+   - 新增 `TelestratorPointerDiagRecorder`，记录最近 160 条 `down / move / up / cancel / hover` 事件的屏幕坐标、NDC、命中来源（`cmf / analytical / stadium / dynamic / none`）、耗时（ms）、拦截原因（`blocked-button-or-ui`、`no-hit`、`pointer-cancelled` 等）及各类统计计数。
+   - 接入 `onDumpLastStroke`（`pointerDiagnostics` 字段），并暴露全局调试接口 `window.__rcTelestratorDiag`：
+     - `window.__rcTelestratorDiag.getDump()`：导出当前指针事件历史与拦截/失败统计。
+     - `window.__rcTelestratorDiag.probeAt(clientX, clientY)`：直接对指定屏幕坐标做一次带耗时与来源诊断的射线探测。
+
+5. **低耦合模块化拆分**
+   - 将原 `TelestratorOverlaySubsystem.ts` 中的 DOM 窗口创建、TouchLock、快捷键订阅、Store 同步订阅、射线目标收集及 Wire 校验抽离至 `src/game/subsystems/telestratorOverlayHelpers.ts`，保持单文件体积精简（均符合 `radar` 体积上限）。
+
+---
+
+## 三、验证结果
+
+- `pnpm run check` (TypeScript `tsc --noEmit`)：通过（0 错误）
+- `pnpm run radar:audit` (体积与架构护栏审计)：通过
+- `pnpm run build` (Vite 生产构建)：通过

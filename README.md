@@ -1,111 +1,177 @@
-# RocketCompanion 分支清理、后缀统一与下一阶段开发规划报告
+# RocketCompanion Rust 重构分支深度诊断、复现路径与架构评估报告
 
-## 一、分支与废弃 Commit 清理结果
-
-### 1. 13 个指定 Commit 核查
-已逐一核查全部 13 个 Commit 与 `origin/alpha` 的代码状态，确认对应功能均已通过 PR 合并或被 `alpha` 中的更新实现替代：
-- `96dcecb7` (`fix-replay-slot-and-timeout`) → 已由 PR #18 (`01dcdc6`) 覆盖
-- `4e9c5271` (`fix-transparency-glow-post`) → 已由 PR #17 (`5094954`) 覆盖
-- `d3fb50c8` (`notification-collapse-toggle`) → 已由 PR #16 (`a77934f`) 覆盖
-- `c61ffe12` / `1db147f4` / `848a0684` (`broked-alpha` / `track-a-telestrator-defaults`) → 已由 Telestrator CMF v4 (`5b1ee5c`) 及后续修复覆盖
-- `0401e7a2` (`track-c-audit`) → 已由 PR #14 (`db84803`) 覆盖
-- `3d289807` (`telestrator-overlay-v3`) → 已由 `5b1ee5c` 覆盖
-- `4591563b` (`fix-bootstrap-stall`) → 已由 PR #13 (`a6c593` / `d4492d9`) 覆盖
-- `1051b102` → 对象在当前仓库已不存在
-- `e32ab9da` (`z/user/tauri/cargowhat`) → 已由 PR #8 (`760a8fc`) 覆盖
-- `e2fcd32a` (`repro-online-match-and-trajectory`) → `multiplayerRoomReproPhenomenaPipeline.ts` 等已存在且在 `alpha` 中持续演进
-- `02cd265d` (`replay-ver-investigate`) → UE3 NetStream 解析已由 `e492dab` 重构对齐 boxcars
-
-### 2. 远程分支清理汇总
-已通过 GitHub API 删除 **31** 个远程分支：
-- **16 个已合并到 `alpha` 的分支**：`z/agy/rc/brush-diag`、`z/agy/rc/fix-bootstrap-hangs`、`z/agy/rc/fix-replay-slot-takeover`、`z/agy/rc/fix-telestrator-dashed-freeze`、`z/agy/rc/pr-dynamic-training-takeover`、`z/agy/rc/pr-notification-collapse-toggle`、`z/agy/rc/pr-transparency-glow-post`、`z/agy/rc/tauri-dev-watch`、`z/agy/rc/telestrator-cmf-v4`、`z/agy/rc/track-c-dynamic-training`、`z/agy/rc/track-c-fix-and-audit`、`z/agy/rc/track-d-replication-bus`、`z/agy/ui/fix-floating-window-schema`、`z/agy/ui/fix-sf-mono-font-stack`、`z/user/default_branch`、`z/user/tauri/cargowhatagain1`。
-- **15 个废弃端头及中间过程分支**：`broked-alpha`、`z/agy/rc/fix-bootstrap-stall`、`z/agy/rc/fix-replay-slot-and-timeout`、`z/agy/rc/fix-transparency-glow-post`、`z/agy/rc/notification-collapse-toggle`、`z/agy/rc/replay-ver-investigate`、`z/agy/rc/repro-online-match-and-trajectory`、`z/agy/rc/telestrator-overlay-v2`、`z/agy/rc/telestrator-overlay-v3`、`z/agy/rc/track-a-telestrator-defaults`、`z/agy/rc/track-a-telestrator-fix`、`z/agy/rc/track-a-telestrator-sandbox`、`z/agy/rc/track-a-telestrator-v3`、`z/agy/rc/track-c-audit`、`z/user/tauri/cargowhat`。
-- **保留的未合并分支**：
-  - `a2`（旧版 `envinit-worker`）
-  - `z/agy/rc/track-b-voice-configurator` & `z/agy/rc/track-b-voice-fix`（未合入的 Audio / WebRTC 语音分支）
-  - `z/agy/rc/rust/*`（未合入 `alpha` 的 Rust/WASM 迁移波次分支，因未在清理清单中，暂予保留）
+> **基准环境**：仓库 `Antigravi-ty/RocketCompanion` | 基准 Commit `eb68dfcd0f2caa7a85af97f301626296afba4a37` (`origin/z/agy/rc/rust/fix-keyboard-dodge-air-steer`) | 本地诊断分支 `z/agy/rc/rust/diag-repro-report` | 对照基准分支 `origin/alpha` (`8d19408`)
 
 ---
 
-## 二、文件后缀统一（PR #19 已合入 `alpha`）
+## 一、 工具链验证与 `tmpfs` 一键恢复方案
 
-- **基准分支**：`alpha` -> 工作分支 `z/agy/rc/unify-extensions` -> **PR #19**（Verified Commit `bc1e9a2f`，已合入 `alpha` `8d19408a`，合入后已删除临时分支）。
-- **统一标准**：`.RCSPack`、`.RCDPack`、`.RCReplay`、`.RLRCReplay`、`.RCGR`、`.zip`、`.RCClip`，全面移除 `.gz` 后缀（保留内部 GZIP 压缩与魔数自动解压）。
-- **本次修改范围（19 个文件）**：
-  - 导出器与解析器默认名：`src/replay/ReplayFileExporter.ts`（`.RCReplay`）、`src/replay/rlrc/runtime/RLRCReplaySessionBridgePipeline.ts`（`.RLRCReplay`）、`src/replay/ReplayDirectorExporter.ts`（`.RCGR`）、`src/replay/ReplayDirectorPatternParser.ts`、`src/replay/ReplayDiagnosticPatternController.ts`。
-  - UI、Store 与 File Picker：`ReplayDirectorOrientationCard.tsx`、`ReplayDirectorTunerFloatingWindow.tsx`、`StateReplayBenchPanel.tsx`、`StaticTrainingPackToolbar.tsx`、`DiagnosticDumpFloatingWindow.tsx`、`ReplayToRcsHeaderAndDeltaSection.tsx`、`DynamicTrainingPackFloatingWindow.tsx`、`devFloatingPresets.ts`、`devHubExperimentalCatalogEntries.ts`、`Layer3TrainingConfigRecipe.tsx`、`OnlineWarmupTelemetryAndReadySection.tsx`、`MultiTrackReplayTimeline.tsx`、`dynamicTrainingPackCodec.ts`、`replayDirectorStore.ts`。
-- **验证结果**：`pnpm check`（1387/1387 TS，0 错误，Radar GREEN）与 `pnpm build` 均通过。
-- **提醒可能遗漏的导出/格式**：
-  1. `.RCSPackE`（可编辑静态包）与 `.RLRCSPack`（开发者自 `.Tem` 转换的静态包）目前仍在 `staticTrainingPackCodec.ts` 与 `StaticTrainingPackToolbar.tsx` 中使用，需确认保留还是归并为 `.RCSPack`。
-  2. `.RCClip` 目前在 `src/` 中尚无导出/导入实现，属于后续新增格式。
-  3. 各类 Tuner 预设、诊断 Dump 与自检报告仍导出 `.json` / `.csv`（如 `audioConfig.json`、`rc-selftest-report-*.json`），预计保持不变。
+### 1.1 当前工具链实测状态
+在沙盒中通过 `/work/fix.sh --ref eb68dfcd0f2caa7a85af97f301626296afba4a37 --new-branch z/agy/rc/rust/diag-repro-report --no-check` 初始化后，所有重型依赖与构建产物均已隔离至 `/tmp` (`tmpfs`)，OverlayFS (`/work/RocketCompanion`) 保持源码纯净：
 
----
+| 检查项 | 命令 | 实测结果 | 备注 |
+| :--- | :--- | :--- | :--- |
+| **Rust 工具链** | `rustc --version && cargo --version` | **PASS** (`rustc 1.100.0`, `cargo 1.100.0`) | 通过 `/usr/local/bin/{cargo,rustc,rustup}` 自动恢复至 `/tmp/rustup` 与 `/tmp/cargo-home` |
+| **TS 架构雷达与类型检查** | `pnpm check` (`radar.ts` + `tsc --noEmit`) | **PASS** (0 循环依赖, 0 越界导入, 1333/1333 TS) | 发现 463 个文件处于 12KB..18KB / 400..800L 软提示区间 |
+| **WASM Workspace Check** | `pnpm build:wasm:check` | **PASS** (12.67s) | 7 个自定义 crate (`rocketsim`, `rc_*`, `rocketsim_wasm`) 全部通过 |
+| **WASM Dev 编译** | `pnpm build:wasm:dev` | **PASS** (16.80s) | 输出 `/tmp/rc-wasm-target/core.wasm` (1162.2 KB, 198 exports) |
+| **Native `cargo test`** | `cargo test --workspace` | **FAIL** (`linker 'cc' not found`) | 沙盒未预装 `gcc`/`clang`；`wasm32-unknown-unknown` 使用内置 `rust-lld`，不受影响 |
+| **Ducky 3v3 全生命周期 E2E** | `node scripts/runScenarioBaseline.mjs --scenario=online_3v3_ducky_full_lifecycle` | **PASS** (30.4s, 2400 ticks, 22/22 断言通过) | Headless Chrome + WebGL2 (SwiftShader) + WASM Ducky 3v3 实跑通过 |
+| **全量基线套件** | `pnpm test:baseline` | **RED** (`multiplayer_6car_loadout_stress` 失败) | 捕获到真实物理回归：`phantomDoubleJumps=1, hasAirJumped=false` |
 
-## 三、架构与文件体积观测（Radar）
-
-全仓无 Hard Error（800 行 / 18 KB），但以下 10 个文件超出 Soft Threshold（400 行 / 12 KB），后续迭代新增功能时建议按职责拆分：
-- `src/ui-core/stores/replayDirectorStore.ts`（446L / 14.8 KB）
-- `src/ui-core/stores/devFloatingPresets.ts`（405L / 15.1 KB）
-- `src/replay/ReplayDirectorPatternParser.ts`（405L / 14.9 KB）
-- `src/ui-core/recipes/Layer3TrainingConfigRecipe.tsx`（379L / 15.0 KB）
-- `src/ui-core/panels/dev/DiagnosticDumpFloatingWindow.tsx`（363L / 14.3 KB）
-- `src/replay/ReplayDirectorExporter.ts`（351L / 13.2 KB）
-- `src/ui-core/charts/MultiTrackReplayTimeline.tsx`（333L / 13.9 KB）
-- `src/ui-core/panels/dev/subsystem-isolation-lab/StateReplayBenchPanel.tsx`（341L / 12.8 KB）
-- `src/ui-core/recipes/online/OnlineWarmupTelemetryAndReadySection.tsx`（332L / 12.8 KB）
-- `src/replay/ReplayDiagnosticPatternController.ts`（336L / 12.3 KB）
-
-此外，`z/agy/rc/track-b-voice-fix` 中的 `WebRtcNativeVoiceBridge.ts` 为 483 行（超过 400 行软限制），合入或重构时建议拆分为「Peer 协商/信令子模块」与「本地/远端音频管线子模块」。
+### 1.2 `tmpfs` 临时工具链一键恢复建议
+目前 `/work/fix.sh` 已经完美处理了 `pnpm`、`node_modules`、`public` 静态资产、`rustup`、`cargo` 以及 `/tmp/rc-wasm-target` 的 `tmpfs` 映射。为了打通 **Native Rust 单元测试 (`cargo test`)** 与 **WASM 体积优化 (`wasm-opt`)**，建议在恢复脚本中追加两项轻量级 `tmpfs` 引导：
+1. **Native 链接器 (`lld` / `clang` 提取至 `/tmp`)**：在无 root 权限或避免污染 OverlayFS 的前提下，通过 `apt-get download lld clang` + `dpkg -x *.deb /tmp/llvm-sysroot` 并在 `CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=/tmp/llvm-sysroot/usr/bin/ld.lld`（或 wrapper script）下运行 `cargo test --workspace`，即可在不污染系统盘的情况下跑通全部 Rust 单元测试（包括 `rc_audio_director/src/director_impact_tests.rs` 等）。
+2. **`wasm-opt` / `wasm-pack`**：`buildPhysicsWasm.mjs` 已内置纯 `cargo build --target wasm32-unknown-unknown` + 导出检查，无需强依赖 `wasm-pack`；若需 release 体积裁剪，可将 `binaryen` (`wasm-opt`) 解压至 `/tmp/bin/wasm-opt`。
 
 ---
 
-## 四、下一阶段开发规划与技术诊断
+## 二、 Ducky Model 可行性验证与双轨自动化复现路径
 
-### 1. Audio / WebRTC 语音问题诊断与整合方案
-- **现状与问题根因**：
-  1. `z/agy/rc/track-b-voice-fix` 尚未合入 `alpha`。
-  2. 在该分支的 `src/audio/voice/voiceAudioGraph.ts` 中，当增益 `<= 100%`（默认）时，WebAudio `gainNode` 增益被设为 `0`，完全依赖未挂载到 DOM 的 `new Audio()`（`hiddenAudioEl`）播放，且 `hiddenAudioEl.play().catch(() => {})` **静默吞掉了所有异常**。在浏览器/WKWebView Lobby 阶段若 `AudioContext` 或媒体播放未获最近手势解锁，会**无声失败且控制台无任何输出**；而本地电平条直接采集自 `localMicAnalyser`，因此本地能看到电平条但两端互相听不见。
-- **规划方案**：
-  - **统一整合到新网络同步结构**：建议将语音通道生命周期绑定到 `EstablishedSessionManager` / `RoomReplicationBus`（而不是零散挂在旧回调中），确保跨 Activity 热切换不掉线。
-  - **修复远端播放与可观测性**：优先统一走 WebAudio `VoiceMasterOutputBus` 播放远端流（不再用 `hiddenAudioEl` 静默兜底），并在 `play()` / `AudioContext.resume()` / `renegotiatePeer()` 失败时输出结构化诊断日志与 UI 状态提示。
-  - **Voice Chat Mode 房间配置**：在创建房间（Host）与房间同步状态中增加 `voiceChatMode: 'open' | 'team_only' | 'off'`：
-    - `open`：全房间互通；
-    - `team_only`：根据各 Peer 的 `team`（Blue / Orange）动态控制 `attachPeer` 发送/接收静音路由（或服务端/Host 广播队伍归属后本地实时 Gate）；
-    - `off`：禁用麦克风采集与远端语音播放。
-  - **键盘打字音降噪**：在 `localMicSource` 与 WebRTC 发送轨（`MediaStreamDestination`）之间接入 `AudioWorkletNode`，集成 MIT 开源降噪库（如 RNNoise WASM 方案）。
+### 2.1 Ducky Model 现状确认：已在 Rust (`rc_bot_ai`) 原生跑通
+经查证，**SafeTensors 模型加载与推理已经完全下沉至 Rust WASM (`crates/rc_bot_ai`)**，并非在 TypeScript 中计算：
+- 模型文件：`public/assets/models/experimental/botpack_9700488/ducky_policy.safetensors`（仅 **1.6 MB**）。
+- Rust 侧实现：`crates/rc_bot_ai/src/safetensors_store.rs` 直接解析二进制 SafeTensors，`mlp_obs_extended.rs` 构建 `DuckyObs_V2_01(3)` (295 floats)，`sequential_mlp.rs` 使用 `DUCKY_SPEC` 执行 SIMD MLP 推理，`bot_director.rs` 统一调度。
+- **Node.js 纯 WASM 实测**：通过 `/tmp/test_ducky_wasm.mjs` 直接加载 `core.wasm`、`public/arenamesh/*.cmf` 与 `ducky_policy.safetensors`，`_physics_loadBotWeights(7, ...)` 成功返回 `18` 个张量，`_physics_isBotPolicyLoaded(7) === 1`。
+- **Headless Chrome 实测**：`online_3v3_ducky_full_lifecycle` 场景已使用 3 个 Ducky Bot 跑通 3v3 完整对局（Lobby → Prepare → Kickoff → Playing → Goal → Director Replay → Overtime → Golden Goal → `.RCReplay` 往返 → Podium → Replay Viewer → Freeplay），2400 ticks 零控制台报错。
 
-### 2. 新网络同步结构 & Multiplayer Training（Online Match 简化版）
-- **核心架构**：基于已有的 `RoomActivityOrchestrator` + `ActivityKernel`（`src/network/server/RoomActivityOrchestrator.ts` & `activities/ActivityKernel.ts`），新增 `MULTIPLAYER_TRAINING` ActivityKernel，支持在房间内无感热切换。
-- **Multiplayer Training 默认规则**：
-  - 无比分概念（隐藏或禁用记分板结算），进球正常进入 Cinematic Goal Replay。
-  - Boost 策略：默认「滞空消耗（`limit_when_aerial`）」——地面保持 100% 持续、允许拾取场内 Boost Pad；一旦离地（`!car.onGround`），Boost 从 100% 开始真实消耗，防止空中无限飞行。
-- **UI 控制**：
-  - 基础配置页提供 Segmented Control：`Limited` | `Limit When Aerial` | `Unlimited` | `Custom`。
-  - 选中 `Custom` 时引导跳转至 Advanced 页面，支持更细粒度参数及 **Per-Player（按特定玩家指定）** Boost/规则覆盖。
+### 2.2 为什么现有测试没抓到 Flip Reset / 进球多音效 / Replay 闪烁？
+核心原因在于：**现有的 `online_3v3_ducky_full_lifecycle` 断言只检查了流程状态机（`phase === 'replay'`、`blueScore >= 2`、`camera_no_nan_poses`）**，而没有检查：
+1. **音频单帧/单事件播放次数**（例如每次进球 `sfx_goal_poof` / `goalScored` 被 `AudioSlotPool` 和 `gameAudio.play` 实际触发了几次）；
+2. **Flip Reset 的物理接触与事件一致性**（车轮接触球体 `UserInfoType::Ball` 次数 vs `0x0F` 事件发射次数 vs 连续 Reset 场景）；
+3. **Cinematic Replay 期间车辆 Mesh 坐标的帧间震荡度**（目前只测了 Camera 位姿平滑度，未测 Replay 期间每辆车 `car[i].group.position` 的帧间位移反转/抖动）。
 
-### 3. 用户移除（Kick）与主动退出（Leave）修复
-- **已定位 Bug**：
-  - `src/game/runtime/OnlineRemotePeerVehicleSynchronizer.ts` 的 `removeRemotePlayer(carIndex)` 仅清理了 Host 本地车辆与 `remotePeerCarMap` 并更新 Host UI，**未向被移除客户端发送踢出控制信令，也未关闭对应的 `P2PWebRTCChannel`**，导致被踢端收不到任何通知。
-  - 客户端主动退出时需确保先通过可靠通道发送 `leave` 控制帧，再关闭连接，保证 Host 与其余客户端立即感知并更新 Roster 与语音状态。
+### 2.3 推荐的自动化复现与 Golden Standard 对比方案
 
-### 4. 自动化测试规划
-- **多人虚拟测试（扩展 `scripts/runMultiplayerRoomRepro.mjs` & `MultiClientLoopbackSimulator.ts`）**：
-  - 覆盖真人接管（Bot take over user input）与 Auto-fill Bot 的多端组合矩阵。
-  - 新增测试用例：
-    1. Multiplayer Training 规则验证（无比分、进球回放、地面 100% Boost + 离地真实消耗、4 种 Segmented Control 模式与 Custom Per-Player 覆盖）。
-    2. Kick 与 Leave 双向信令测试（被踢端收到通知并退回大厅、退出端立即从其余端 Roster 与语音列表移除）。
-    3. Lobby 与对局中 Voice 信令/Track 绑定及 `Open / Team Only / Off` 权限路由测试。
-- **画笔（Telestrator）自动化测试**：
-  - 利用 `src/network/protocol/TelestratorWireCodec.ts` 既有的 `stroke.hash` 与 `TelestratorHashAck` 编解码，构建自动化压测场景：在场地内随机/程序化绘制多段笔画，通过 DataChannel 同步至远端并校验实时渲染与 `Hash ACK` 一致性。
+建议构建**双轨自动化复现链路**：
+
+#### 轨道 A：Headless Chrome 全链路探针（抓音频、相机、Mesh 闪烁）
+复用 `scripts/runScenarioBaseline.mjs` + `soakAudioAndHeapHooks.ts`，新增一个专用诊断场景（或扩展 `online_3v3_ducky_full_lifecycle`）：
+- **Ducky 双模式驱动**：
+  - **Bot 填充模式**：`configureBotSlot(1..5, policyId=7, ...)` 填充 5 个 Ducky Bot。
+  - **接管用户输入模式**：对 `car[0]` 启用 Ducky 接管（在 `SimulationStage` 前通过 `_physics_stepBotInferenceMask(0x3F, ...)` 覆盖本地 `playerControls`，或使用预设 `.RCDPack` / `.RCReplay` 注入特定空中 Flip Reset 切片并由 Ducky 接管）。
+- **三大问题自动断言探针**：
+  1. **进球音效计数探针**：在 `AudioSlotPool.playBuffer` 与 `gameAudio.play` 上挂载计数器（按 `sfx_goal_poof` / `goal_explosion` 统计），每次进入 `goal` phase 至下一次 `kickoff` 之间，**严格断言 `goalAudioCount === 1`**（当前分支实测会 `>= 2`）。
+  2. **Replay 车辆闪烁探针**：在 `phase === 'replay'` 且 `cameraMode === 'director'` 期间，每帧记录 `arena.cars[i].group.position`，计算相邻两帧位移向量点积 `dot(delta_t, delta_{t-1})`。若出现连续大幅反向跳变（`|delta| > 30uu` 且点积为负），立即判定为**车辆闪烁/双源抢写**。
+  3. **Flip Reset 探针**：构造“空中单跳 → 4 轮触球 → 不翻转直接二次触球 / 快速连 Reset”合成切片，统计 `wheels_with_contact` 含 `Ball` 的上升沿次数 vs `0x0F` 事件数 vs `0x0F` 音频槽位触发数。
+
+#### 轨道 B：Node.js + WASM 极速差分测试（以 `origin/alpha` 为 Golden Standard）
+将 `origin/alpha`（C++ WASM + 原版 TS）与当前 `rust` 分支视为两个黑盒（对我们自身是白盒）：
+- 使用完全相同的开球种子 `resetKickoff(42)` 与相同的 Ducky 控制序列（或录制一份 `.RCReplay` 控制流），分别在 `origin/alpha` 与 `rust` 分支回放 3v3 10,000 ticks。
+- **可接受差异（白名单）**：随机种子不同导致的开球阵型差异、浮点微扰导致的 1~2 tick 碰撞时间差。
+- **不可接受差异（红线）**：相同触球状态下的 Flip Reset 判定分歧、单次进球的事件发射数量 > 1、High-RPM 音频增益突变、Replay 帧间状态跳变。
 
 ---
 
-## 五、待讨论与不明确事项
+## 三、 四大核心问题源码级根因诊断
 
-1. **`track-b-voice-fix` 合入顺序**：是先单独修复 `hiddenAudioEl` 静默播放问题并合入 `alpha` 做一次快速验证，还是直接基于 `alpha` 的新 `RoomReplicationBus` 架构重构后再合入？
-2. **静态包衍生后缀**：`.RCSPackE` 与 `.RLRCSPack` 是否保留，还是统一对外只用 `.RCSPack`？
-3. **`.RCClip` 格式定位**：`.RCClip` 具体对应哪类导出（如高光片段/短回放），结构上是否复用 `RCREPLAY` V2 容器？
-4. **键盘降噪 MIT 仓库**：团队是否已选定具体库（如 `@sapphi-red/web-noise-suppressor` / `rnnoise-wasm` 等）？
-5. **Multiplayer Training Advanced 页面范围**：除 Per-Player Boost 选项外，Custom 还需要开放哪些参数（如 Goal Replay 开关、球速/重力、自动复位延迟等）？
-6. **Lobby Voice 行为确认**：确认 Lobby 期间预期行为即为 `Open`（或按房间设置的 `voiceChatMode`）可正常互通，无「Lobby 静默」设计。
+### 3.1 问题一：Flip Reset 时灵时不灵（`0x0F` 判定与多重防抖冲突）
+
+用户提到“旧版本通过车辆轮胎接触点的物体指针判断它是不是球”。在 Rust 版本中，虽然保留了 `UserInfoType::Ball` 检查，但**在 `car_modifiers.rs`、`car_action_events.rs`、`rc_audio_director` 与 TS `CarActionDebounceRegistry.ts` 中叠加了四层相互矛盾的限制**：
+
+1. **连续 Flip Reset 被条件锁死（`crates/rc_physics_sim/src/car_modifiers.rs:181-189`）**：
+   ```rust
+   let flip_reset_this_tick = !st.is_demoed
+       && is_on_ground
+       && !pre.is_on_ground
+       && (has_ball_or_car_wheel || is_ceiling_contact)
+       && (pre.has_jumped
+           || !pre.had_air_flip_avail
+           || pre.has_double_jumped
+           || pre.has_flipped)
+       && st.has_flip_or_jump();
+   ```
+   - **缺陷 A**：如果车辆已经获得过一次 Flip Reset（或从天花板/门框掉落未按跳跃），此时 `has_jumped == false`、`has_flipped == false`、`has_double_jumped == false`、`had_air_flip_avail == true`，上述 `&& (...)` 条件直接为 **`false`**！导致**未消耗掉上一次 Flip 的情况下，第二次四轮触球无法触发 Flip Reset 事件与音效**。
+   - **缺陷 B**：`is_on_ground` 在 `crates/rocketsim/src/sim/car/base.rs:1048` 定义为 `num_wheels_in_contact >= 3`。如果车辆高速蹭球，第 T 帧只有 2 轮射线命中球体、第 T+1 帧另外 2 轮命中（或车体先发生刚体弹开导致同一帧内未能凑齐 3 轮 raycast 命中），`is_on_ground` 根本不会变成 `true`，Flip Reset 直接丢失。
+2. **物理层与音频层冷却时间不一致（12 ticks vs 60 ticks）**：
+   - `crates/rc_physics_sim/src/car_action_events.rs:169` 使用 **12 ticks (100ms)** 冷却。
+   - `crates/rc_audio_director/src/director_vehicle_events.rs:185` 与 `vehicle_incident_cues.rs:344` 却使用 **60 ticks (500ms)** 冷却！
+   - 若 0.5 秒内完成快速 Double Flip Reset，物理层发出了 `0x0F`，但音频导演**静默吞掉了第二次音效**。
+3. **TS 侧双重拦截与墙上时钟污染（`src/game/pipeline/stages/CarActionEventSynthesizer.ts:226` & `CarActionDebounceRegistry.ts:320`）**：
+   - `CarActionEventSynthesizer.ts:226` 存在硬拦截：`if (networkReconciler && !networkReconciler.lobbyDualWorldMode) return;`——**在线/联机模式下本地预测的 `FLIP_RESET_GAINED` 会被直接丢弃**。
+   - `CarActionDebounceRegistry.ts:321` 同时检查 `tickDelta < 60 || timeDeltaMs < 500`，使用了 `performance.now()` 墙上时钟，在倍速快进或帧率波动时行为不可预测。
+4. **回滚/Seek 后的单调性假设失效**：
+   - `director_vehicle_events.rs:184` 使用 `ev_tick.saturating_sub(dt_state.last_flip_reset_tick) < 60`。若发生网络回滚或 Replay 往回拖拽（`ev_tick < last_flip_reset_tick`），`saturating_sub` 结果为 `0 < 60`，导致后续 Flip Reset 音效被误杀。
+
+---
+
+### 3.2 问题二：进球触发的音频明显多于一次（多链路并发 + 回滚重触发）
+
+当前架构中，**单次进球会同时激活 Rust 音频导演与多处 TS 业务层代码**，导致 `sfx_goal_poof.m4a`（`goalScored`）被重复播放多次：
+
+1. **Rust 音频导演链路**：
+   - `crates/rc_physics_sim/src/car_modifiers.rs:279` 检测到进球后发射事件 `0x0E`。
+   - `crates/rc_audio_director/src/director_impact_events.rs:403` (`handle_goal_scored`) 生成 `AudioOneShotSlotPod { event_type: 0x0E }`。
+   - `src/audio/wasmAudioOneShotDispatcher.ts:253` 消费该槽位并调用 `pool.playBuffer(incBufs.goalScored, ...)`。
+2. **TS 业务层并行重复播放（至少 5 个独立入口未与 WASM 解耦）**：
+   - `src/game/runtime/RuntimeGoalReplaySignalSubController.ts:104`：收到 `SCORE_UPDATED` 信号时直接调用 `audio?.play('sfx_goal_poof', 1.0)`。
+   - `src/game/modes/freeplay/freeplayTouchAndGoalPipeline.ts:342`：Freeplay 进球记录时直接调用 `audio.play('sfx_goal_poof', 1.0)`。
+   - `src/game/modes/experimental-multi-bots/ExperimentalMultiBotsGoalIncidentTracker.ts:210`：Bot 对局进球时直接调用 `audio?.play?.('sfx_goal_poof', 1.0)`。
+   - `src/game/modes/static-training/StaticTrainingSimulationController.ts:365`：训练模式进球时直接调用 `audio?.play?.('sfx_goal_poof', 1.0)`。
+   - `src/replay/ReplayFrameEventDispatcher.ts:221`：回放事件分发时再次调用 `gameAudio?.play?.('sfx_goal_poof', 1.0)`。
+3. **去重窗口过短 + 状态回滚重触发**：
+   - `wasmAudioOneShotDispatcher.ts:15` 的 `SAME_FRAME_DEDUP_MS` 仅 **28ms**（约 1.6 帧）。
+   - 网络回滚或状态恢复（`state_sync.rs:179`）会将 `goal_scored_flag` 恢复为 `0.0`，且 `director.rs:313` 在 `current_tick < last_sim_tick` 时会将 `last_goal_scored_tick` 重置为 `u32::MAX`——当客户端重算跨过球门线时，`0x0E` 会再次发射并突破 28ms 窗口，导致同一粒进球播放 2~4 次以上爆炸音效。
+
+---
+
+### 3.3 问题三：Cinematic Replay Camera 期间车辆来回闪烁
+
+在 Cinematic Goal Replay (`phase === 'replay'`, `cameraMode === 'director'`) 期间，车辆网格位置存在**多写入源抢占（Multi-Writer Race）**：
+
+1. **`SimulationStage` 与 `GameplayModeStage` 同帧双写 `interpolator`**：
+   - 在 `src/game/pipeline/stages/simulationNetworkReconcilePipeline.ts:105` 中，`reconciler.reconcile(now)` **在 `replayPlaybackMode` 下依然被无条件调用**。
+   - 紧接着第 168 行调用 `applyReplayFrameToEngine(physics, pkt.stateSnapshot, interpolator)`，以 `prevFrameBuffer = null, alpha = 1.0` 写入 `interpolator`。
+   - 随后在 `GameplayModeStage` 中，`networkStreamedGoalReplayCoordinator.ts` → `ReplayTimelineController.stepPlayback` → `executeReplayPlaybackStep` (`ReplayDirectorStatePipeline.ts:389`) 又会依据 `cursorFloat` 与 `alpha` 再次调用 `applyStepFrameAndControlsToEngine` 改写 `interpolator`。两组不同的 `(prevState, currState, alpha)` 在相邻帧/同帧间交替生效，导致车辆在两帧位置之间来回跳变。
+2. **`PresentationStage` 仍叠加联机平滑偏移 (`smoothOffset`)**：
+   - `src/game/pipeline/stages/PresentationStage.ts:128-137` 在 `reconciler` 存在时，**未判断 `isGoalReplay` / `replayPlaybackMode`**，每帧继续执行 `reconciler.updateSmoothing(dt)` 并将 `smoothOffset` 强行加到 `activeCarMesh.group.position` 上，使主角车辆在回放坐标系中发生位置撕裂与闪烁。
+
+---
+
+### 3.4 问题四：高转速引擎音频“滋啦滋啦”爆音（对比 `origin/alpha`）
+
+- Commit `52b8173` 已针对该问题做了显著优化：75ms 断油回弹（rev-limiter bounce）、95-RPM 切片锚点间距、余量缩放（headroom scaling）与 `setTargetAtTime` 音频率平滑，整体表现已优于 `origin/alpha`。
+- **残留风险点**：高转速下若 `TurtleModemGranularVoiceGraph` 的多切片循环点未对齐过零点（zero-crossing）或 RPM 在 95-RPM 锚点边界高频抖动，仍可能引发微弱相位干涉爆音；建议在 `rc_audio_director` 侧对输出给 WebAudio 的 RPM 增加轻量级施密特触发器/低通滤波。
+
+---
+
+## 四、 `origin/alpha` vs `rust` 分支功能差异与未迁移清单
+
+对比 `d9e7498`（`rust` 分支最后一次同步 `alpha` 的公共祖先）之后 `origin/alpha` 的提交历史（至 `8d19408`），以下功能已在主分支落地但**尚未在 `rust` 分支重建/同步**：
+
+| 主分支 PR / Commit | 功能模块 | 缺失/待重建内容说明 |
+| :--- | :--- | :--- |
+| **PR #19 (`bc1e9a2`)** | 文件扩展名统一 | 统一 `.RCReplay`、`.RLRCReplay`、`.RCGR`、`.RCDPack`、`.RCSPack`（移除 `.gz` 后缀约定） |
+| **PR #18 (`3e8ce00`, `f70fbf3`, `abeab8f`, `3da79fa`, `5aab062`)** | **Dynamic Training Takeover** | Replay Viewer 捕获 4s 预卷 `.RCDPack`、双标记捕获、接管 HUD 与 3s 超时音效、修复槽位错乱与稀疏阵容、修复 120Hz 物理双步进、暂停时冻结 Boost Pad |
+| **PR #17 (`3b3b3cc`)** | 渲染与后处理 | 修复半透明遮罩遮挡 Hex Glow 的问题，将护盾六边形网格默认不透明度设为 `0.03` |
+| **PR #16 (`8484cf9`)** | 通知系统 UI | 增加黄色铃铛强制折叠开关与退出菜单自动展开逻辑 |
+| **Telestrator (`da722e3`, `2f38585`, `5b1ee5c`)** | 3D 战术画笔 | CMF 射线检测（消除球场 Mesh 回退卡顿）、圆角端点/连接、视向箭头、实时预设重建、Dump Last Stroke |
+| **PR #14 (`db84803`, `cf5cfee`)** | Track D 联机总线 | `RoomReplicationBus` 与 `ActivityOrchestrator`（`rust` 的 Wave 3/4 已部分实现，需与 `alpha` 最终契约对齐核验） |
+
+---
+
+## 五、 Rust vs TypeScript 下沉评估与架构解耦建议
+
+### 5.1 模块下沉边界建议
+
+| 子系统 | 当前归属 | 建议归属 | 权衡理由 (Trade-off) |
+| :--- | :--- | :--- | :--- |
+| **物理仿真 & 碰撞** | Rust (`rocketsim`, `rc_physics_sim`) | **保持 Rust** | 120Hz 核心计算与内存安全已完全落地 |
+| **Bot AI & SafeTensors 推理** | Rust (`rc_bot_ai`) | **保持 Rust** | Ducky/Nexto/Ripple 等已全部使用 Rust SIMD 推理，无需 TS 介入 |
+| **音频事件判定 & 空间计算** | Rust (`rc_audio_director`) + TS 混杂 | **100% 收口至 Rust** | 必须**删除 TS 侧所有独立 `audio.play('sfx_goal_poof')` 与 `CarActionDebounceRegistry` 重复防抖**，TS 仅保留薄 WebAudio 播放壳 |
+| **网络协议编解码、状态差分、Jitter Buffer 与预测回滚循环** | TS (`src/network/`, 110 文件) | **核心状态机下沉 Rust** | WebRTC DataChannel / WebSocket I/O 留给 TS；二进制包序列化、压缩、256 槽位快照回滚 (`13c078e` 基础已就绪) 与平滑插值下沉 Rust，消除 GC 抖动 |
+| **Replay 导演相机轨迹规划** | TS (`src/replay/`, 86 文件) | **中期评估下沉 Rust** | `ReplayDirectorGazeSolver` 涉及全帧扫描与平滑滤波，下沉 Rust 可与 `rc_replay_codec` 共享内存，避免大量 JS 对象分配 |
+| **UI / Three.js 渲染 / WebAudio API** | TS | **保持 TS** | 浏览器 DOM/WebGL2/AudioContext 原生绑定，留在 TS 维护成本最低 |
+
+### 5.2 代码组织与防大文件建议
+- 当前 Rust 侧最大文件为 `sequential_mlp.rs` (548 行)，整体拆分健康。
+- TS 侧仍有 463 个文件处于 400~800 行区间，且存在像 `sfx_goal_poof` 这样分散在 6 个不同文件中的“隐式耦合”。后续修复应优先**收口事件源**（Single Source of Truth），而不是在 TS 侧继续打补丁式防抖。
+
+---
+
+## 六、 待确认与后续权衡讨论的问题 (Questions for Discussion)
+
+1. **Flip Reset 判定语义**：在物理上，是否严格要求与 Rocket League 原版一致（必须 **4 轮同时**触球才算 Reset，还是沿用 RocketSim 的 `>= 3` 轮）？另外，若车辆**尚未消耗上一次 Flip** 时再次四轮触球，是否应该重新触发 `0x0F` 音效与视觉特效？
+2. **联机音频单一数据源**：是否同意彻底移除 TS 侧（`RuntimeGoalReplaySignalSubController`、`freeplayTouchAndGoalPipeline`、`ReplayFrameEventDispatcher` 等）对 `sfx_goal_poof` 的直接调用，全部统一由 `rc_audio_director` 的 `0x0E` 槽位（配合状态机锁死“单回合仅响一次”）驱动？
+3. **主分支 PR #16~#19 同步优先级**：在修复上述 3 个核心 Bug 后，是否优先将 `origin/alpha` 的 PR #18 (Dynamic Training Takeover) 与 PR #19 (文件扩展名统一) 合并/重构进 Rust 分支，还是先完成网络通道 Rust 化？
+4. **Native `cargo test` 需求**：是否需要在 `/work/fix.sh` 中集成轻量级 `/tmp` `lld` 链接器，使沙盒与 CI 能够直接运行 `cargo test --workspace` 来保护 `rc_physics_sim` 与 `rc_audio_director` 的边界用例？

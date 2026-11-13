@@ -1,69 +1,82 @@
-# Track C (`abeab8fa` / Dynamic Training Pack) 深度排查、修复与合并评估报告
+# RocketCompanion 推进报告：Track A/D 合入、Track B 诊断、Track C 盘点与新路线图建议
 
-**工作分支**：`z/agy/rc/track-c-audit`（基于 `abeab8fa0462382d53bac7ac94b2d0360d6013b6`）  
-**已推送 Verified Commit**：[`0401e7a205e1681b987a376c9d1450af088c42eb`](https://github.com/Antigravi-ty/RocketCompanion/commit/0401e7a205e1681b987a376c9d1450af088c42eb) (`signature.isValid: true`)
+## 1. 已执行操作（Track D & Track A 已合并至 `alpha`）
 
----
+1. **Track D（PR #14）已验收并合并**
+   - 分支：`z/agy/rc/track-d-replication-bus` -> `alpha`
+   - 合并前实测 `pnpm run check`（Radar 2.0 + `tsc --noEmit`）全绿通过。
+   - 已通过 GitHub API 合并至 `alpha`（Merge SHA: `db8480300db46e6ffd54cacdd0d82583366f12cf`）。
 
-## 一、实测 Bug 根因定位与已落地的修复
-
-### 1. 导出 `1.RCDPack` 在 frame 2775「完全没对上」的根因（已修复）
-- **根因**：对用户提供的 `1.RCDPack` 与 `rc-replay-3v3-1-0-2026-11-13T07-26-58.rcreplay.gz` 逐帧比对发现：
-  - 球的位置完全一致（frame `2772` 均位于 `[-2020.60, 2259.54, 668.63]`）。
-  - 但 `1.RCDPack` 中 `roster` 与每帧 `cars` 数组顺序为 `[3, 4, 5, 0, 1, 2]`（`ReplayViewerRosterSubController.resolvedRoster` 将 Player 所在队伍排在前面），而 `DynamicTrainingSliceExtractor.ts` 直接按 `roster` 顺序写入 `cars` 并透传给 `hydrateRLRCFramesFromDynamicSession`。
-  - 下游 `RLRCInterveneTargetFrameApplier` / `RLRCInterveneNonPovSyncPipeline` / `RLRCIntervenePrerollHistoryInjector` 全部按 **数组下标 `frame.cars[slot]`** 取车。结果 **Slot 0 (`Nexto #4`) 拿到了 Car 3 (`Player`) 的位置/速度/朝向，Slot 3 (`Player`) 拿到了 Car 0 (`Nexto #4`) 的数据**，整场 6 辆车全部错位。
-- **修复**（`src/replay/DynamicTrainingSliceExtractor.ts`）：
-  1. `extractDynamicSessionFromReplayFrames` 与 `extractDynamicSessionFromRLRCFrames` 提取前强制按 `slotIndex` 升序排列 `roster` 与 `cars`。
-  2. `hydrateRLRCFramesFromDynamicSession` 按 `car.slotIndex` 建立槽位索引数组 `cars[slot]`（即使加载之前已导出的 `1.RCDPack` 旧文件也能自动纠正错位）。
-  - **实测验证**：用 `1.RCDPack` + `.rcreplay.gz` 跑 Node 校验，6 辆车 `slotIndex` 全部对齐 `0..5`，位置误差 `0.000000`。
-
-### 2.「3-2-1 倒计时莫名其妙」与「倒计时结束后速度突然飞快」的根因（已修复）
-- **根因**：双重步进 + 帧率耦合：
-  1. `SimulationStage.ts` 的 `CUSTOM_STEP_MODES` 集合中**遗漏了 `'dynamic-training-pack'`**，导致 `SimulationStage` 的 120Hz `interpolator.update()` 不断调用 `physics.step(1)`。
-  2. 与此同时，`DynamicTrainingMode.update(context)` 又在 **渲染帧率（60/120/144Hz）** 下调用 `this.interveneController.stepTick(...)`，内部再次调用 `physics.step(1)`。
-  3. 结果：倒计时阶段渲染线程按 60Hz 拉回 pre-roll 帧而 `SimulationStage` 仍在 120Hz 偷跑物理（导致画面抖动、3 秒倒计时被拉长到 ~6 秒）；进入 `intervening` 后两边同时调 `physics.step(1)`，物理流速直接翻倍（2x+ 飞快）。
-- **修复**：
-  - `src/game/pipeline/stages/SimulationStage.ts`：将 `'dynamic-training-pack'` 加入 `CUSTOM_STEP_MODES`，并在 `interpolator.update` 回调中路由到 `onStepPhysicsTick()`。
-  - `src/game/modes/dynamic-training/DynamicTrainingMode.ts`：将 pre-roll 倒计时与 `intervening` 物理步进从 `update()` 迁入 `onBeforePhysicsTick()` / `onStepPhysicsTick()`，由 120Hz 累加器单源确定性驱动。
-
-### 3. 只有「接管前 4 秒」导致后续 `as-previous` 失控：两段式标签区间（已修复）
-- **问题**：原实现仅截取 `[t0 - 480 + 1, t0]`，`t0` 之后没有帧数据，导致 `as-previous`（`follow-state`）在接管后第 1 帧就因 `frames[followIdx]` 为 `undefined` 而失去原始轨迹。
-- **修复**：
-  - `dynamicTrainingPackTypes.ts` / `DynamicTrainingSliceExtractor.ts`：为 `DynamicTrainingStateSession` 新增 `interveneFrameOffsetInSession` 与 `originalMovementEndFrame120Hz`，支持截取 `[max(0, t0 - 479), max(t0, tEnd)]`。
-  - `DynamicTrainingMode.ts`：`startShot` 改以 `session.interveneFrameOffsetInSession` 作为接管锚点（兼容旧 4 秒切片）。
-  - `replayViewerStore.ts` / `StandaloneReplayViewerController.ts` / `ReplayViewerFloatingWindow.tsx`：新增 **`Tag Intervene From`** 与 **`Tag Movement End`** 两个打标按钮及状态存储，导出时按双标签区间切片。
-
-### 4. RCDPack 悬浮窗改用标准 UI 组件 & 禁用 `Optional POV Car Spawn Variation`（已修复）
-- `DynamicTrainingPackManagerSection.tsx` & `DynamicTrainingShotEditorCard.tsx`：将原生 `<select>` / `<button>` / `<input type="checkbox">` 替换为标准 `DropdownMenu`、`Button`、`SegmentedSwitch`、`Checkbox`。
-- 将 `Optional POV Car Spawn Variation` 设为 `disabled` 并标注为 **`Optional POV Car Spawn Variation (under evaluation)`**。
-
-### 5. 回放暂停/冻结时地面 Boost Pad 动画抖动（已修复）
-- **根因**：`src/entities/BoostPadSystem.ts` 在 `!isActive` 时每帧都会 `padCooldownTimers[i] -= safeDt`，当与 `stateBuffer` 中静态的 `bufferCooldown` 偏差超过 `0.5s` 时又强行拉回 `bufferCooldown`，形成每 0.5 秒循环一次的充能环抖动。
-- **修复**：检测 `EXTENDED_STATE_OFFSETS.IS_SIMULATION_FROZEN` 或 `bufferCooldown` 与上一帧完全一致（静态冻结）时，停止递减 `padCooldownTimers[i]` 并直接锁定为 `bufferCooldown`。
+2. **Track A 默认参数更新（PR #15）已提交 Verified Commit 并合并**
+   - 新建分支：`z/agy/rc/track-a-telestrator-defaults`（基于 `origin/z/agy/rc/track-a-telestrator-v3` 并合入最新 `alpha`）。
+   - 修改文件：
+     - `src/entities/telestrator/telestratorTypes.ts`
+     - `src/game/runtimeUiStoreProxies.ts`
+   - 更新后的默认参数：
+     - `DEFAULT_TELESTRATOR_LINE_WIDTH_REF_PX = 5`
+     - `DEFAULT_TELESTRATOR_ARROW_LENGTH_REF_PX = 60`
+     - `DEFAULT_TELESTRATOR_ARROW_WIDTH_REF_PX = 30`
+     - `DEFAULT_TELESTRATOR_PRESETS`:
+       - `preset-100`: `opacity: 1`, `widthRefPx: 5`
+       - `preset-70`: `opacity: 0.5`, `widthRefPx: 5`
+       - `preset-50`: `opacity: 0.1`, `widthRefPx: 5`
+   - 已通过 GraphQL `createCommitOnBranch` 生成 Verified Bot Commit（`1db147f4debff915603210c73d141e8e2827b46d`，`VALID` 签名），创建 PR #15 并直接合并至 `alpha`（Merge SHA: `c61ffe12b741ff87af741b242ab70c65d29e8823`）。
+   - 合并后在最新 `alpha` 上运行 `pnpm run check`：**0 Radar Error，0 tsc Error，100% TypeScript**。
 
 ---
 
-## 二、关于「500% 回放倍速是否会每秒发 600 个包」的结论
-- **不会，且网络广播频率由 Track D/F 管，不由 Replay 倍速决定**：
-  - `ReplayTakeoverSubController` / `RLRCReplaySessionBridgePipeline` 在 500% 倍速下是在 **120Hz tick 内将游标步长放大为 `5.0` 帧/tick**（跳帧推进），tick 频率本身仍是 120Hz，并非跑到 600Hz。
-  - 联机房间的网络快照广播频率由 Track D 的 `RoomReplicationBus`（Continuous 60/120Hz 或 Sparse 2Hz Ping-Pong）与 `AuthoritativeServerHost` 的固定发送节拍控制，与本地回放倍速彻底解耦。
+## 2. Track B（WebRTC 语音）深度诊断与建议
+
+### 2.1 为什么「电平条在动、控制台无报错，但听不见自己说话」？
+- **直接原因**：在 `origin/z/agy/rc/track-b-voice-fix` 的 `src/audio/voice/WebRtcNativeVoiceBridge.ts`（第 105–109 行）中，`localMicSource` 仅连接到了 `localMicAnalyser`（用于计算 `localMicLevel01` 驱动 UI 电平条），**没有连接到 `ctx.destination`**。
+- 这是正常 VoIP 语音通话的防回声/防啸叫设计（本地不播放自己的 sidetone，只把音轨通过 `RTCPeerConnection.addTrack` 发给远端 Peer）。如果单机测试时没有连第二个 Peer，就会表现为「电平条正常随人声跳动、无报错、但听不见自己」。
+- 若需要单机自测，只需在 UI 中增加一个可选的 **「Mic Test / 本地回听」** 开关，临时将 `localMicSource` 接到一个受控 `GainNode` -> `ctx.destination` 即可。
+
+### 2.2 当前实现是否符合要求？能否直接提 PR 合并？
+- **架构与需求匹配度**：
+  - 已通过 `IVoiceAudioBridge` 防腐层 + `runtimeVoiceBridge.ts` 注入，完全不违反 Transport 隔离红线。
+  - 已按最新要求移除了车顶说话指示器与 3D 空间衰减，入口放在 Developer Under Development Configurator，且**默认关闭**（开启时才调用 `getUserMedia` 请求麦克风权限）。
+  - 已支持按 `playerId` 区分注册用户（持久化）与游客（仅当前会话），并支持 0%–250% 独立音量调节（100% 以下走 `<audio>`，101%–250% 自动切换 WebAudio `GainNode` + `DynamicsCompressorNode` 限幅）。
+  - 语音音轨走原生 RTP 媒体流，与 DataChannel 状态同步完全解耦，不会干扰后续总线重构。
+- **合并前唯一阻塞项（3 文件冲突）**：
+  - 因 Track D（PR #14）刚刚修改了 DataChannel 分流管道，`z/agy/rc/track-b-voice-fix` 与最新 `alpha` 在以下 3 个文件存在合并冲突：
+    1. `src/network/transport/P2PWebRTCChannel.ts`
+    2. `src/network/transport/webrtc/DataChannelTransport.ts`
+    3. `src/network/transport/webrtc/dataChannelFramingPipeline.ts`
+  - **建议**：基于最新 `alpha` 新建 `z/agy/rc/track-b-voice-rebased` 解掉这 3 处冲突（把 `sendVoiceSignal` 走 Track D 的 Reliable 控制信道），顺便加上「Mic Test 本地监听」开关后**即可直接提 PR 合并**，无需等后续网络层全部完成。
+
+### 2.3 输入 / 输出降噪方案评估
+- **输入降噪**：
+  - 当前已启用浏览器/WebRTC 原生 `echoCancellation` / `noiseSuppression` / `autoGainControl`。
+  - 如需更强的键盘声/环境底噪抑制，建议直接引入成熟的 MIT 开源库 **`@sapphi-red/web-noise-suppressor`**（基于 `AudioWorklet` + RNNoise / Speex WASM，体积轻量，可在 `MediaStream` 进 `addTrack` 前插一层 Worklet 处理），**不要自己手写降噪算法**。
+- **输出降噪**：
+  - **不建议做**。语音质量主要取决于发送端输入降噪；对经过 Opus 有损编码传输后的远端音频再跑 AI 降噪，不仅浪费 CPU，还容易出现声音发闷/抽吸效应。保留当前 `VoiceMasterOutputBus` 的 `DynamicsCompressorNode` 输出防爆音限幅器即可。
 
 ---
 
-## 三、如何检验 Track C 是否具备合并条件（Merge Readiness Checklist）
+## 3. Track A 剩余待办（UI 协同 & 网络联调）
 
-建议按以下 4 步验收，全部通过即可合并到 `alpha`：
-1. **静态与架构门禁**（本次已通过）：
-   - `pnpm run check`（Radar 2.0 + `tsc --noEmit`）0 Error。
-   - `pnpm run build` 生产构建通过。
-2. **数据与槽位一致性回归**（本次已通过）：
-   - 对 `1.RCDPack` 与真实 3v3 `.rcreplay.gz` 验证 `frame.cars[slot].slotIndex === slot` 且全员 6 车坐标误差 `0.000000`。
-3. **浏览器交互实测（待您本地端到端确认）**：
-   - 在 Replay Viewer 加载 `rc-replay-3v3-1-0-2026-11-13T07-26-58.rcreplay.gz`：
-     - 暂停在含正在充能 Boost Pad 的帧，确认地面 Boost Pad 充能环**完全静止不抖动**。
-     - 在 `2775` 打 `Tag Intervene From`，在后续节点（如 `3015`）打 `Tag Movement End`，点击 `Put into Dynamic Training Pack (.RCDPack)`。
-     - 点击 Play：确认 6 辆车位置/车型/队伍与回放完全一致、3-2-1 倒计时为正常 1:1 实时秒数、倒计时结束后物理流速正常 1x。
-     - 测试 `5275` 场景下的 5 种接管模式（`player` / `as-previous` / `disappear` / `no-input` / `model`）。
-4. **后续仍可作为 Track C2 / Track F 联动项（不阻塞本次基础合并）**：
-   - `tEnd`（`originalMovementEndFrame120Hz`）之后，原本处于 `as-previous` 的车辆在序列结束后的默认行为目前会保持最后一帧控制输入/惯性滑行；后续可按需增加「`tEnd` 后自动转为 `no-input` 或 `model`」的显式选项。
-   - `RLRCReplayToRcsImporter` 如需同样的双标签按钮，可复用 `useReplayViewerStore` 的同款双标签模式。
+`alpha` 当前已具备 3D 贴地/贴墙 Raycasting、屏幕比例自适应线宽、实线/虚线/箭头、6 色、3 档透明度、`Ctrl/Cmd+Z` 撤销、一键清空、Direction Adjust 视角偏转与一键 Restore，以及 `TelestratorWireCodec`（FNV-1a Hash + ACK 帧）。
+后续需要跨团队协同的部分：
+1. **UI 团队**：为窄竖栏 `TelestratorToolbarFloatingWindow` 增加 Hover 自适应左右弹出 Bubble Dialogue 提示气泡。
+2. **网络联调（Track D/F）**：目前 `TelestratorOverlaySubsystem` 仅做了本地编解码自环校验，需将 `TelestratorWireCodec` 接入 `RoomReplicationBus` 的 Reliable 控制信道，实现多端同视角下的笔画同步与 Hash ACK 校验重传。
+
+---
+
+## 4. Track C（Dynamic Training Pack）现状与待定事项
+
+`origin/z/agy/rc/track-c-audit` 目前与最新 `alpha` 仅在 `src/ui-core/stores/devFloatingPresets.ts` 存在 1 处小冲突，已实现 `.RCDPack` 编解码、Replay 4 秒预卷截取、120Hz 防双步进、双标记截取与单车独立接管配置。
+对照最新需求，以下设计点建议放入后续迭代或专项讨论：
+1. **State Session 独立存储与链表结构（`prevSessionId`）**：将 4 秒录制的 State Session 独立落盘，Pack 仅通过 ID 引用并支持跨 Pack 预览、`Move To` / `Duplicate To` / 二次确认 `Delete`。
+2. **Intervene 精确切换时机**：倒计时阶段严格保持原录制状态，直到真正接收用户输入的瞬间（或提前半秒预热悬挂）才执行模型替换、他车消失或 AI 接管。
+3. **多人在线接管权限**：后续在 Track F 中定义「申请接管 / 交换控制权」的 Reliable 信令。
+
+---
+
+## 5. 新路线图评估（替代旧 6-Track / 22 分支计划）
+
+鉴于 **Track A** 与 **Track D** 已正式合入 `alpha`，**Track B** 与 **Track C** 也已有完整单分支原型，旧计划中「22 个细粒度分支」已无必要继续机械拆分，建议收敛为 **4 个高内聚收敛步骤**：
+1. **收敛 Track B & Track C 至 `alpha`**：各自基于最新 `alpha` 解冲突（Track B 3 处、Track C 1 处）并做轻量验证后依次合入，形成完整基线。
+2. **落地 Track E（Activity Kernels）**：基于 Track D 已合入的 `RoomActivityOrchestrator` 与 `ActivityKernel` 契约，拆出 `FreeplayKernel`、`MatchKernel` 与 `DevSandboxKernel`（含 Drawing Sandbox / CSR 广播占位）。
+3. **落地 Track F（Replay 观战室 + 远程接管 + Telestrator 联机）**：将 `TelestratorWireCodec` 接入 `RoomReplicationBus` Reliable 信道，复用 Track D 的 Sparse 冻结帧 + 2Hz Ping-Pong 模式实现多人观战与 `4-3-2-1-0` 接管。
+4. **端到端压测**：在 `scripts/runMultiplayerRoomRepro.mjs` 中补齐 `Freeplay <-> Match <-> Replay` 热切换与动态训练压测。

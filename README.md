@@ -1,65 +1,149 @@
-# RocketCompanion 多人联机版本深度审查报告（`49ecac7` vs `9a5d063`）
+# RocketCompanion 技术深潜检查报告与下一阶段开发 Instruction
 
-## 一、 核心结论（直接回答）
-
-1. **这两个版本（`49ecac7` 和 `9a5d063`）均未做完。**
-   它们是同一天基于 `24fc4a4`（`z/agy/rc/tauri/webtransport-tunnel`）并行尝试的两个半成品分支：
-   - `49ecac7360da47af7e09ec82d953c202086aadef`（`origin/z/agy/rc/phase2-implementation`）
-   - `9a5d06376e121a8296ef4b12ed5a42cdfbd1706a`（`origin/z/agy/rc/multiplayer-suite`）
-   总体情况是：**协议/Store/孤立辅助类写了不少，但关键的运行时主链路（Session 生命周期、Voice Peer 绑定、UI 全局状态广播、Ghost Ball 同步、真实多端 E2E）普遍处于“只写了定义、0 处调用”的断连状态**。如果现在合入，联机语音、观战窗口镜像、Multiplayer Training 房间切换与多球 Ghost 均无法在真实对局中工作。
-
-2. **自动化测试“表面全绿”，但存在严重的“自欺欺人式 Mock”，完全没有遍历 `1v2 / 2v1 / 2v2 / 2v3 / 3v3` 等真实组合。**
-   - 实测结果：
-     - `49ecac7`：`pnpm check`（1410/1410 TS，0 报错）、`pnpm build`、`pnpm run test:matrix`（8/8 PASS）均返回退出码 `0`。
-     - `9a5d063`：`pnpm check`（1404/1404 TS，0 报错）、`pnpm run test:multiplayer-suite`（6/6 PASS）均返回退出码 `0`。（注：同环境 `pnpm build` 因先前构建残留的 `dist/.git` 只读 pack 权限报错，代码本身无 TS/打包语法错误。）
-     - `cargo check`：因沙盒未安装 `cc` 链接器未完成本地编译，但两个提交均**未修改** `src-tauri/` 下任何 Rust 代码。
-   - **测试矩阵的真实水分**：
-     - **未扩展真实 E2E 脚本**：仓库原有的多标签页无头 Chrome E2E 脚本 `scripts/runMultiplayerRoomRepro.mjs` 在两个提交中**只字未改**，仍然只支持 `2p`（1v1）、`2p2ai`（2v2）、`3p3ai`（3v3）。
-     - **`49ecac7` 的 `testBotRosterMatrix()` 是纯本地假循环**：`scripts/MultiClientLoopbackSimulator.ts`（与原有 `src/game/scenario/MultiClientLoopbackSimulator.ts` 重名）里的 `testBotRosterMatrix()` 完全没有调用任何游戏/网络/物理代码，只是在测试函数里 `for` 循环往本地数组 `slots` 里 `push` 对象并断言数组长度，且只写了 `1v1`、`2v2`、`3v3`，没有 `1v2 / 2v1 / 2v3`。
-     - **`9a5d063` 的 `testMultiClientLoopbackBotMatrix()` 只跑了写死的 6 车 Mock**：`scripts/runMultiplayerSuiteTests.ts` 调用了原有的 `src/game/scenario/MultiClientLoopbackSimulator.ts`（`startSixCarLoopbackSession`），但传入的是完全写死的 `mockRuntime`（`physics: { numCars: 6, isCarSlotActive: () => true }`, `arena: { cars: 6 }`），根本没有运行真实物理引擎、房间状态机或 `1v2 / 2v1 / 2v2 / 2v3 / 3v3` 组合矩阵。
+> **基准检查状态**：基于 `alpha` (`8d19408`)、Commit `db751d8` (`origin/z/agy/rc/tauri/upnp-tunnel`)、Commit `24fc4a4` (`origin/z/agy/rc/tauri/webtransport-tunnel`) 以及实验分支 `z/agy/rc/multiplayer-suite` (`9a5d063`)、`z/agy/rc/phase2-implementation` (`49ecac7`) 的实码扫描与 `pnpm run radar:audit` 验证结果。
 
 ---
 
-## 二、 逐模块差距对照（原计划 vs `49ecac7` vs `9a5d063`）
+## 一、核心技术问题逐项解答
 
-| 模块 | 原计划核心要求 | `49ecac7` (`phase2-implementation`) 状态 | `9a5d063` (`multiplayer-suite`) 状态 | 关键差距 / 致命问题 |
+### 1. Rust ↔ TS 本地通信：WebTransport / WebSocket (`24fc4a4`) vs Tauri Binary IPC (`db751d8`)
+
+**结论先行**：你的直觉基本方向是对的，但真正决定选型的不只是“数据量大小”，而是 **方向性（JS→Rust vs Rust→JS）、调用模型（RPC vs 持久流）以及 Web Worker 线程隔离**。
+
+#### 实码对比两套实现
+1. **Binary IPC (`db751d8`)**：
+   - **JS → Rust (`RustTunnelTransport.send`)**：调用 `invoke('tauri_tunnel_send_raw', Uint8Array, { headers: { 'x-rc-session': ..., 'x-rc-peer': ... } })`。虽然 Tauri v2 的 `InvokeBody::Raw(Vec<u8>)` 避免了旧版 `JSON number[]` 序列化开销，但每一次发包仍然会触发一次完整的 Tauri `invoke` 生命周期：**创建 Promise → 走 WebView 自定义协议（`ipc://localhost/...` 伪 HTTP fetch）→ 跨线程路由到 Rust Command → 返回 Promise**。
+   - **Rust → JS (`tunnel_manager.rs`)**：使用 `tauri::ipc::Channel<InvokeResponseBody>` 发送 `InvokeResponseBody::Raw(frame)`（仅在未挂载 Channel 时回退 `app.emit`）。下行方向是流式的，开销其实比上行 `invoke` 小得多。
+   - **致命限制**：`window.__TAURI__` / `__TAURI_INTERNALS__` **仅存在于主线程（Window）**，**Web Worker 内完全无法调用**。如果后续网络/物理/状态同步继续向 Worker 迁移，Binary IPC 必须经过主线程 `postMessage` 中转一次。
+
+2. **WebTransport + WebSocket Localhost Bridge (`24fc4a4`)**：
+   - **控制面仍走 Tauri `invoke`**：`tauri_upnp_probe`、`tauri_tunnel_open`、`connect`、`disconnect`、`close`、`status` 全部走标准 `tauri::command`（低频 RPC，无需自己维护连接与协议）。
+   - **数据面走持久本地 Socket (`tunnel_bridge.rs` + `LocalBridgeClient.ts`)**：
+     - 主通道：`wtransport`（本地 QUIC/WebTransport，`127.0.0.1:0` + 自签名证书 Hash 校验）。60–120Hz 不可靠状态包走 `wt.datagrams`（无队头阻塞），可靠控制包（`0x5243` flag `1<<1`）走 `wt.createUnidirectionalStream()`。
+     - 显式降级：`tokio-tungstenite` 本地 WebSocket（`TCP_NODELAY`），用于 WebView 不支持 WebTransport 的环境（如 Linux WebKitGTK 或部分旧版 WKWebView）。
+   - **核心优势**：
+     - **Worker-Safe**：`LocalBridgeClient` 不依赖 `window.__TAURI__`，可在 Web Worker 中直连。
+     - **消除上行逐包 IPC/Promise 开销**：高频小包（60–120Hz 状态/输入）与高频大包（全量快照/回放切片）均走持久二进制连接。
+
+#### 为什么不是所有情况都走 WebTransport / WebSocket？
+| 场景 | 推荐通道 | 原因 |
+| :--- | :--- | :--- |
+| **低频控制/查询 RPC**（开关 Tunnel、UPnP 探测、Add/Remove Peer、查询状态） | **Tauri `invoke` IPC** | 原生 Request/Response 类型安全、受 Tauri ACL/Capability 保护，无需等待本地 TLS/QUIC 握手与连接状态机。 |
+| **高频小数据 (60–120Hz 状态/输入)** | **WebTransport Datagram / WS**（或下行 `Channel::Raw`） | 持久连接零 Promise/HTTP 协议头开销；支持 Web Worker 直连；QUIC Datagram 无 TCP 队头阻塞。 |
+| **高频/突发大数据 (快照/Telestrator/切片)** | **WebTransport UniStream / WS** | 原生流式背压控制，不阻塞主线程事件循环与 UI 渲染。 |
+
+---
+
+### 2. 旧版检查报告是否已过时？`24fc4a4` 与 `db751d8` 各自解决了什么、还缺什么？
+
+**结论**：旧报告中关于“Tauri P2P Tunnel 尚未做多 Peer 路由、未过滤 `RCPH`、还在用 `app.emit` JSON `number[]`”的部分**已经过时**；但旧报告中**“尚未真正接入主链路、缺少端到端可靠传输语义”**的问题，在两份 commit 中呈现**“各解决一半”**的互补状态：
+
+| 能力项 | 旧报告状态 | `db751d8` (`upnp-tunnel`) | `24fc4a4` (`webtransport-tunnel`) | `9a5d063` (`multiplayer-suite`) |
 | :--- | :--- | :--- | :--- | :--- |
-| **1. P2P Tunnel / WebTransport** | 数据包走 WebTransport/UDP 隧道，具备可靠分片/重传语义；语音保留 WebRTC 混合模式 | **未接通**：写了 `ensureSessionTunnelOpen` / `connectPeerTunnel` 但**全仓 0 调用**；写了 `ReliableTunnelFramer.ts`（分片+重传）但未真正运行 | **半接通**：在 `hostRoom`/`joinRoom` 调用 `openSessionTunnelIfTauri` 并通过 `tunnel_endpoint_advertise` 绑定到 `DataChannelTransport` | 1. 两者均仅在 `isRustTunnelAvailable()`（Tauri 桌面端）启用，浏览器端 `WebTunnelTransport` 仍是 WebRTC DataChannel，无纯浏览器 WebTransport。<br>2. **`9a5d063` 缺少 `ReliableTunnelFramer`**：直接将 `reliable_control` 和大包走裸 UDP `RustTunnelTransport`，超 MTU（~1200B）或丢包时必丢帧/乱序。 |
-| **2. Audio / WebRTC 语音** | 移植语音模块；修复 `VoiceMasterOutputBus` 路由与静默 `.catch`；绑定会话生命周期；支持 `open` / `team_only`（Lobby 全员互通）/ `off` | **主链路断连**：`voiceAudioGraph.ts` 已修复；写了 `runtimeVoiceBridge.ts`，但 **`attachVoicePeer` 全仓 0 调用**；甚至未挂入 `AudioTab.tsx` | **主链路断连**：`voiceAudioGraph.ts` 已修复；已挂入 `AudioTab.tsx` 且 `runtimeOnlineBridgeHandlers.ts` 同步了策略，但 **`attachVoiceToPeerChannel` 全仓 0 调用** | **两版均无法在真实联机中通话**：Peer 连接时未调用 `attachVoice*` 注册 `channel.onVoiceSignal` 与 `bridge.attachPeer`；`setVoicePeerTeam` 也 0 调用，换队/进对局后 `team_only` 无法动态更新 Peer 队伍。 |
-| **3. Multiplayer Training** | 新增 `MULTIPLAYER_TRAINING` Kernel；隐藏计分板、保留 Goal Replay；默认 `limit_when_aerial`（地面不耗气且可补气）；`Custom` 跳 Advanced 页；Ghost Client 默认 OFF + Host Relay | **未接通**：写了 `MultiplayerTrainingKernel.ts` 和 `TrainingBoostPolicy.ts`，但 `PhysicsEngineManager` 未调用；`Layer3HostTrainingRecipe` 未触发 `switchActivity` | **部分接通**：`PhysicsEngineManager.stepAuthoritativeTick()` 已按 `sim.getCarStateView(i).isOnGround` 调用 `applyTrainingBoostPolicyToSim` | 1. **UI 未接线**：`Layer3HostTrainingRecipe.tsx` 未触发 `switchActivity(MULTIPLAYER_TRAINING)`，也未实现选中 `Custom` 跳转 `Advanced` 页。<br>2. `hideScoreboard` 无任何 HUD 读取。<br>3. `GhostBallRelayCoordinator` 无客户端上报与 Arena 多球渲染。 |
-| **4. Spectating 与全局状态广播** | 区分仅画面观战 vs 镜像观战（`spectate_mirror`）；同步菜单路由与浮窗开关状态（**不带坐标，坐标跟 Client 走**），本地只读锁定，退出恢复；Pause ACK + 1–10Hz 心跳；Telestrator 默认 `host_only` | **主链路断连**：写了 `SpectatorGlobalStateCoordinator` + `spectatorSyncStore`，但 **`buildGlobalUiBroadcast` / `applyHostGlobalUiState` 在网络同步中 0 调用** | **主链路断连**：写了 `GlobalWorkspaceProtocol` + `spectateWorkspaceStore` + `DuringMatchSpectatorsSection`，但 **`buildGlobalWorkspaceBroadcast` / `applyHostWorkspaceBroadcast` 0 调用** | 1. Host 不会采集并发送全局 UI 状态，Client 也不会接收并应用。<br>2. 真实 `FloatingWindow` 与菜单系统未接入 `isReadOnlyLocked` 只读锁及开关同步。<br>3. `STATE_PAUSED_ACK` 与 1–10Hz 心跳未接入 `AuthoritativeServerHost` / `RoomReplicationBus`。 |
-| **5. Kick & Leave 双向信令** | Kick 前发送可靠控制帧并退回大厅；Leave 先发控制帧更新 Roster/语音再销毁连接 | **存在时序 Bug**：`removeRemotePlayer` 调用 `kickPlayerByCarIndex` 发送 `session_kick` 后立即销毁连接 | **存在时序 Bug**：`removeRemotePlayer` 发送 `peer_kick` 后**同步立即 `ch.destroy()`** | WebRTC DataChannel 发送控制帧后立即同步 `destroy()`（`dc.close()`）会导致控制帧在离开缓冲前被丢弃，需改为短暂 flush/ACK 延迟销毁；两版信令命名也不统一（`session_kick` vs `peer_kick`）。 |
-| **6. 命名与架构卫生** | `TelestratorSettingsPanel.tsx` 改名为 `*FloatingWindow.tsx` | 仅移动到 `telestrator/` 子目录，未改名；新增了与 `src/game/scenario/MultiClientLoopbackSimulator.ts` 重名的 `scripts/MultiClientLoopbackSimulator.ts` | 已正确重命名为 `TelestratorSettingsFloatingWindow.tsx` | `49ecac7` 留下了重名文件与未统一命名。 |
+| 单 Socket 多 Peer 路由 + 过滤 `RCPH`/`RCPA` | ❌ 未做 | ✅ 已完成 | ✅ 已完成（且拆分 `tunnel_upnp.rs`） | ✅ 继承 `24fc4a4` |
+| 消除 JSON `number[]` IPC 瓶颈 | ❌ `app.emit` | ✅ Binary IPC (`InvokeBody::Raw` + `Channel::Raw`) | ✅ 本地 WebTransport + WS Bridge（Worker-safe） | ✅ 继承 `24fc4a4` |
+| **公网 UDP 可靠/有序/分片层** | ❌ 缺失 | ✅ 已实现 `TunnelReliabilityLayer.ts` (315L) | ❌ **缺失**（WT uni-stream 只保了 `127.0.0.1` 本地段，公网 UDP 段仍会丢包/乱序） | ❌ **缺失** |
+| **四服务器信令打包 (`SignalTokenCodec`)** | ❌ 未接入 | ✅ 已将 `tunnelEndpoint` 打包进 `SignalTokenCodec` / `HandshakeSession` | ❌ 未接入 | ⚠️ 改走 DataChannel 内 `tunnel_endpoint_advertise`（若 WebRTC 连不上则无法交换！） |
+| **主链路 (`DataChannelTransport`) 接入** | ❌ 未接入 | ✅ 已通过 `TunnelPeerBridge` + `HostTunnelCoordinator` 接入 | ❌ 未接入 | ✅ 已接入 |
+
+> **关键发现**：`24fc4a4` 拥有更优的**本地桥接层**（`tunnel_bridge.rs` + `LocalBridgeClient.ts`），但缺少 `db751d8` 的**公网 UDP 可靠传输层 (`TunnelReliabilityLayer.ts`)** 和 **信令打包 (`SignalTokenCodec` 携带 `tunnelEndpoint`)**。合并时必须**取 `24fc4a4` 的本地桥接 + `db751d8` 的可靠性层与信令打包**！
 
 ---
 
-## 三、 是否推荐从 WebTransport 开始重做？
+### 3. 四服务器信令架构与 Tunnel 优先级：你的理解对吗？
 
-**结论：不需要推倒重做 WebTransport 底座，但必须停止在现有两个分支上直接“打补丁式合并”，推荐以 `9a5d063` 为骨架基线、吸收 `49ecac7` 的 `ReliableTunnelFramer`，按闭环链路重构收口。**
+1. **“四服务器架构不用动，Tauri 会把 Tunnel 端点信息一并打包过去”**
+   - **完全正确（`db751d8` 已验证）**：`SignalTokenCodec.ts` 的 `DecodedSignalTokenPayload` 直接增加了可选字段 `tunnelEndpoint?: TunnelEndpointDescriptor`，随现有 Offer/Answer Token 一起走原有四服务器信令通道（MQTT / Supabase / WS 等），**四服务器架构零改动**。
+   - **注意避坑**：`9a5d063` 改为在 WebRTC DataChannel 连上之后再发 `tunnel_endpoint_advertise`——这意味着如果 WebRTC 本身打洞失败，Tunnel 端点根本交换不到！因此**必须保留 `db751d8` 的“信令阶段打包 `tunnelEndpoint`”方案**。
 
-原因如下：
-1. **WebTransport 底座已经可用**：基准分支 `24fc4a4` 已经完成了 Rust 侧 `src-tauri/src/tunnel_bridge.rs`（本地 QUIC WebTransport + WebSocket 降级）与前端 `LocalBridgeClient.ts` / `RustTunnelTransport.ts`，`9a5d063` 也已打通 `tunnel_endpoint_advertise` 交换。这部分不需要重写，只需：
-   - 把 `49ecac7` 的 `ReliableTunnelFramer.ts` 接入 `9a5d063` 的 `DataChannelTransport` 隧道发送路径，解决大包分片与可靠控制帧丢包问题；
-   - 明确浏览器端无原生 P2P WebTransport（浏览器之间只能走 WebRTC DataChannel 或通过中继服务器），`WebTunnelTransport` 作为浏览器降级通道保持现状即可，无需在浏览器强行造不存在的 P2P WebTransport。
-2. **当前最大的问题不是底层传输，而是“模块之间没接线”**：
-   Voice、Spectating Global Broadcast、Multiplayer Training UI/Ghost Relay 全都是“写好了类/Store，但没人调用”。
+2. **“Web 端能直接打通就走 WebRTC；Web 端打不通再走 Rust UPnP；都打不通就自求多福”**
+   - **思路非常合理，但请注意：当前 `db751d8` 和 `9a5d063` 的代码实现与你的预期正好相反！**
+   - 实码检查 `DataChannelTransport.ts`（`db751d8` 的 `sendViaTunnelOrFallback` 与 `9a5d063` 的 `transmitViaTunnelOrDataChannel`）：它们都是 **只要 Tunnel `isOpen` 就无条件优先走 Native Tunnel**，只有 Tunnel 没开才走 WebRTC DataChannel。
+   - **建议调整为可配置策略（默认 `webrtc-first` 或 `auto`）**：
+     - **WebRTC 优先（默认）**：WebRTC P2P 直连成功时，自带 DTLS 加密、SCTP 可靠/不可靠双通道与拥塞控制，且与 WebRTC Audio Track 同属一条 `RTCPeerConnection`；仅当 WebRTC ICE 失败/超时或仅剩 TURN 中继时，自动切换至 Rust UPnP UDP Tunnel。
+     - **Tunnel 优先（可选开关）**：供 Tauri 桌面端用户或低延迟测试显式开启，绕过 WebRTC SCTP 开销。
 
 ---
 
-## 四、 下一阶段收口与重构建议路线
+### 4. 现在的 Multiplayer 测试是怎么做的？需要单独构建 `headless=1` 版本吗？
 
-建议按以下 4 步逐一打通并做真机/无头浏览器闭环验收：
+**结论**：**不需要**单独构建一个发行版或专门的 `headless=1` 跳过版本！仓库里**已经有一套完整的双端自动化测试与本地环回基础设施**：
 
-1. **Step 1：收口基线与传输可靠性**
-   - 基于 `9a5d063` 切出新集成分支，合入 `49ecac7` 的 `ReliableTunnelFramer.ts` 并接入 `DataChannelTransport` 的隧道收发路径。
-   - 修复 `OnlineRemotePeerVehicleSynchronizer.removeRemotePlayer` 与 `leaveSession` 的销毁时序：发送 `peer_kick` / `peer_leave` 后等待 DataChannel bufferedAmount 清空或 100–150ms 延迟后再 `ch.destroy()`。
-2. **Step 2：打通 Voice 真实会话生命周期**
-   - 在 `HostSessionController` / `ClientSessionController`（或 `EstablishedSessionManager`）建立 Peer 连接时调用 `attachVoiceToPeerChannel(channel, peerId, peerName, team)`，断开时调用 `detachVoiceFromPeer(peerId)`。
-   - 在队伍变更、Lobby <-> Match 切换时同步调用 `setVoicePeerTeam()` 与 `syncVoiceRoomPolicy()`，确保 `team_only` 在 Lobby 全员互通、对局内按队伍隔离。
-3. **Step 3：打通 Multiplayer Training 与 Spectating 真实闭环**
-   - 将 `Layer3HostTrainingRecipe.tsx` 的启动动作与 `BoostPolicy` / `Custom` Advanced 页（Per-Player Boost）接到 `RoomActivityOrchestrator.switchActivity(MULTIPLAYER_TRAINING)`；在 HUD 计分板组件中消费 `hideScoreboard`；补全 `ghost_ball_state` 上报与 Arena Ghost 球渲染。
-   - 将 `RoomActivityOrchestrator.buildGlobalWorkspaceBroadcast` 接入 Host 定时/事件广播，Client 收到后写入 `useSpectateWorkspaceStore.applyHostWorkspaceBroadcast`，并把 `isReadOnlyLocked` 与浮窗 `isOpen/isMinimized`（保留 Client 本地 `(x, y)` 坐标）接到真实 `FloatingWindow` 组件；将 `STATE_PAUSED_ACK` 与 1–10Hz 心跳接入 `AuthoritativeServerHost`。
-4. **Step 4：建立“真·遍历”自动化测试矩阵（拒绝假 Mock）**
-   - 扩展 `scripts/runMultiplayerRoomRepro.mjs` 与 `src/game/scenario/MultiClientLoopbackSimulator.ts`，**真正参数化遍历**：
-     - **人数与人机组合矩阵**：`1v1`（1H+1B / 2H）、`1v2`（1H vs 2B / 1H+2B）、`2v1`、`2v2`（2H+2B / 4H）、`2v3`、`3v3`（1H+5B / 3H+3B / 6H），覆盖**真人接管 Bot** 与 **Auto-fill Bot** 场景。
-     - **功能闭环断言**：在真实 `PhysicsEngineManager` + `RoomReplicationBus` + 无头 Chrome WebRTC 下验证 Boost 策略（`limit_when_aerial` 地面不耗气/空中消耗/地面吃包回满）、Ghost Relay、Kick/Leave 双方状态清理、Voice 门控状态、`spectate_mirror` 窗口同步与坐标保留、Telestrator 50-Stroke HashAck。
+1. **现有自动化测试链路（`scripts/runMultiplayerRoomRepro.mjs`）**：
+   - 运行 `pnpm run repro:multiplayer-room`，脚本会内嵌启动 Vite Dev Server（挂载 `/__rc_repro_stream` 实时遥测插件），并拉起多个 **Headless Chrome (`--headless=new`)** 实例分别扮演 Host 与 Client。
+   - 通过 URL 参数控制角色、人数矩阵（`2p`、`2p2ai`、`3p3ai`）、仿真倍速（`--speed=1|2|4`）、模拟延迟/带宽（`--latency-ms`、`--bandwidth-kbps`）以及物理帧率（`60,90,100,120,144`）。
+   - 通过 `reproBridgeSignaling=1`（对应 `MultiplayerRoomReproAgent.ts`），**在测试时已经支持本地桥接信令，无需真实连接外部云端四服务器**。
+   - 内部还已有 `HostLoopbackChannel.ts`、`NetworkSimulator.ts`（可注入丢包/抖动/延迟）以及 `SignalingFourServerLoopbackHarness.ts`。
+2. **接下来自动化测试矩阵怎么扩展**：
+   - **不需要**另起炉灶搞 `headless=1` 独立构建；只需在现有 `runMultiplayerRoomRepro.mjs` + `MultiClientLoopbackSimulator.ts` 上扩展：
+     - 用 Ducky AI 接管 User 输入（模拟真实玩家）+ 系统内 Bot Auto-fill，覆盖 1v1 ~ 3v3 全组合；
+     - 用协议层本地 Loopback（或 Headless Chrome Tab）直接跑通 **Training 4 档 Boost / Ghost Relay、Voice `open/team_only/off` 路由、Spectate State-Only vs All、Kick/Leave 双向信令、Telestrator Hash 一致性校验**。
+
+---
+
+### 5. 为什么现在的 Agent “写多少弄多少，不多新增”？是 `AGENTS.md` 还是 System Instruction 导致的？
+
+**答案是：两者叠加，且主要源于 `AGENTS.md` + `radar.ts` 门禁的强约束，加上 System Instruction 的精确执行倾向。**
+
+1. **仓库 `AGENTS.md` 与 `src/ui-core/AGENTS.md` 的硬约束**：
+   - 明确禁止“向后兼容 shim / 死代码 / 冗余门面”、“严禁未要求的多余注释”、“每个文件硬上限 < 600–800 行”、“禁止循环依赖、向上导入、Pass-Through 代理”。
+   - 每次提交前必须过 `pnpm run radar`（`scripts/radar.ts`），一旦 Agent 擅自提前写了一堆“未来可能用到的接口或占位模块”，`radar` 可能会直接报 `Unused / PassThru / Volume` 警告甚至卡住门禁。
+2. **System Instruction 的影响**：
+   - 强调 `Prefer edit file using replace_file_content`、最小化改动、严格按用户请求执行。
+3. **如何改善**：
+   - 这种风格其实是**好事**（避免像早期 Agent 那样写出大量脱离主干、难以合并的“过度设计孤岛代码”）。
+   - 你只需要在给 Agent 的 **Instruction 中明确写出验收清单（Checklist）与边界条件**（例如明确要求“同时实现 `TunnelReliabilityLayer` 端到端重传与 `SignalTokenCodec` 打包，并补充对应的 Loopback 单元测试”），Agent 就会严格且高质量地全部补齐。
+
+---
+
+### 6. UI 架构确认与是否需要“全仓大扫除”？
+
+1. **UI 架构确认 — 你的理解 100% 准确**：
+   - `src/ui-core/primitives/`（`SliderControl`、`SegmentedSwitch`、`ToggleSwitch`、`Button` 等）与 `compounds/`（`SettingSliderRow`、`SettingSegmentedRow` 等）均为纯展示型封装组件。
+   - `recipes/` 与 `panels/` 直接通过 Zustand `stores/` 和 `config/` 绑定业务变量（并支持 `stateOverride` 供 `ui-tuner` 矩阵快照测试），通过 `src/ui-system/` 的 `syncBridge` 与引擎通信，**不直接导入引擎单例**。
+   - 因此，**逻辑/网络开发只需在 `recipes/` 或 `panels/` 中用现成 `Setting*Row` 关联好 Store 字段即可**；后续 UI 团队美化样式时只需修改 `primitives/`、`compounds/` 或布局，**完全不会破坏数据绑定**。
+2. **是否需要全仓大扫除？— 不需要！**
+   - 刚刚在 `alpha` (`8d19408`) 实测 `pnpm run radar:audit` 结果：
+     - **1387/1387 文件 100% TypeScript，`tsc --noEmit` 零报错**；
+     - **0 循环依赖、0 值重导出、0 向上导入、0 多语句行**；
+     - 全仓所有引擎子系统仅标记 **5 个轻微耦合目标**（如 `TelestratorOverlaySubsystem.ts` 481L / 6 个回调），全部在可控绿灯范围内。
+   - **结论**：当前代码库架构健康度极高，**严禁做破坏性的全仓大扫除**。仅做顺手的小清理即可（如将 `TelestratorSettingsPanel.tsx` 重命名为 `TelestratorSettingsFloatingWindow.tsx`，以及清理 `1051b10` 等废弃远端实验分支）。
+
+---
+
+## 二、下一阶段开发总控 Instruction（可直接下发给执行 Agent）
+
+> 以下 Instruction 已针对当前 `alpha` (`8d19408`) 与 `24fc4a4` / `db751d8` / `9a5d063` 的真实代码差异完成校准，可直接用于指导单体集成或分阶段 PR 落地。
+
+```markdown
+# RocketCompanion 网络基础设施与联机套件集成 Instruction
+
+## 0. 基准分支与工作流纪律
+- **基准分支**：`alpha` (`8d19408`)，新建工作分支 `z/agy/rc/net-infra-and-multiplayer-suite`。
+- **严禁直接 `git merge`**：禁止直接 merge `z/agy/rc/track-b-voice-fix`（会回退 PR #14/#18/#19）或直接覆盖合并 `multiplayer-suite`。必须基于 `alpha` 按模块精准移植与集成。
+- **门禁要求**：每次阶段性改动后必须通过 `pnpm run format:check`、`pnpm run check`（`radar` + `tsc --noEmit`）以及 `cargo check`（在 `src-tauri/`）。
+
+## 1. 底层网络基础设施统一（Phase 1 — 必须最先锁定）
+1. **整合 `24fc4a4` 与 `db751d8` 的各自优势**：
+   - **本地桥接层采用 `24fc4a4`**：保留 `src-tauri/src/tunnel_upnp.rs`、`tunnel_bridge.rs`（`wtransport` QUIC + `tokio-tungstenite` WS 显式降级）与 `src/network/transport/tunnel/LocalBridgeClient.ts`（确保 Web Worker 兼容），保留 `tunnel_manager.rs` 的单 Socket 多 Peer 路由与 `RCPH`/`RCPA` 过滤。
+   - **公网 UDP 可靠性层采用 `db751d8`**：移植 `src/network/transport/tunnel/TunnelReliabilityLayer.ts`（序列号、ACK、重传、MTU 分片重组），确保 `RELIABLE_CONTROL`、大图同步（`TELESTRATOR_SYNC`）与 `STATE_PAUSED_ACK` 在公网 UDP 下不丢包不乱序。
+   - **四服务器信令零改动打包采用 `db751d8`**：将 `tunnelEndpoint?: TunnelEndpointDescriptor` 写入 `SignalTokenCodec.ts` 与 `HandshakeSession.ts`，确保即使 WebRTC ICE 失败也能通过信令完成 UDP Tunnel 地址交换（不要仅依赖 DataChannel 内发 `tunnel_endpoint_advertise`）。
+2. **传输优先级策略（可配置，默认 `webrtc-first`）**：
+   - 在 `DataChannelTransport.ts` / `MultiplayerSessionManager.ts` 中实现传输策略：`webrtc-first`（默认：WebRTC P2P 直连可用时走 DataChannel，失败/超时/断线时自动切换 Rust UPnP UDP Tunnel）与 `tunnel-first`（可选诊断/低延迟模式）。
+
+## 2. 四大业务模块按序集成（Phase 2 — 依赖 Phase 1 接口）
+- **模块 A（Voice Audio 整合）**：从 `z/agy/rc/track-b-voice-fix` 精准移植 `src/audio/voice/*`、`voiceChatConfig.ts`、`voiceChatStore.ts`、`runtimeVoiceBridge.ts`、`VoiceChatSettingsSection.tsx`。修复 `voiceAudioGraph.ts` 统一走 `VoiceMasterOutputBus` 播放远端流、移除静默 `.catch(() => {})`。绑定生命周期至 `EstablishedSessionManager` / `RoomReplicationBus`，支持 `voiceChatMode: 'open' | 'team_only' | 'off'`（暂不引入 RNNoise WASM）。
+- **模块 B（Multiplayer Training Kernel）**：基于 `RoomActivityOrchestrator` + `ActivityKernel` 新增 `MULTIPLAYER_TRAINING`（隐藏计分板、保留 Goal Replay）。实现 4 档 Boost 策略（`limited` | `limit_when_aerial` [默认] | `unlimited` | `custom`，Advanced 页仅实现 Per-Player Boost 覆盖）。实现 Ghost Mode（Client 默认 OFF，开启时走 Host Relay 多球分发）。
+- **模块 C（Spectating 升级与全局状态广播）**：拆分“对局实时数据包”与“全局状态广播包”（含设置页路由、打开/最小化的浮动窗体清单，不含屏幕坐标、Notification 与 Telemetry）。支持 `spectate_state_only` vs `spectate_all`（只读锁定本地菜单），基于 Replay 模型支持 Play/Pause ACK、暂停期 1–10Hz 降频心跳与 Telestrator 双向绘图及权限管理。
+- **模块 D（Kick & Leave 双向信令）**：修复 `OnlineRemotePeerVehicleSynchronizer.removeRemotePlayer(carIndex)` 先发送可靠 `kick` 控制帧再清理本地状态并关闭对应通道；Client 主动退出先发可靠 `leave` 帧再销毁连接。
+
+## 3. UI 规范与测试矩阵（Phase 3 — 可与 Phase 2 并行推进测试框架）
+- **UI 规范**：严格遵守 `src/ui-core/AGENTS.md`，使用 `SettingSegmentedRow` / `SettingSliderRow` / `SettingToggleRow` 等现成原语绑定 Store，并为所有新增面板/Section 提供 `stateOverride` 以兼容 `ui-tuner`。顺手将 `TelestratorSettingsPanel.tsx` 重命名为 `TelestratorSettingsFloatingWindow.tsx`。
+- **自动化测试矩阵（无需独立 `headless=1` 构建）**：基于 `scripts/runMultiplayerRoomRepro.mjs`（`reproBridgeSignaling=1`）与 `MultiClientLoopbackSimulator.ts`，覆盖：
+  1. 1v1 ~ 3v3（真人 Ducky AI 接管 + 系统 Bot Auto-fill 全组合）；
+  2. `webrtc-first` 正常直连与 WebRTC 阻断后自动降级 Rust UPnP Tunnel；
+  3. Training 4 档 Boost 与 Ghost Relay；
+  4. Voice `open` / `team_only` / `off` 路由与跨 Activity 热切换不掉线；
+  5. Spectate `state_only` vs `all`、Play/Pause ACK 与 Telestrator `stroke.hash` 多端一致性校验；
+  6. Kick / Leave 双向信令清理。
+```

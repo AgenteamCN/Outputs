@@ -1,65 +1,65 @@
-# 紧急修复与后续防崩溃工程方案报告
+# RocketCompanion `alpha` 分支架构研判与 6-Track 并行开发计划核查报告
 
-已完成针对 Commit `4b248ddfa72e343a9e0cf0c2a8a274194988ded7` 的紧急修复与 `Agent Name / Agent Model` 快速选择器优化，并已通过 Verified Bot Commit 推送至 `origin/a2`（Commit: `fab1672907c6c004ad3e2952437270561cfbd0aa`）。
-
----
-
-## 一、崩溃根因分析
-
-Commit `4b248dd` 引入了 `useBackdropClose`（内部调用了 `useRef`），在多个弹窗组件中直接把 `const backdropProps = useBackdropClose(...)` 写在了**组件底部的 `return (` 之前**，而不是**提前返回 `if (!isOpen) return null;` 之前**，直接违反了 React **Rules of Hooks**：
-
-1. `CredentialsSettingsModal.tsx`（**Manage Key**）：`if (!isModalOpen) return null;` 在第 107 行，而 `useBackdropClose` 被放在第 273 行。打开弹窗时 Hook 数量从 24 个突然变为 25 个（多出 `useRef`），触发 `Rendered more hooks than during the previous render` 崩溃。
-2. `StatementSnippetModal.tsx`（**Insert Repository / Insert Scan** 共用弹窗）：`if (!isOpen) return null;` 在第 83 行，而 `useBackdropClose` 被放在第 145 行，同样在打开时崩溃。
-3. `RequestQuotaModal.tsx`（**Request Quota**）：`if (!isModalOpen) return null;` 在第 81 行，而 `useBackdropClose` 被放在第 129 行，同样存在相同隐患。
-
-> **为什么 AI/开发者容易踩这个坑？**
-> 这三个文件都是 **570~1075 行、20~38 KB 的超大文件**，`if (!isOpen) return null;` 在文件上半部分（80~110 行），而 `return (` 在 130~280 行之后，局部修改时极易忽略上方的 early return。
+> 核查基准：`/work/RocketCompanion` 当前 `alpha` 分支（Commit `f5e8c9f`，`origin/HEAD -> origin/alpha`），已通过 `pnpm run check`（Radar 2.0 + `tsc --noEmit` 全绿，1350/1350 TS 文件）。
 
 ---
 
-## 二、本次紧急修复与功能优化（Commit `fab1672`）
+## 一、 总体结论：报告方向准确，但你的合并认知与报告细节各有一处关键偏差
 
-### 1. 修复 Rules of Hooks 崩溃
-- `CredentialsSettingsModal.tsx`、`StatementSnippetModal.tsx`、`RequestQuotaModal.tsx`：将 `useBackdropClose(...)` 全部上移至 `if (!isOpen) return null;` 之前。
-- 全量扫描 `src/**/*.tsx`，确认已无任何组件在 `return null` 之后调用 React Hook（`Hook order issues found: 0`）。
-
-### 2. Agent Model & Agent Name 快速选择器优化
-- **移除 `Custom` 按钮与 `Empty` 选项，保留 `<SquareDashed />` 虚线小框**：
-  - 修改 `AgentModelField.tsx`：移除 `Custom` 按钮，仅保留预设标签按钮 + `<SquareDashed />` 虚线小框，节省横向布局空间。
-  - 新增 `AgentNameField.tsx`（从 `TaskConfigurationPanel.tsx` 拆出）：同样提供预设标签按钮 + `<SquareDashed />` 虚线小框。
-  - **统一语义**：只要当前输入值不匹配任何预设（`!matchesPreset`，包括任意自定义输入或非预设文本），`<SquareDashed />` 虚线小框即自动高亮（`primer-btn-primary`）；点击虚线小框直接聚焦并全选输入框。
-- **Agent Name 预设与默认值配置**：
-  - 扩展 `presets.ts`、`agentDefaults.ts`、`defaultProfile.json`、`presetStore.ts`、`workspaceDraft.ts`，支持 `agentNamePresets` 持久化、排序与默认 Agent Name 同步。
-  - 新增独立设置分区 `AgentNamesSection.tsx`，并在 `AppSettingsModal.tsx` 注册 `Agent Names` 入口。
-
-### 3. 验证结果
-- `pnpm build`（`tsc && vite build`）：**通过**（0 TS 错误，Vite 打包成功）。
-- 全量 Hook 顺序静态扫描：**0 个问题**。
+1. **架构研判与现状完全吻合**：报告指出的 `MatchDomainState.ts`、`MatchPhaseLifecycleSubController.ts`、`MatchSystemControlSubController.ts`、`HostWorkerMessageRouter.ts`、`AuthoritativeServerHost.ts` 职责倒挂问题在 `alpha` 分支中 **100% 属实**。所有被点名的核心模块和符号均真实存在。
+2. **大方向并行关系（你的核心判断正确）**：
+   - **第一梯队（可从 `alpha` 同步并行启动）**：**Track A (Alpha)**、**Track B (Bravo)**、**Track C (Charlie)**、**Track D (Delta)** 四个 Track 确实可以 **100% 并行** 从最新 `alpha` 拉出分支开发。
+   - **第二梯队（依赖 Track D）**：**Track E (Echo)** 和 **Track F (Falcon)** 必须等待 **Track D (Delta)** 锁定协议与 `RoomActivityOrchestrator` 后才能真正落地。
+3. **需要纠正的 3 个认知偏差（避免下发错误计划）**：
+   - **偏差 1（关键）：Track C (Charlie) 不依赖 Track D，也不需要等 Delta 之后再“和 Echo/Falcon 一起往下推”**。
+     - 代码实证：`StaticTrainingPackMode.ts` 在 `onEnter()` 中直接调用 `teardownRuntimeNetworkForStaticTraining(r)`，Dynamic Training Pack（Track C）与 Static Training Pack 一样是 **纯单机引擎**（依赖 `GameModeManager` + `ReplayRingBuffer` + `ReplayBufferSliceExtractor` + IndexedDB），与多人网络总线（Track D）**零耦合**。
+     - 因此，Track A / B / C 各自完成后，**直接向 `alpha` 提 PR 合并即可完结**，不需要在 Delta 合并后再重新基于 Delta 开分支推进 Charlie。
+   - **偏差 2：目标主干分支是 `alpha`，不是 `main`**。
+     - 仓库当前 `origin/HEAD -> origin/alpha`，不存在 `main` 分支。所有 6 个 Track 的基准分支与 PR 合入目标都应是 `alpha`。
+   - **偏差 3：Track A / B / C 并不是完全“零触碰网络”，有一个轻量收口点**。
+     - Track A 的 `branch02` 涉及 `src/network/protocol/`（画笔 Float32 编解码），Track B 的 `branch05` 涉及向 `WebRTCConnection` 的 `RTCPeerConnection` 注入音轨。它们本身可以独立开发并合入 `alpha`，但**多人观战室里把画笔包真正塞进 Reliable DataChannel 广播**，是在 **Track F（或 D+A 合入 `alpha` 后的集成阶段）** 才完成串联。
 
 ---
 
-## 三、后续防崩溃与工程约束方案（如何避免再次发生）
+## 二、 代码库深度核查结果（逐项对照报告）
 
-不建议为了防这种问题去做全量重写（成本高、风险大），建议用**「硬性静态门禁 + 渐进式拆小文件 + 关键交互烟雾测试」**三层约束，低成本彻底堵住同类问题：
+### 1. 报告完全属实、可直接沿用的部分
+- **“Match vs State”痛点**：`MatchDomainState.ts`、`MatchRosterPolicyState.ts`、`MatchPhaseLifecycleSubController.ts`、`MatchSystemControlSubController.ts` 中确实混杂了 `lobbyMode`、`isTrainingMode`、`trainingDisableGoalReset`、`SYS_CTRL_STATE_ONLY` 等布尔开关与状态机分支。
+- **单 DataChannel 现状**：`HandshakeSession.ts` 当前仅创建了一条不可靠通道 `pc.createDataChannel('game_net', { ordered: false, maxRetransmits: 0 })`，`DataChannelTransport.ts` 也只维护单通道，因此 Track D (`branch13`) 落地双 DataChannel 分流非常必要。
+- **可复用资产均存在**：
+  - `ReplayBufferSliceExtractor`（`src/replay/ReplayBufferSliceExtractor.ts`）
+  - `staticTrainingVariationMath`（`src/game/modes/static-training/staticTrainingVariationMath.ts`）
+  - `RLRCHermiteSlerpResampler`（`src/replay/rlrc/synthesis/RLRCHermiteSlerpResampler.ts`）
+  - `RLRCInterveneTakeoverSubController`（`src/replay/rlrc/runtime/RLRCInterveneTakeoverSubController.ts`）
+  - `SignalAudioEngine`（`src/audio/SignalAudioEngine.ts`）与 `useInGameHudChoreography`（`src/ui-core/hud/useInGameHudChoreography.ts`）
+  - `scripts/runMultiplayerRoomRepro.mjs`（当前 `--mode` 仅支持 `2p | 2p2ai | 3p3ai | both | all`，确实缺少 `freeplay` 与热切换压测）
 
-### 1. 立即引入 ESLint + `eslint-plugin-react-hooks`（最高性价比，1 天落地）
-- 当前 `package.json` **只有 `tsc && vite build`，没有 `lint` 脚本**。`tsc` 查不出 Hook 顺序错误！
-- 引入 `eslint-plugin-react-hooks`（`react-hooks/rules-of-hooks: "error"`）：只要有人在 `if (...) return null;` 之后写任何 `useXxx()`，CI / 本地 `pnpm lint` 会**直接报错拦截**，从根本上消灭此类崩溃。
-- 可顺带加一条自定义/ESLint 规则：`max-lines: ["warn", { max: 400, skipBlankLines: true, skipComments: true }]`，限制单文件膨胀。
+### 2. 报告中与当前 `alpha` 规则冲突、下发前必须修正的 4 个“暗坑”
 
-### 2. 用“弹窗外壳组件”替代手动调用 `useBackdropClose`（架构防呆）
-- 与其要求每个 Modal 自己记得在 `return null` 前调用 `useBackdropClose`，不如抽一个统一的 `<PrimerModalShell isOpen={...} onClose={...} maxWidth={...}>`：
-  - 外壳组件内部统一处理 `if (!isOpen) return null;`、`useBackdropClose`、`Escape` 键关闭、滚动锁定。
-  - 子弹窗只在 `isOpen === true` 时才挂载内部表单状态，天然隔离 Hook 生命周期，不再需要每个 Modal 重复写 backdrop 逻辑。
+| 编号 | 报告原表述 | 代码库实际约束（`alpha`） | 下发前修正建议 |
+| :--- | :--- | :--- | :--- |
+| **坑 1** | `branch03`: `src/ui-core/telestrator/`<br>`branch07`: `src/ui-core/audio/`<br>`branch11`: `src/ui-core/training/`<br>`branch21`: `src/ui-core/overlay/` | `src/ui-core/AGENTS.md` 强制规定 `src/ui-core/` 必须按 **UI 分层目录**组织（`config -> tokens -> stores -> primitives -> layout -> compounds -> navigation -> (hud/charts/viewport/loading) -> (panels/recipes)`），引擎桥接放在 `src/ui-system/`。**不存在按业务功能建一级子目录的先例**。 | 将这 4 个分支的 UI 文件分别落入 `src/ui-core/stores/`、`compounds/`、`hud/`、`panels/` 及 `src/ui-system/`，不要新建 `ui-core/telestrator` 等目录。 |
+| **坑 2** | `branch12` & `branch14` 引用 `src/network/sync/` | 当前 `alpha` 仓库中 **不存在 `src/network/sync/` 目录**。另外 `scripts/radar.ts` 会严格检查循环依赖与跨层引用。 | 明确 `src/network/sync/` 为 Track D 新建目录；引用 `RLRCHermiteSlerpResampler` 时注意避免 `src/replay/` 与 `src/network/sync/` 产生双向依赖（建议抽纯数学工具函数）。 |
+| **坑 3** | `branch02` (`src/network/protocol/`) 与 `branch12` (`src/network/protocol/`) | 两个分支都会修改 `src/network/protocol/`，同时开发可能产生协议文件冲突。 | 约定 `branch02` 只新增独立编解码文件（如 `TelestratorWireCodec.ts`），**不修改 `HostWorkerProtocol.ts` 或 `DataChannelTransport.ts`**；等 Track D 合并后再在 Track F 接线。 |
+| **坑 4** | `branch05` (`src/audio/voice/`) 接入 `WebRTCConnection` | `scripts/radar.ts` 强制执行 `[TRANSPORT ISOLATION VIOLATION]`：**`src/network/transport/` 禁止 import `src/network/` 和 `src/ui-core/config/` 之外的任何模块**。 | `src/network/transport/` 绝不能反向 import `src/audio/voice/`；必须由上层（`src/game/` 或 `src/ui-system/`）把 `WebRTCConnection.pc` 或窄接口 Port 注入给 `WebRtcNativeVoiceBridge`。 |
 
-### 3. 渐进式拆分超大文件（指哪儿打哪儿）
-目前 `src/` 中超过 16 KB / 500 行的文件有 30+ 个，建议按**“改到哪、拆到哪”**的原则逐步拆分（优先拆高频修改区）：
-- **`CredentialsSettingsModal.tsx`（37.4 KB / 1074 行）**：按凭据域拆为 `GeminiKeySection`、`GithubAppSection`、`EmqxSection`、`BemfaWebhookSection` + 外壳。
-- **`TaskOverviewSidebar.tsx`（30.8 KB / 865 行）** & **`TaskConfigurationPanel.tsx`（17.7 KB / 521 行）**：按表单字段/卡片拆成独立小组件（本次已先拆出 `AgentNameField.tsx`）。
-- **`taskStore.ts`（51.7 KB / 1625 行）**：按职责拆分为 `taskSlice`、`draftSlice`、`syncSlice`。
+---
 
-### 4. 引入轻量级前端测试流程（Vitest + React Testing Library）
-- 不需要上来就做重型 E2E，先补 **Modal 开关烟雾测试**（10~15 个测试用例即可）：
-  - 对每个弹窗执行 `render(closed) -> rerender(open) -> rerender(closed)`。
-  - 只要存在 Hook 顺序错误或初始化异常，Vitest 会当场报错（`Rendered more hooks`），5 秒内跑完全部弹窗。
-- 顺带清理 `src-tauri` 两条 `unused import: redact_sensitive_blocks` warning，保持构建输出干净。
+## 三、 修正后的正确分支与合并流向（可直接用于下发任务）
+
+```text
+alpha (f5e8c9f, 最新主干)
+ ├──► Track A (branch01 ~ 04) ──► PR 合并回 alpha（完全独立；branch01->02，03/04 可并行）
+ ├──► Track B (branch05 ~ 07) ──► PR 合并回 alpha（完全独立；branch05 锁 Port 后 06/07 并行）
+ ├──► Track C (branch08 ~ 11) ──► PR 合并回 alpha（纯单机引擎，与 Track D 零耦合；branch08 锁 Schema 后 09/10/11 并行）
+ └──► Track D (branch12 ~ 15) ──► PR 合并回 alpha（先锁 branch12 协议，再并行 13/14/15）
+                                        │
+                                        ▼ (待 Track D 合入 alpha 后，从最新 alpha 拉出)
+                                  ├──► Track E (branch16 ~ 18) ──► PR 合并回 alpha（16/17 并行，18 压测收口）
+                                  └──► Track F (branch19 ~ 22) ──► PR 合并回 alpha（19->20，21 并行，22 做全链路最终审计）
+```
+
+### 一句话总结给团队的口径：
+- **A / B / C / D 四线同时从 `alpha` 开干**；**A / B / C 做完直接 PR 合回 `alpha` 结束**（不需要跟在 D 后面再跑一轮）；
+- **D 合入 `alpha` 后，再从最新 `alpha` 拉出 E 和 F 并行推进**；
+- 最终由 **F (`branch22`)** 在包含 A–F 全量代码的 `alpha` 上完成全链路集成审计（`pnpm check` + `test:baseline` + `repro`）。

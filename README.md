@@ -1,73 +1,68 @@
-# RocketCompanion Wave 1–4 Octopus Merge 验证与真机测试报告
+# Track A 修复报告与全链路推进讨论
 
-## 1. Octopus Merge 执行结论
+## 一、Track A 修复与推送结果
 
-**结论：可以执行 Octopus Merge，且已完成无损合并与 GPG Verified Bot 提交。**
+- **分支**：`z/agy/rc/fix-telestrator-dashed-freeze`（基于 `5b1ee5c3b78bb16bcfc35eb1688b6d930904b97a`，已提交 `2f38585` 并推送至 `origin`）
+- **改动文件**：`src/entities/telestrator/telestratorStrokeGeometry.ts`
 
-- **目标分支**：`z/agy/rc/rust/wave-1-4-octopus`
-- **Verified Commit SHA**：`84f20d2177d12df7a7593ef8fc2c78fc86294f50`（`verified: true`，4 个 Parent 均基于共同基线 `b88102a60527e50892564b15b7ff2e1acee401c0`）：
-  1. Wave 1：`8a6e00a408d2fd39ffa10601c1b14ed3a886f023` (`origin/z/agy/rc/rust/wave-1`)
-  2. Wave 2：`1409ec743742b234f3b2843a6fd195a987818802` (`origin/z/agy/rc/rust/t5-wave2-ue3-replay`)
-  3. Wave 3：`514be256901d72d568dfe5f272dc147432bbef92` (`origin/z/agy/rc/rust/wave3-multiplayer-bus-reconciler`)
-  4. Wave 4：`50b9b01d92d2a1c62aa1f7c5129bb16e5aab4157` (`origin/z/agy/rc/rust/wave4-room-kernels-csr-soak`)
-- **冲突与处理**：
-  - `src/physics/core.d.ts` 与 `src/physics/core.js`（Wave 2 与 Wave 3 重叠）：Git 自动无冲突合并成功。
-  - `src/ui-system/GameUIRoot.tsx`（Wave 1 与 Wave 4 重叠）：仅在顶层 `useEffect` 生命周期挂载处存在 1 处简单文本冲突（Wave 1 挂载 `ensureVoiceChannelBridge` / `DrawingSandboxController`，Wave 4 挂载 `syncCsrFollowHostNotification`），已合并保留双方初始化与清理逻辑。
+### 1. 虚线卡死（无报错冻结）根因与修复
+- **根因**：在 `buildDashedRibbonPositions` 中，`while (localOffset < segLen)` 循环使用 `(accumPhase + localOffset) % dashPeriod` 计算当前相位与步长 `step`。由于 `dashLen` / `gapLen` / `dashPeriod` 均为浮点数，当 `phase` 极其逼近 `dashLen` 或 `dashPeriod`（差值在 `1e-15` 量级）且 `localOffset` 较大时，`step` 小于 IEEE-754 双精度浮点数的最小表示精度（ULP），导致 `localOffset += step` 实际上没有推进 `localOffset`，从而触发**主线程死循环**（画面彻底卡死、控制台无任何报错）。
+- **修复**：
+  - 增加 `Number.isFinite(halfWidth) && Number.isFinite(dashPeriod) && dashPeriod > 0` 防护；
+  - 引入最小步进下界 `minStep = Math.max(1e-3, segLen * 1e-5)`，确保每次迭代 `localOffset` 必定向前推进；
+  - 当 `step <= 1e-3` 时跳过退化小面片生成，避免无效几何体；
+  - 增加 `maxIter` 安全上限，从根本上杜绝无限循环。
+- **验证**：已通过 `prettier --check`、`pnpm check`（Radar + `tsc --noEmit` 0 Error）及 `pnpm build`。
 
----
+### 2. 点击 Configurator 只生成 Floating Window 是否为预期行为？
+- **是预期行为**。
+- 在当前代码（`src/ui-core/recipes/settings/components/TelestratorDeveloperSection.tsx` 与 `src/ui-core/panels/dev/TelestratorToolbarFloatingWindow.tsx`）中，Telestrator 被实现为**与模式无关的功能叠加层（Mode-independent functional override）**，而不是单独的 `Drawing Sandbox` 模式。
+- 点击打开悬浮窗后，`TelestratorToolbarFloatingWindow` 挂载时会自动触发 `setOverlayActive(true)`，使画笔直接叠加在当前正在运行的 3D 场景（Freeplay / Replay / Training 等）上；关闭悬浮窗则自动关闭叠加层。
 
-## 2. Linux Headless 沙盒自动化验证结果
-
-| 检查项 | 结果 | 详情 |
-| :--- | :--- | :--- |
-| `pnpm run check` (Radar 2.0 + `tsc --noEmit`) | **PASS** | 1331/1331 TS 文件 + 83 自定义 Rust 文件，0 循环依赖、0 桶文件、0 类型错误 |
-| `pnpm run build:wasm:check` | **PASS** | `cargo check --target wasm32-unknown-unknown --workspace` 9.09s 通过 |
-| `pnpm run build:wasm:dev` | **PASS** | 生成 `src/physics/core.wasm`（1160.2 KB，198 exports） |
-| `npx vite build` | **PASS** | 生产构建 23.16s 通过 |
-| `node scripts/benchmarkTrajectory120Hz.mjs` | **PASS** | 3.01 us/frame，120Hz 预算余量 99.96% |
-| `cargo test --manifest-path crates/Cargo.toml` | **BLOCKED (环境限制)** | 沙盒未安装 `cc`/`gcc` 链接器，WASM 可编译但 native test 需在真机运行 |
-| `pnpm run test:baseline` (Headless Chrome) | **RED (2 项断言失败)** | 0 运行时/控制台错误，24/24 静态描述符匹配；失败项：<br>1. `multiplayer_6car_loadout_stress`: `multiplayer_kickoff_transitioned_to_playing` (`isJumping=true, posZ=74.59`) 与 `multiplayer_no_phantom_double_jump_on_flip_e` (`phantomDoubleJumps=1`)<br>2. `training_and_kickoff`: `kickoff_ppo_ghost_trajectory_and_episode_ste` (`epTick=254, pts=0, aiTouch=380`) |
-| `pnpm run repro:multiplayer-room` | **EXIT 0 (有基线异常)** | Host 端正常；Client 端存在 `missing_match_participant_car` / `client_lobby_connected` 等异常（Wave 3/4 新总线尚未完全替换旧 `MatchDomainState` 主循环） |
-| `scripts/verifyWave4Multiplayer.ts` | **FAIL (Node ESM 解析)** | `node --experimental-strip-types` 无法解析 `quickNotificationStore.ts` 中无后缀导入 `'./syncBridge'` |
+### 3. Track A 当前代码拆分与状态提醒
+- 目前 Track A 所有文件均通过 Radar 检查，但有 3 个文件超过了 Radar 的软阈值（400 行 / 12KB，非阻塞）：
+  - `src/entities/telestrator/TelestratorManager.ts`（533 行 / 16.0 KB）
+  - `src/game/subsystems/TelestratorOverlaySubsystem.ts`（465 行 / 15.5 KB）
+  - `src/entities/telestrator/telestratorStrokeGeometry.ts`（430 行 / 13.5 KB）
+  - 后续若继续扩展功能（如圆形工具、网络同步发送），建议将 `telestratorStrokeGeometry.ts` 的箭头几何构建拆分出去，并将 `TelestratorOverlaySubsystem.ts` 中的 CMF 网格加载与键鼠事件处理剥离为独立模块。
+- 另外，`TelestratorOverlaySubsystem.ts` 目前在松开鼠标后只做了 `encodeTelestratorStroke` / `decodeTelestratorStroke` / `encodeTelestratorHashAck` 的本地编解码自检（统计 `wireBytes` 与校验 hash），**尚未接入 WebRTC 实际传输**，待与网络层信道对接。
 
 ---
 
-## 3. 各 Branch 成果审查与未闭合的集成缺口
+## 二、Track B / C / D 现状与验收标准
 
-虽然 4 个分支可以无损 Octopus Merge 并通过编译与架构雷达检查，但代码审计发现以下**尚未完全闭合的跨模块接线缺口**（可在真机测试观察后通过单线分支补齐）：
+> 注：在当前基准 Commit `5b1ee5c` 上，仓库里**仅合入了 Track A 的代码**；`src/audio/voice/`（Track B）、`src/game/modes/dynamic-training/`（Track C）、`src/network/sync/`（Track D）、`src/network/server/activities/`（Track E）与 `src/network/server/spectator/`（Track F）均**尚未合入主干**。
 
-1. **Wave 1 (`8a6e00a4`)**：
-   - **Tier 3 音频 & Tier 4 轨迹**：`director_impact_events.rs` 与 `incident_classifier.rs` 双路径已修复（移除 `ev.speed` fallback、接入 `dir_dot < 0.15` 浅角抑制、冷却提升至 `>= 60ms / 8 ticks`）；`WasmAudioDirectorBridge.ts` 已接入 `AUDIO_CUE_CARS_WORD_OFFSET = 22`，`VehicleAudioManager` / `TurtleModemEngineSynth` 已瘦身切流。
-   - **3D 战术画笔 (Telestrator)**：`DrawingSandboxController`、`arenaSurfaceRaycaster`、`TelestratorRibbonRenderer`、`TelestratorToolbarFloatingWindow` 与 `CameraManager` 的 `povAngularOffset` 已实现并挂载于 `GameUIRoot`，但**尚未接入 Wave 3 的 `TelestratorSyncChannel`**，联机同步仍待连线。
-   - **WebRTC 原生语音**：`WebRtcNativeVoiceBridge` 与 `runtimeVoiceChannelBridge.ts` 已实现本地麦克风权限显式请求、降噪开关与 0–250% 增益控制，但 **`bindVoicePeerConnection(playerId, pc)` 尚未在 `WebRTCConnection` / `MultiplayerSessionManager` 建连处调用**，远端 Peer 音频流尚未注入。
-   - **RCDPack 动态训练**：`DynamicTrainingMode`、IndexedDB 存储与 `DynamicTrainingEditorFloatingWindow` 已实现，但 **`DynamicTrainingMode` 尚未注册接入 `GameModeManager` 游戏模式运行主循环**（当前仅编辑器调用了 `captureSessionFromReplay`）。
-2. **Wave 2 (`1409ec74`)**：
-   - `crates/rc_replay_codec` 已实现 UE3 BitReader、Header、Actor/NetStream 解码与 `touch_analyzer.rs`，`RLRCWasmReplayBridge.ts` 已接入 `RLReplayToRLRCConverter.ts` 与 `ReplayTouchTimelineAnalyzer.ts`，并删除了 21+ 个旧 TS 解析文件。
-3. **Wave 3 (`514be256`)**：
-   - `clock_sync.rs`、`reconciler_exports.rs`、`wasmReconcilerBridge.ts` 已接入 `RocketSimPhysicsEngine.ts` 与客户端回滚管线；`RoomReplicationBus`、双 DataChannel 与 `TelestratorSyncChannel` 已实现，但尚未完全切离旧 `MatchDomainState` 房间同步循环。
-4. **Wave 4 (`50b9b01d`)**：
-   - `RoomActivityOrchestrator`、4 类 `ActivityKernel`（Freeplay/Match/ReplayIntervene/Sandbox）、`SpectatorRoomTimelineController`、`InterveneHandoffCoordinator` 与 `csrFollowHostBridge` 已落地并接入 `HostWorkerMessageRouter.ts` 与 `GameUIRoot.tsx`。
+1. **Track B（WebRTC 语音）：电平条动了算胜利，还是多人互相听到才算？**
+   - 仅看到自己本地电平条在动**不算最终胜利**（它只能证明本地 `getUserMedia` + 音频分析器与 UI 绑定正常）。
+   - **完整验收标准**：在 Multiplayer 房间中，默认关闭且不弹窗请求麦克风权限；开启后才请求权限并将音轨注入 `RTCPeerConnection`，**双方能在联机中实际听到彼此清晰的原声**，且基于 Player ID 的独立音量调节（0%~250%）与降噪开关正常工作。
+
+2. **Track C（Dynamic Training Pack）：为什么是灰色的？怎么测？**
+   - 在当前代码 `src/ui-core/recipes/Layer3SelfTrainingRecipe.tsx`（第 66–73 行）中，`dynamic-training-pack` 菜单项目前**硬编码了 `disabled: true`**，且 Replay 界面也还没有“打包进动态训练包”的入口，因此目前显示为灰色，**需要等 Track C 分支实现并合入后才能测试**。
+   - **后续验收链路**：从 Replay 截取介入前状态生成动态切片/Session -> 在 Dynamic Training Pack 列表中解锁并可预览/管理（Move / Duplicate / Delete）-> 进入训练后完成 Lead-in 播放 -> 倒计时 -> 物理接管瞬间模型/角色切换 -> 进球或超时结算并持久化成绩。
+
+3. **Track D（统一房间复制总线与双模同步）：联机没改坏就算成功吗？**
+   - “能正常联机没改坏”**只是底线回归（Smoke Test），不算 Track D 的完整验收**。
+   - **核心验收标准**：
+     - **不断线热切换（`ROOM_ACTIVITY_SWITCH`）**：同一房间内 Freeplay / Match / Replay 模式切换时，不踢人、不断开 WebRTC 连接；
+     - **双模状态广播（Continuous vs Sparse）**：Replay 暂停或冻结帧时，总线自动降频进入 Sparse/Frozen 模式（停止无效 60/120Hz 全量快照，仅保留 2Hz 轻量 Ping-Pong 与 `STATE_PAUSED_ACK`）；
+     - **双 DataChannel 分流**：Unreliable 信道跑高频快照、Reliable 信道跑控制信令/画笔/模式切换；
+     - **自动化压测通过**：`pnpm repro:multiplayer-room` 多端压测通过。
 
 ---
 
-## 4. Real Device（真机）重点测试清单
+## 三、推进顺序与 Pull Request (PR) 标准
 
-由于 Linux Headless 环境缺乏真实声卡输出、麦克风硬件、桌面 GPU/高刷渲染交互与多端真实网络，**真机测试（macOS / Windows）请重点验证以下 6 项**：
+### 1. 是否必须等 A、B、C、D 全完成才能推进 E 和 F？
+- **不需要等 A、B、C 全部完成**。Track A（画笔）、Track B（语音）、Track C（单机动态训练包）与底层房间架构解耦，**相互独立、谁好谁先合**，不会阻塞 E 和 F。
+- **唯一的强依赖是 Track D**：必须先由 Track D 锁定 `RoomReplicationBus` 协议、`ROOM_ACTIVITY_SWITCH` 信令以及与 `HostWorkerProtocol` 的接口契约，**之后再基于该契约并行推进 Track E（Freeplay/Match/Sandbox 内核拆解）与 Track F（多人观战室与接管）**，否则 E/F 会与底层总线产生大量结构性冲突。
 
-1. **音频引擎听感与碰撞防抖（Tier 3）**
-   - 在真机扬声器/耳机下实测：高速贴地平滚、球以极浅角度擦碰侧墙/弧角、地面低速带球，确认已无高频连击“机关枪抖动音”。
-   - 对比旧版 Golden Sample，确认引擎转速音、Boost 启停、超音速音爆、球车/门柱撞击音高与空间衰减听感一致，无爆音或静音丢失。
-2. **WebRTC 语音权限与降噪增益（Voice）**
-   - 在 Developer Settings 确认语音开关**默认关闭**且启动时不弹出麦克风权限请求；手动开启时确认每次均正确触发系统麦克风权限弹窗。
-   - 测试输入降噪（AEC/NS）开关与 Peer 音量滑块（0% → 100% → 250% 放大）在真机音频设备下的清晰度与防削波表现。
-3. **3D 战术画笔与视角锁定交互（Telestrator）**
-   - 在 Developer Settings 进入 Drawing Sandbox，验证 6 辆车生成、无 Title/Footer 竖栏工具条交互（实线/虚线/箭头、6 色、100%/70%/50% 透明度）。
-   - 验证鼠标在草皮、侧墙、弧角、天花板上的 Raycast 贴合精度、`Cmd+Z`/`Ctrl+Z` 撤销、1–6 号车视角与 7 号自由视角切换。
-   - 验证 **Direction Adjust** 视角偏转锁定（转动视角时禁止绘制、绘制时禁止转视角）及一键 Restore / 切回 1–6 自动归零。
-4. **真实 `.replay` 大文件流式解析（Wave 2）**
-   - 在真机 UI 中导入真实 Rocket League `.replay` 文件，验证 Rust WASM 解码耗时、内存占用、触球时间线标注准确性及回放画面同步性。
-5. **跨端联机回滚与 `test:baseline` 暴露的问题定位（Wave 3 + Wave 4）**
-   - 在两台真机（或同机双窗口真实 WebRTC）下测试 Freeplay / Match / Replay 房间热切换与 CSR `Completely Follow Host`（尤其验证不同屏幕分辨率/宽高比客户端的渲染一致性）。
-   - **重点复现排查**：`test:baseline` 中出现的 `multiplayer_no_phantom_double_jump_on_flip_e`（`phantomDoubleJumps=1`）与 `kickoff_ppo_ghost` 失败问题，确认是 Wave 3 WASM Reconciler 边沿状态同步引入还是原有基线漂移。
-6. **Rust 原生单元测试补跑**
-   - 在真机（带 Xcode `cc` / MSVC 环境）执行 `cargo test --manifest-path crates/Cargo.toml`，确认 `rc_audio_director::director_impact_tests` 等全部 Rust 单元测试通过。
+### 2. 什么状态可以提 Pull Request (PR)？合并顺序是什么？
+- **可提 PR 的准入条件**：
+  1. 代码格式化与架构门禁全绿：`pnpm run format:check && pnpm run check`（Radar 0 Error + `tsc --noEmit` 0 Error）及 `pnpm build` 通过；
+  2. 遵守仓库红线：无中文注释/日志/Emoji、无 `index.ts` 桶式重导出、无 `soccer` 命名、无超 800 行/18KB 巨型文件；
+  3. 职责闭环且无死代码/无兼容垫片，可独立完成自身分支的功能验证（若有耦合旧文件，需在分支内直接清理）。
+- **建议合并顺序**：
+  1. **第一梯队（并行独立合入）**：Track A（当前修复分支可先提 PR 合入）、Track B、Track C；
+  2. **第二梯队（基础设施锁契约）**：Track D 优先合入（或至少先锁定协议接口）；
+  3. **第三梯队（上层业务收敛）**：基于 Track D 并行开发并合入 Track E 与 Track F，最后统一执行 `pnpm test:baseline` 与 `pnpm repro:multiplayer-room` 做全量联调验收。

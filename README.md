@@ -1,90 +1,138 @@
-# Rocket Companion Rust 重构与音频引擎规划审计及分支裁决报告
+# Rocket Companion (RC) 下一代架构演进与并行开发方案审查报告
 
-## 1. 三线头基准分支裁决与云端清理结果
-
-针对提供的三个待决策 Commit：
-- `ec3e076688954389e8afd983e0a1fe71e3a1a8e2`（`origin/z/agy/rc/rust/alpha-merge-and-audio-arch`）
-- `b26d3287295714c16f4f5f69d373498b963d6e70`（`origin/z/agy/rc/rust/sync-main-audio-plan`）
-- `f64c3b85875e8444a133a194be26b8ece8a202f7`（`origin/z/agy/rc/rust/sync-main-audio-investigate`）
-
-### 最终裁决：**仅保留 `b26d328` (`z/agy/rc/rust/sync-main-audio-plan`)，已从云端删除其余两个分支**
-
-1. **`b26d328` (`z/agy/rc/rust/sync-main-audio-plan`) — 底子最正常（唯一保留）**
-   - 正确合并了 `2cb143b`（Tier-2 Octopus Merge）与 `alpha`（`1facf97`）。
-   - 完整保留了 `alpha` 主线在 `src/game/runtime/RuntimeKickoffSignalSubController.ts` 中修复网络回放倒带与开球死锁的关键提交（`39cdc82`、`815f67d`）。
-   - 正确修复了 `scripts/vite/gitHeadAutoRestartPlugin.ts` 的 `signature` 属性冲突。
-   - 实测 `pnpm check` 全绿：`1311/1311 TS`，`tsc --noEmit` 通过，0 循环依赖、0 越权引用。
-2. **`f64c3b8` (`z/agy/rc/rust/sync-main-audio-investigate`) — 已从 GitHub 云端删除**
-   - 合并 `alpha` 时遗漏 `scripts/vite/gitHeadAutoRestartPlugin.ts` 的 `signature` 字段，存在编译与热重载运行时缺陷。
-3. **`ec3e076` (`z/agy/rc/rust/alpha-merge-and-audio-arch`) — 已从 GitHub 云端删除**
-   - 合并质量存在 4 项严重问题：
-     - **回退了 `alpha` 修复**：`src/game/runtime/RuntimeKickoffSignalSubController.ts` 被错误覆盖回 `2cb143b` 合并前版本，直接丢失了 `39cdc82` 与 `815f67d` 修复；
-     - **夹带无关改动**：在 merge commit 中混入了 `crates/rc_bot_ai/src/kickoff_ppo.rs`、`kickoff_v1_v2_obs.rs`、`kickoffEpisodePrimitives.ts`、`kickoffGhostPrecomputePipeline.ts`、`replayViewerBaselineScenario.ts` 等非合并改动；
-     - **破坏 Vite 插件状态更新**：将 `gitHeadAutoRestartPlugin.ts` 中的 `let baselineSignature` 改为 `const baselineSignature` 并删去了重置赋值；
-     - **污染仓库根目录**：将 `ARCHITECTURE_MERGE_AND_AUDIO_REPORT.md`（257 行）直接提交进了主仓库。
-
-> 注：原报告中声明“推荐工作分支 `z/agy/rc/rust/audio-recreate-plan`（已基于 `sync-main-audio-plan` 切出）”，经核查远端尚不存在该分支，后续应直接基于 `z/agy/rc/rust/sync-main-audio-plan`（`b26d328`）切出。
+**基准分支与 Commit**：`origin/alpha` (`f5e8c9f`)  
+**审查工作分支**：`z/agy/rc/arch-review-alpha`  
+**工程健康度基线**：`pnpm check`（Radar Gen-3 + `tsc --noEmit`）**GREEN**（1350/1350 TS 文件，0 JS 引擎文件，0 循环依赖，0 向上引用）
 
 ---
 
-## 2. 原规划报告（`RC-RUST-AUDIO-INVESTIGATION-AND-ROADMAP-2026`）合理性审计
+## 一、 核心结论先行（TL;DR）
 
-对照 `b26d328` 真实代码库逐项核验后，原报告**在 Tier 3 音频问题诊断上基本准确，但在代码路径定位上有遗漏，且 Tier 4 / Tier 5 / Tier 6 存在大量与现有代码严重不符的“重复规划”和“文件名幻觉”**，需要重构。
-
-### 2.1 核验准确的部分
-- **音频“半下沉”架构现状属实**：`src/audio/WasmAudioDirectorBridge.ts`（第 77 行）确实定义了 `AUDIO_CUE_CARS_WORD_OFFSET = 22`，但全仓库无任何读取代码；TS 侧 `TurtleModemEngineSynth.ts`、`TurtleModemGranularVoiceGraph.ts`、`turtleModemSynthAcousticPipeline.ts` 与 `VehicleAudioManager.ts` 仍在主线程重复计算 40 切片混合与动力学，而 Rust `rc_audio_director` 已算完所有 `cars[8]` 数据。
-- **碰撞抖动根因方向正确**：`crates/rc_audio_director/src/incident_classifier.rs`（第 292–296 行）确实存在 `ev.normal_rel_vel <= 0.0` 时错误 fallback 到 `ev.speed.abs()` 的问题，导致高速平滚时触发高阈值地板撞击音。
-
-### 2.2 失真或不合理的部分（必须修正）
-1. **碰撞抖动漏掉了真正运行的 `AudioDirectorInstance` 路径**：
-   - `crates/rocketsim_wasm/src/lib.rs` 实际绑定运行的是 `AudioDirectorInstance`（`crates/rc_audio_director/src/director_impact_events.rs` 中的 `handle_ball_world_or_post_hit`），而非 `incident_classifier.rs` 的 `process_physics_incidents`。
-   - `director_impact_events.rs` 的真实问题是：使用 `ev.normal_rel_vel.max(ev.impulse)`、硬编码 `< 5` ticks（41.6ms）冷却，且**完全没有使用** `crates/rc_physics_sim/src/step_and_events.rs`（第 124 行）已经算好并写入 `custom_float` 的 `dir_dot`（$\cos\theta$）来做浅角滚动过滤。两条路径必须同时修复。
-2. **Tier 3（分支 01~08）存在不存在的文件名且拆分过碎**：
-   - 原计划点名要删除 `RemoteEngineAudioLodController.ts` 与 `TurtleModemDrivetrainModel.ts`，但 `src/audio/`（共 26 个文件）中**根本不存在这两个文件**。实际需清理/瘦身的是 `TurtleModemEngineSynth.ts`、`TurtleModemGranularVoiceGraph.ts`、`turtleModemSynthAcousticPipeline.ts`、`VehicleAudioManager.ts` 以及依赖 `TurtleModemEngineSynth` 的 `AudioMenuPreviewPlayer.ts`。
-   - 将同一组滚动判据、防抖和单元测试硬拆为 `t3-01`~`t3-04` 四个分支属于过度碎片化，合并为一个内聚分支即可。
-3. **Tier 4（轨迹预测）几乎全部重复规划**：
-   - `crates/rc_trajectory_mesh/src/` 已经完整实现 `tube_extruder.rs`、`intercept_solver.rs`、`sampler_and_anomaly.rs`、`bounce_and_anchors.rs`、`ground_reachability.rs`、`aerial_reachability.rs`，且 `crates/rocketsim_wasm/src/exports/trajectory_exports.rs` 已导出零拷贝顶点/法线/UV/索引指针。
-   - 原报告中点名要移除的 `TrajectoryTubeMeshBuilder.ts` 在 `src/` 中不存在；而 `t4-15-hex-thickness-tuning-port` 属于 Driftwoods 球场 GPU Hex Ribbon 着色器缩放特性，与轨迹网格毫无关系。
-4. **Tier 5（回放系统）混淆了自研二进制流与 UE3 `.replay` 解析**：
-   - `crates/rc_replay_codec/src/` 已经实现 `container.rs`、`delta_transpose.rs`、`seeker.rs`、`anomaly.rs` 及 `replay_exports.rs`，原计划的 `t5-20`、`t5-23` 属于重复建设。
-   - 真正仍留在 `src/replay/`（106 个 TS 文件）的硬骨头是 **UE3 `.replay` NetStream 位流/Actor 通道解析** 及 `ReplayTouchTimelineAnalyzer.ts`。
-5. **Tier 6（网络预测与回滚）严重低估 Rust 现有资产**：
-   - 原报告称“Multiplayer 完成度 15%，仅有数据结构定义”，与代码库严重不符。
-   - `crates/rc_physics_sim/src/reconciler.rs` 与 `crates/rocketsim_wasm/src/exports/reconciler_exports.rs` 已经实现了 `CONTROLS_RING_CAPACITY`、`ReconcileControlEntryPod`、`ReconcileOutcomePod`、`_physics_reconcileRollbackToTick` 和 `step_reconciler_range`。因此 `t6-25`~`t6-27` 已在 Rust 侧完成，真正缺口是 `src/network/`（95 个 TS 文件）全面切换消费这些 WASM 导出并下线 TS 冗余逻辑。
+1. **50 个分支过多、过碎，建议收敛为 6 条 Track 共 22 个高内聚分支。**
+   原计划为了凑满 50 个分支，将大量“本应内聚在 1 个模块”的逻辑强行按单文件切分，且**未充分盘点 `origin/alpha` 已有代码**——当前 Alpha 分支实际上已经完成了原方案中约 **35%～40%** 的底层能力（如 `MatchSystemControlSubController`、`RLRCInterveneTakeoverSubController`、`StaticTrainingPackMode`、`FreeCameraController`、`globalPhysicsSnapshotSectionCodec` 等）。盲目按 50 分支从零开干，不仅会**重复造轮子**，还会触发 Radar 2.0 的“伪拆分 / Pass-Through Proxy / Host Penetration”结构告警，并大幅推高合并期接口对齐成本。
+2. **推翻“Match 与 State Sync 拆成两套平行体系”的做法，改为【统一房间复制总线 + 可热插拔模式内核】。**
+   针对“整体捏成一个 vs 拆成 Match 和 State”的架构纠结，以及“开发者开房后动态切换 Match / Replay / Sandbox 并 Broadcast 给所有 Client”的核心诉求，最优解是**纵向分层、正交解耦**：
+   - **底层“捏成一个”**：沉淀统一的 `RoomReplicationBus`（只负责 WebRTC 双模状态分发、可靠信令、权威归属与输入回传，**完全不感知**上层是比赛、练车、看录像还是开发者沙盒）。
+   - **上层“按模式拆分且可热切换”**：将 `Match`、`Freeplay`、`ReplayWatch`、`DynamicTraining`、`DevSandbox` 抽象为可热插拔的 **Room Activity Kernel**，由 Host 通过单条广播信令在同一个房间连接内动态切换，无需断开重连。
+3. **代码具体实现交由各子团队裁决，主干只锁定接口契约（Port / Wire Protocol）与 Radar 规范。**
 
 ---
 
-## 3. 修正后的精简并行分支规划（16 分支，基于 `b26d328`）
+## 二、 深度架构研判：解决“Match vs State”纠结与动态 Broadcast 模式
 
-将原虚胖的 32 分支精简为 **4 个 Tier、16 个高内聚正交分支**：
+### 1. 当前 Alpha 分支的真实痛点
+通过深度扫描 `src/network/server/match/` 与 `src/game/modes/`，当前最大的问题不是缺少功能，而是**职责倒挂**：
+- `MatchDomainState.ts` 和 `MatchPhaseLifecycleSubController.ts` 既要管比赛计分/加时/Podium，又通过 `lobbyMode`、`isTrainingMode`、`trainingDisableGoalReset` 等布尔开关硬塞了练车场逻辑，还挂载了 `MatchSystemControlSubController.ts`（负责 `SYS_CTRL_STATE_ONLY` 停帧录像同步）。
+- 结果就是：**想做一个“不计分的自由练车”或“开发者沙盒广播”，必须拖着整套 Match 状态机一起跑。**
 
-### Tier 3：音频引擎全下沉与碰撞抖动根治（5 分支）
-1. `z/agy/rc/rust/t3-01-ball-contact-rolling-and-debounce`
-   - 同时修复 `director_impact_events.rs`（live 路径）与 `incident_classifier.rs`：删除 `ev.speed` fallback；接入 `ev.custom_float`（`dir_dot < 0.15` 浅角抑制）；将地板/墙面碰撞冷却统一提升至 `≥ 60ms`（8 ticks）；加入地面带球低相对速度抑制；补充覆盖高速平滚、浅角擦碰、带球、60ms 防抖的 Rust 单元测试。
-2. `z/agy/rc/rust/t3-02-wasm-car-cue-bridge-cutover`
-   - 在 `WasmAudioDirectorBridge.ts` 接入 `AUDIO_CUE_CARS_WORD_OFFSET = 22`，读取 `AudioFrameCuePod.cars[8]` 并直接映射至 WebAudio `AudioParam`。
-3. `z/agy/rc/rust/t3-03-retire-ts-turtle-modem-synth`
-   - 下线 `TurtleModemEngineSynth.ts`、`TurtleModemGranularVoiceGraph.ts`、`turtleModemSynthAcousticPipeline.ts` 中的 TS 动力学与切片计算，将 `VehicleAudioManager.ts` 与 `AudioMenuPreviewPlayer.ts` 改造为纯 Dumb Driver。
-4. `z/agy/rc/rust/t3-04-stadium-anthem-thin-driver`
-   - 对齐 `StadiumBusBlendPod` 与 `wasmAudioOneShotDispatcher.ts`，清理 TS 侧残留混音与衰减计算。
-5. `z/agy/rc/rust/t3-05-audio-radar-and-e2e-verify`
-   - 音频子系统体积/边界/无死代码清理，确保 `pnpm check` 与音频行为验收通过。
+### 2. 推荐的新抽象：Unified Room Replication Bus + Hot-Swappable Activity Kernel
 
-### Tier 4：轨迹预测 TS 侧零拷贝收口（2 分支）
-6. `z/agy/rc/rust/t4-01-trajectory-ts-zero-copy-audit`
-   - 核验 Three.js 侧是否已 100% 直读 `trajectory_exports.rs` 共享内存指针，清理残留 TS 几何包装代码。
-7. `z/agy/rc/rust/t4-02-trajectory-120hz-benchmark`
-   - 建立 120Hz 连续采样与零拷贝渲染基准测试。
+```text
+┌─────────────────────────────────────────────────────────────────────────┐
+│                Host Room Orchestrator (房主动态调度器)                     │
+│  广播信令: ROOM_ACTIVITY_SWITCH (activityId, seed/payload, authorityMask) │
+└───────┬──────────────────┬──────────────────┬──────────────────┬────────┘
+        ▼                  ▼                  ▼                  ▼
+  [Freeplay Kernel]  [Match Kernel]    [Replay & Intervene] [Dev Sandbox /
+  (无计分/无限气/     (倒计时/比分/      (Host控时间轴/       Future CSR
+   FIFO滚动池)        GoalReplay/加时)   4-3-2-1-0接管)       Broadcast]
+        │                  │                  │                  │
+        └──────────────────┴──────────────────┴──────────────────┘
+                                    │
+                                    ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│             Unified Room Replication Bus (唯一底层同步总线)                │
+│  1. 双模状态广播: Continuous (60/120Hz 快照) <-> Sparse (冻结帧 + 2Hz Ping) │
+│  2. 实体权威路由: Host权威 / Peer本地预测 / Replay只读 / 接管交接           │
+│  3. 多路复用信道: Unreliable Snapshot Channel + Reliable Control Channel  │
+│  4. 零历史包袱: 不含任何计分、倒计时、进球重置等业务语义                     │
+└─────────────────────────────────────────────────────────────────────────┘
+```
 
-### Tier 5：UE3 `.replay` NetStream Rust 化（5 分支）
-8. `z/agy/rc/rust/t5-01-ue3-bitstream-reader`：在 `rc_replay_codec` 中实现 UE3 无锁 `BitReader` 与头部元数据解码。
-9. `z/agy/rc/rust/t5-02-ue3-actor-channel-parser`：实现 UE3 NetStream Actor/Component 属性通道解码器。
-10. `z/agy/rc/rust/t5-03-touch-timeline-analyzer-rust`：将 `src/replay/ReplayTouchTimelineAnalyzer.ts` 下沉至 Rust。
-11. `z/agy/rc/rust/t5-04-replay-wasm-streaming-bridge`：实现大 `.replay` 文件流式 WASM 解码桥接。
-12. `z/agy/rc/rust/t5-05-retire-ts-netstream-parsers`：分批 `git rm` `src/replay/`（106 TS 文件）中已被替代的位流解析器。
+**这一抽象如何完美满足您的长远设想：**
+- **动态变换、不断线切换**：开发者（Host）建房后，所有 Client 接入 `RoomReplicationBus`。Host 先拉起 `Replay` 模式带大家复盘；复盘完毕发一个 `ROOM_ACTIVITY_SWITCH('match')`，全员无缝切入 2v2 对战；打完一局发一个 `ROOM_ACTIVITY_SWITCH('freeplay')` 或 `ROOM_ACTIVITY_SWITCH('sandbox')`，全员瞬间回到自由练车或开发者自定义的测试沙盒。
+- **为未来 Client-Side Rendering / 全局状态广播铺路**：只要把“当前房间正在运行的 Activity ID + 序列化场景/UI 状态摘要”也视为 `RoomReplicationBus` 的一个可靠信令载荷，未来甚至可以将菜单状态、视角焦点、实验室参数一并广播给所有 Client，上层业务与底层同步彻底零耦合。
 
-### Tier 6：联机回滚全面切换至 `rc_physics_sim::reconciler`（4 分支）
-13. `z/agy/rc/rust/t6-01-ts-network-reconciler-cutover`：让 `src/network/` 全面切换消费 `_physics_reconcileRollbackToTick` 与 `step_reconciler_range`，移除 TS 侧重复状态回滚推导。
-14. `z/agy/rc/rust/t6-02-rtt-and-clock-sync-rust`：将 RTT 抖动平滑与物理时钟同步下沉至 `rc_physics_sim`。
-15. `z/agy/rc/rust/t6-03-room-state-pod-codec`：联机房间 8 车状态紧凑二进制协议收口。
-16. `z/agy/rc/rust/t6-04-multiplayer-soak-and-final-radar`：双世界/多车浸泡测试与全局 `pnpm check` 终局验收。
+---
+
+## 三、 原 50 分支计划书深度审计（基于 Alpha 源码盘点）
+
+### 1. 已有资产 vs 真正缺口对照表
+
+| 原计划 Track | Alpha (`f5e8c9f`) 已存在的相关实现 | 原计划中的重复/错位项 | 真正的增量缺口 |
+| :--- | :--- | :--- | :--- |
+| **Track 1: State Sync & Protocol** (`branch01-10`) | • `globalPhysicsSnapshotSectionCodec.ts`（稀疏 448-float 编码 + activeCarMask）<br>• `GlobalPayloadCodec.ts` & `sessionSignalWireCodec.ts`<br>• `DataChannelTransport.ts`（已含基础 Ping/Pong）<br>• `PredictionReconciler.ts`<br>• `RLRCHermiteSlerpResampler.ts`（Hermite+Slerp 算法已有） | • `branch03/04/08` 大量与现有 Codec 和 Resampler 重叠，另起炉灶会产生两套编码器<br>• `branch10` 指定的 `*.test.ts` 与 `node scripts/radar.ts` **无法运行**（仓库无 vitest/jest，且 TS 脚本需 `--experimental-strip-types` 或 `pnpm check`） | 1. **Sparse/Freeze 降频态**：在 `SYS_CTRL_STATE_ONLY` / 暂停态下真正切断 120Hz 物理广播，切至 `STATE_PAUSED_ACK` + 2Hz 16B Ping-Pong。<br>2. **双 DataChannel 显式分流**：区分 Unreliable 快照信道与 Reliable 信令信道。<br>3. **独立基准验证**：应接入 `src/game/scenario/` 而非虚构 `.test.ts`。 |
+| **Track 2: Multiplayer Freeplay** (`branch11-18`) | • `MatchDomainState.ts` 已有 `lobbyMode`、`trainingDisableGoalReset`、`trainingUnlimitedBoost`<br>• `MatchPhaseLifecycleSubController.ts` 已有 `enterLobbyMode()` 与 `startTrainingMode()`（已配 `COUNTUP_FIFO`）<br>• `LobbyGhostCarCoordinator.ts` 已有碰撞模式切换<br>• `autonomousTrainingAndMatrixScenario.ts` 已测通部分训练流 | • `branch11-15` 是在已经臃肿的 `Match` 子控制器上继续打补丁，与“彻底解耦”的目标背道而驰<br>• `branch18` 的 `runMultiplayerRoomRepro.mjs --mode=freeplay` 目前脚本仅识别 `2p \| 2p2ai \| 3p3ai \| both \| all` | 1. **剥离而非打补丁**：将 Freeplay 抽成独立 `ActivityKernel`，不依赖 `Match` 计分/时钟。<br>2. **多人一键重置球 & 碰撞热切换**的房间级广播。<br>3. 为 `runMultiplayerRoomRepro.mjs` 补齐 `freeplay` 与模式热切换压测分支。 |
+| **Track 3: Dynamic Training Pack** (`branch19-28`) | • `src/game/modes/static-training/`（含 `StaticTrainingPackMode.ts`、`staticTrainingVariationMath.ts`、`StaticTrainingShotEditor.ts`）<br>• `src/replay/ReplayBufferSliceExtractor.ts`（已支持切片提取） | • `branch22`（变体微扰）和 `branch20`（切片提取）已有高度可复用的前序基建，无需重头写数学库 | 1. `.rctrain` 动态切片资产 Schema 与 IndexedDB Worker。<br>2. **DynamicTrainingMode**（Lead-in 切片回放 -> 介入点 -> 接管 -> 多维成功判定）。<br>3. 时间轴预览与标注 UI（`src/ui-core/training/`）。 |
+| **Track 4: Replay Spec & Takeover** (`branch29-36`) | • `MatchSystemControlSubController.ts`（已实现 `SYS_CTRL_STATE_ONLY 0xA0` / `INTERVENE_WILL_RESUME 0xA1` / `PHYSICS_RESUME 0xA2`）<br>• `RLRCInterveneTakeoverSubController.ts`（已有 480 帧 pre-roll 与 4 种 non-POV 行为）<br>• `SignalAudioEngine.ts`（已有 `training_countdown` / `match_start_go`）<br>• `useInGameHudChoreography.ts`（已有 `useTakeoverPrerollChoreography`） | • `branch32/33/34/35` 把**已存在的核心状态机和 HUD/音频管线**当成全新开发任务列出<br>• `branch36` 同样写了不存在的 `*.test.ts` | 1. **多人观战室房间模型**（当前系统控制偏单机/主从原型，缺多人观战席位、Host 授权指定学员接管 `InterveneRoleAssignment`）。<br>2. **时间轴 Lockstep 信令**（Host Seek/Speed/Pause 广播与 Client 对齐）。 |
+| **Track 5: 3D Telestrator & Free Cam** (`branch37-44`) | • `CameraManager.ts` + `FreeCameraController.ts`（Free Cam 已完整实现，支持 WASD/I/M/Shift/鼠标拖拽/FOV） | • `branch43/44` 需基于现有 `CameraManager` 扩展，不可另起控制器 | 1. **3D Telestrator（完全空白，最适合独立并行）**：`src/entities/telestrator/`（地表/侧壁 Raycasting、Ribbon 网格、空中下垂虚线与阴影圈、时空淡出）+ `src/ui-core/telestrator/` + 笔画压缩协议。<br>2. **Coach POV Follow** 与 C 键视角循环扩展。 |
+| **Track 6: WebRTC Voice & Integration** (`branch45-50`) | • `WebRTCConnection.ts`（已管理 `RTCPeerConnection` 生命周期）<br>• `scripts/radar.ts`（已有 Gen-3 架构与耦合审计） | • `branch49`（`mergeStagingTool.ts`）在 20 余个清晰垂直分支下属于过度工程，且可能与现有 `radar.ts` 重复 | 1. **WebRTC Voice（完全空白，最适合独立并行）**：`IVoiceAudioBridge` + `WebRtcNativeVoiceBridge`（挂载到现有 `WebRTCConnection` 的 `RTCPeerConnection.addTrack`）+ 可选 `VoiceSpatialPanner` + 静音/音量条 UI。<br>2. **全链路集成守卫脚本**（串行跑 `pnpm check`、`test:baseline`、`repro`）。 |
+
+### 2. 工程规范与路径/命名问题清单
+1. **测试路径与命令错误**：仓库当前没有任何 `vitest`/`jest` 依赖，所有 `*.test.ts` 均无运行器；自动化验证必须落入 `src/game/scenario/`（由 `pnpm test:baseline` 驱动）或 `scripts/runMultiplayerRoomRepro.mjs`（Headless Chrome）。
+2. **Radar 2.0 红线约束**：
+   - 严禁出现 `index.ts` 桶式重导出（0 Value Re-Exports）。
+   - 严禁在 `src/` 或 `scripts/` 中出现任何中文注释、中文日志或 Emoji（`checkLanguageAndEmoji` 会直接报错拦截）。
+   - 严禁使用 `soccer`/`soccar` 命名（`AGENTS.md` 硬性要求）。
+   - 单文件严格控制在 400 行 / 12KB 以下（超 800 行 / 18KB 直接阻塞），且不能为了凑行数做无意义的 `Part1`/`Helper1` 水平拆分。
+3. **跨层引用检查**：
+   - `src/entities/telestrator/` 只能依赖 `three` 与通用数学/物理常量，**绝不能反向 import `src/game/` 或 `src/network/`**。
+   - `src/audio/voice/` 只通过窄接口（Port）接入 `WebRTCConnection` 的 `RTCPeerConnection`，不直接耦合 `MultiplayerSessionManager`。
+
+---
+
+## 四、 重构后的高效率并行开发蓝图（6 Track / 22 分支）
+
+以下方案**不预设具体代码实现**，仅明确各分支的**职责边界、依赖关系与独立验收标准**，具体实现由各团队自行裁决。
+
+### 阶段一：可 100% 零阻塞并行的独立子系统（优先启动）
+
+#### Track A：3D 空间战术画笔与自由视角扩展（4 分支）
+- `z/agy/rc/branch01-telestrator-3d-core`：`src/entities/telestrator/` — 场馆表面 Raycasting（`Z=0` 草皮 + 6 面侧壁/天花板）、贴地 Ribbon 渲染、空中航迹下垂虚线（Drop Stems）与地面阴影圈。
+- `z/agy/rc/branch02-telestrator-timeline-and-wire`：`src/entities/telestrator/` + `src/network/protocol/` — 笔画时空绑定（按 Replay Tick 锚定/淡出）与 Float32 世界坐标序列网络编解码。
+- `z/agy/rc/branch03-telestrator-ui-toolbar`：`src/ui-core/telestrator/` — 悬浮工具栏（画笔/箭头/战术圈/下垂虚线开关/颜色/清空）。
+- `z/agy/rc/branch04-camera-coach-follow`：`src/camera/` — 扩展 `CameraManager` 与 `FreeCameraController`，增加 C 键循环与“锁定跟随导师主视角（Coach POV Follow）”。
+
+#### Track B：纯原生 WebRTC 语音通话（3 分支）
+- `z/agy/rc/branch05-voice-bridge-and-webrtc`：`src/audio/voice/` — 定义 `IVoiceAudioBridge` 抽象防腐层，并实现基于 `RTCPeerConnection.addTrack`（Opus + 内置 AEC/NS）的 `WebRtcNativeVoiceBridge`。
+- `z/agy/rc/branch06-voice-spatial-panner`：`src/audio/voice/` — 基于 Web Audio `PannerNode` 的 3D 空间语音衰减（可开关）。
+- `z/agy/rc/branch07-voice-chat-ui`：`src/ui-core/audio/` — 麦克风开/关、音量电平条、说话者车顶指示状态。
+
+#### Track C：Dynamic Training Pack 单机引擎（4 分支）
+- `z/agy/rc/branch08-dynamic-pack-schema-and-extractor`：`src/game/modes/dynamic-training/` + `src/replay/` — `.rctrain` 资产 Schema，复用并增强 `ReplayBufferSliceExtractor` 提取动态切片与介入点元数据。
+- `z/agy/rc/branch09-dynamic-pack-variation-and-judge`：`src/game/modes/dynamic-training/` — 复用 `staticTrainingVariationMath` 思路实现动态切片初速度/角度/自旋微扰，以及多维度成功判定器（进球/扑救/限时/球速）。
+- `z/agy/rc/branch10-dynamic-training-mode-runner`：`src/game/modes/dynamic-training/` — 实现 `DynamicTrainingMode`（Lead-in 播放 -> 介入倒计时 -> 物理接管 -> 判定结算 -> 成绩持久化）。
+- `z/agy/rc/branch11-dynamic-training-editor-ui`：`src/ui-core/training/` — 训练包切片打点与时间轴预览 UI + IndexedDB 异步存取 Worker。
+
+---
+
+### 阶段二：核心网络与房间模式重构（建议先锁协议，再并行）
+
+#### Track D：统一房间复制总线与双模同步（4 分支）
+- `z/agy/rc/branch12-replication-bus-protocol`：`src/network/protocol/` + `src/network/sync/` — 定义 `RoomReplicationBus` 双模协议（Continuous 120Hz vs Sparse/Frozen + `STATE_PAUSED_ACK` + 2Hz 16B Ping-Pong）与 `ROOM_ACTIVITY_SWITCH` 热切换信令。
+- `z/agy/rc/branch13-webrtc-dual-channel-mux`：`src/network/transport/webrtc/` — 在 `DataChannelTransport` 中落地双 DataChannel 分流（Unreliable 快照信道 vs Reliable 控制/信令信道）与自适应码率降频。
+- `z/agy/rc/branch14-sync-authority-and-interpolator`：`src/network/sync/` — 实体级物理权威路由（Host / Peer / Replay 只读）与客户端稳态插值衔接（复用 `RLRCHermiteSlerpResampler` 核心数学）。
+- `z/agy/rc/branch15-room-activity-orchestrator`：`src/network/server/` — 将 `AuthoritativeServerHost` / `HostWorkerMessageRouter` 从硬编码 `Match` 中解放，支持在不断开房间的情况下动态挂载/切换上层 `ActivityKernel`。
+
+#### Track E：上层模式内核拆解（Freeplay / Match / Sandbox）（3 分支）
+- `z/agy/rc/branch16-freeplay-activity-kernel`：`src/network/server/activities/` — 彻底从 `MatchPhaseLifecycleSubController` 剥离出的多人自由练车内核（无计分、无进球冻结、无限气、ROLLING FIFO、一键重置球、Ghost/Solid 碰撞热切换）。
+- `z/agy/rc/branch17-match-and-sandbox-kernels`：`src/network/server/activities/` — 保留纯粹的 `Match` 对战内核，并新增 `DevSandboxKernel`（支持开发者房间广播自定义状态/实验场模式切换）。
+- `z/agy/rc/branch18-room-switch-repro-suite`：`scripts/runMultiplayerRoomRepro.mjs` — 增加 `--mode=freeplay` 与动态模式热切换（Freeplay -> Match -> Replay -> Freeplay）的 Headless Chrome 多端压测。
+
+#### Track F：Replay 多人观战室与远程接管（4 分支）
+- `z/agy/rc/branch19-spectator-room-and-timeline`：`src/network/server/spectator/` — 多人观战室域模型与 Host 时间轴 Lockstep 信令（Seek / PlayRate / Pause 触发总线进入 Sparse 2Hz Ping-Pong 模式）。
+- `z/agy/rc/branch20-intervene-role-and-handoff`：`src/network/server/spectator/` — 接管角色授权（Host 自演或指定特定 Client 学员接管），桥接现有 `MatchSystemControlSubController` 与 `RLRCInterveneTakeoverSubController`。
+- `z/agy/rc/branch21-takeover-countdown-ux`：`src/audio/` + `src/ui-core/overlay/` — 复用并扩展现有 `SignalAudioEngine` 与 `useInGameHudChoreography`，对齐 4-3-2-1-0 音梯与多人观战提示 HUD。
+- `z/agy/rc/branch22-full-integration-audit`：`src/game/scenario/` + `scripts/` — 补齐动态训练、观战接管场景测试，并沉淀一键串行审计入口（`pnpm check` + `test:baseline` + `repro`）。
+
+---
+
+## 五、 合并策略与各团队交付红线
+
+1. **合入节奏**：
+   - **Track A / B / C** 完全独立，开发完成并通过 `pnpm check` 后即可随时合入主干，无需等待网络层。
+   - **Track D** 锁定 `RoomReplicationBus` 与 `ROOM_ACTIVITY_SWITCH` 协议后，**Track E / F** 立即基于该契约并行开发，最后通过 `--no-ff` 按 Track 顺序收敛。
+2. **交付前强制自检**：
+   - 任何分支提交前必须通过 `pnpm run format:check && pnpm run check`（0 Radar Error，0 `tsc` Error）。
+   - 禁止在仓库中引入中文注释/字符串、Emoji、`index.ts` 桶文件及向后兼容垫片。
+   - 不保留死代码，该删的历史耦合文件直接删除（依赖 Git 历史回溯）。

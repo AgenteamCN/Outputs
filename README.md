@@ -1,68 +1,57 @@
-# Dynamic Training Pack 修复报告（Slot 串号 / 名字显示 / 非对称阵型 / 3s Timeout 音效）
+# Dynamic Training Pack 修复与验证报告
 
-- **仓库**: `Antigravi-ty/RocketCompanion`
-- **基准 Commit**: `f70fbf369eb1c4a3d72013bf2f30925908acb9e7`
-- **工作分支**: `z/agy/rc/fix-replay-slot-and-timeout`（未提交 PR，待验证）
-- **Verified Commit**: `96dcecb7bfcf50c574c4ed9ca9cb0c5bebdd91a7` (`verified: true`)
-
----
-
-## 1. 根因定位：为什么六个 Slot 会全部串号
-
-使用实际提供的 `rc-replay-3v3-1-0-2026-11-13T07-26-58.rcreplay.gz` 与 `Captured From Replay.RCDPack` 排查后，确认原因如下：
-
-1. **Replay 导出顺序与 `slotIndex` 不一致**：
-   - 在 `rc-replay-3v3-1-0-2026-11-13T07-26-58.rcreplay.gz` 中，`Player` 在 Team 1（`carIndex: 3`）。`ReplayViewerRosterResolver.ts` 将本方队伍（`localTeam`）排在前面，导致 `resolvedRoster` 顺序为 `[3, 4, 5, 0, 1, 2]`。
-   - `DynamicTrainingSliceExtractor.ts` 按 `roster` 顺序写入 `frame.cars`，于是 `Captured From Replay.RCDPack` 的每一帧里 `cars[0].slotIndex === 3`、`cars[3].slotIndex === 0`。
-2. **运行时按数组下标 `cars[slot]` 错位读取**：
-   - 以下文件全部直接用 `frame.cars[slot]`（数组下标）而不是匹配 `car.slotIndex === slot`：
-     - `RLRCInterveneTargetFrameApplier.ts` (`applyTargetFrameToPhysicsAndArena`)
-     - `RLRCInterveneNonPovSyncPipeline.ts` (`stepNonPovCarsBeforePhysics`、`syncFollowStateNonPovAfterStep`)
-     - `RLRCInterveneFrameStateBuilder.ts` (`packRLRCFrameToGameStateBuffer`)
-     - `RLRCIntervenePrerollHistoryInjector.ts` (`resolveValidIntervenePovSlotIndex`、`buildFrameAcknowledgedControls`、`detectBallTouchIncidentBetweenFrames`)
-   - 结果导致 `slot 0` 读了 `slotIndex 3` 的车、`slot 3` 读了 `slotIndex 0` 的车，切换任意 slot 都会位置与队伍错乱；在 1v1 / 2v2 / 非对称对局中更会出现越界或空槽错位。
-3. **POV 切换未互斥**：
-   - `dynamicTrainingPackStore.ts` 的 `updateShotPerCarTakeover` 在将某辆车设为 `'player'` 时，未把原 `'player'` 槽位降级为 `'as-previous'`，可能导致多辆车同时处于 `'player'`。
+**分支**：`z/agy/rc/fix-replay-slot-takeover`  
+**基准 Commit**：`f70fbf369eb1c4a3d72013bf2f30925908acb9e7`  
+**最新 Verified Commit**：`3e8ce00a6cf2e51970e165c0998e34888e3a54e9`（尚未提交 PR，等待你本地验证）
 
 ---
 
-## 2. 本次修改内容
+## 1. 两个 Commit 对比：`0401e7a` vs `f70fbf3`
 
-1. **按 `car.slotIndex` 精确索引（兼容历史已导出的 `.RCDPack` 与非连续槽位）**
-   - 在 `src/replay/rlrc/runtime/RLRCInterveneFrameStateBuilder.ts` 新增 `findRLRCCarBySlot(cars, slotIndex)`，并在以下模块全部替换为按 `slotIndex` 查找：
-     - `src/replay/rlrc/runtime/RLRCInterveneFrameStateBuilder.ts`
-     - `src/replay/rlrc/runtime/RLRCInterveneTargetFrameApplier.ts`
-     - `src/replay/rlrc/runtime/RLRCInterveneNonPovSyncPipeline.ts`
-     - `src/replay/rlrc/runtime/RLRCIntervenePrerollHistoryInjector.ts`（含 `resolveValidIntervenePovSlotIndex` 与 `detectBallTouchIncidentBetweenFrames` 返回真实 `car.slotIndex`）
-   - 在 `src/replay/DynamicTrainingSliceExtractor.ts` 中将新提取的 `compactRoster` 和 `frame.cars` 按 `slotIndex` 升序规范化输出，同时保留仅实际参战车辆（支持 1v1、2v2、2v1、1v0 等任意阵型）。
-2. **显示 1-based Slot 编号、队伍色点与玩家名称**
-   - `src/ui-core/config/dynamicTrainingPackTypes.ts`：`DynamicTrainingStateSessionSummary` 增加可选 `roster` 字段并在 `summarizeDynamicStateSession` 中填充。
-   - `src/ui-core/panels/dev/dynamic-training/DynamicTrainingShotEditorCard.tsx`：优先使用 `sessionSummary.roster` 渲染实际存在的车辆槽位（不再依赖固定 6 槽或猜号），展示 `#1..#6` 编号 + 蓝/橙队伍圆点 + `userName`。
-   - `src/ui-core/stores/dynamicTrainingPackStore.ts`：`updateShotPerCarTakeover` 保证单人训练中仅有一个 `'player'` POV 槽位，切换时自动将旧 `'player'` 槽位切回 `'as-previous'`。
-   - `src/game/modes/dynamic-training/DynamicTrainingMode.ts`：`startShot` 解析有效 `player` POV 槽位并在 `enterInterveneAtFrame` 后同步 `runtime.playerCarIndex` 与 `arena.playerCarIndex`。
-3. **Timeout 最后 3 秒倒计时音效**
-   - `src/game/modes/dynamic-training/DynamicTrainingMode.ts`：在 `onAfterPhysicsTick` 中参考 `StaticTrainingSimulationController` 的模式，当 `remainingSeconds` 进入 `3s / 2s / 1s` 时触发 `training_countdown` 音效，超时结算时触发 `training_ball_expire` 音效（并在 `onEnter` / `startShot` / `stopShot` 时重置计数状态）。
-4. **Headless / 非 UI 挂载保护**
-   - `src/replay/rlrc/runtime/RLRCInterveneEnvPortBuilder.ts`：对 `useReplayToRcsImporterStore.getState()?.updateLiveTelemetry?.(...)` 增加可选链保护。
+| 维度 | `0401e7a` | `f70fbf3`（本分支基准） | 本次吸收与决策 |
+| :--- | :--- | :--- | :--- |
+| **120Hz 双步进修复** | 在 `SimulationStage.ts` 特判 `dynamic-training-pack` 并新增 `onStepPhysicsTick()` | 复用标准 `GameMode` 生命周期 `onBeforePhysicsTick()` + `onAfterPhysicsTick()` | 保留 `f70fbf3`，无额外分支特判，耦合更低 |
+| **BoostPad 暂停冻结** | 直接移除 `isBufferFrozen` 逻辑 | 保留 `safeDt === 0` 与 `isBufferFrozen` 判断，暂停时精确冻结 | 保留 `f70fbf3` |
+| **Slot 串号修复** | 在 `DynamicTrainingSliceExtractor` 中对 `cars` 与 `roster` 按 `slotIndex` 排序 | 未排序，导致 `[3,4,5,0,1,2]` 顺序直接按数组下标读取 | **吸收并升级**：不仅排序，还用 `findCarBySlot` + 稀疏槽位归一化彻底根治 |
+| **Bridge & Importer** | 缺少 `runtimeDynamicTrainingBridge.ts` 与 `replayToRcsImporterStore.ts` 完整接线 | 完整保留并支持两阶段截取与桥接 | 保留 `f70fbf3` |
 
 ---
 
-## 3. 测试与验证结果
+## 2. 根因定位与修复明细
 
-1. **格式与静态检查**：
-   - `pnpm exec prettier --check`（本次修改的 10 个文件）：**PASS**
-   - `pnpm run check`（`radar` + `tsc --noEmit`，1364/1364 TS 文件）：**PASS**
-   - `pnpm run build`：Exit 0，构建通过
-2. **Ducky / 真实 Replay & RCDPack 自动化测试（Node + esbuild 打包实测）**：
-   - **测试 1（真实 `Captured From Replay.RCDPack`）**：对乱序 `cars`（`[3,4,5,0,1,2]`）遍历切换 POV `0..5`，验证 `packRLRCFrameToGameStateBuffer`、`setCarState` 位置、`addCarAtSlot` 队伍、`playerCarIndex` 全部 1:1 精确对应，无串号。
-   - **测试 2（真实 `rc-replay-3v3-1-0-2026-11-13T07-26-58.rcreplay.gz`）**：解析 20107 帧并在 23.2s 提取 session，验证 `roster` 按 `0..5` 排序且完整保留 `Nexto #4..#6 / Player / Nexto #2..#3` 名称与队伍。
-   - **测试 3（1v1 / 2v2 / 非对称 2v1 / 单人 1v0）**：验证非连续 `slotIndex`（如 `[0,3]`、`[1,3,5]`、`[2]`）下仅激活真实车辆、其余槽位正确停用与隐藏，且无效 `povSlotIndex` 能回退到有效 `car.slotIndex` 而非数组下标。
-   - **测试 4（Timeout 3 秒倒计时音效）**：5s 超时实测触发 3 次 `training_countdown`（3s/2s/1s）与 1 次 `training_ball_expire`。
+### 2.1 Slot 串号 & 稀疏/非对称阵容（1v1 / 2v2 / 非对称）
+- **根因**：在 `Captured_From_Replay.RCDPack` 中，`session.roster` 与 `frame.cars` 的顺序为 `[3, 4, 5, 0, 1, 2]`（先橙队后蓝队）。`DynamicTrainingSliceExtractor.ts` 未按 `slotIndex` 排序或归一化，同时 `RLRCInterveneTargetFrameApplier.ts`、`RLRCInterveneNonPovSyncPipeline.ts`、`RLRCIntervenePrerollHistoryInjector.ts`、`RLRCInterveneFrameStateBuilder.ts` 全部直接使用 `frame.cars[slot]` 按数组下标取值，导致 0-5 号位与物理槽位错位；在 1v1 / 2v2 / 非对称对局中，`cars[3]` 甚至会越界为 `undefined`。
+- **修复**：
+  - `src/replay/DynamicTrainingSliceExtractor.ts`：在提取和回填（`hydrateRLRCFramesFromDynamicSession`）时，统一对 `roster` 与 `cars` 按 `slotIndex` 升序排列，并将每帧 `cars` 归一化为 `0..5` 槽位索引数组（缺失槽位自动填充 `entityActive: false` 占位，兼容已有历史 `.RCDPack` 文件）。
+  - `src/replay/rlrc/runtime/RLRCInterveneFrameStateBuilder.ts`：新增并导出 `findCarBySlot(cars, slot)`，并在上述 4 个 RLRC 接管运行时文件中全部替换 `frame.cars[slot]`；同时修复 `resolveValidIntervenePovSlotIndex` 与 `detectBallTouchIncidentBetweenFrames` 返回真实 `car.slotIndex` 而非数组下标。
+  - `src/game/modes/dynamic-training/DynamicTrainingMode.ts`：新增 `resolveEffectivePovSlot()`，当稀疏对局中 `povSlotIndex` 不存在时安全回退至有效活跃槽位。
+
+### 2.2 全员设为 Player 仍不接收用户输入
+- **根因**：`DynamicTrainingMode.readPlayerControls()` 调用了不存在的 `r?.input?.getPlayerControls?.()`，导致每帧永远返回 `DEFAULT_NEUTRAL_CAR_CONTROLS`。实际上 `SimulationStage.ts` 在每帧物理步前通过 `this.runtime.pollInputs()` 将输入写入 `this.runtime.playerControls`。
+- **修复**：`DynamicTrainingMode.readPlayerControls()` 优先读取 `this.runtime.playerControls`；同时为 `createRLRCInterveneEnvPort` 增加独立 `onPhaseChanged` 回调，避免污染 `useReplayToRcsImporterStore`。
+- **关于 Multiplayer 规划**：本次按你要求保持单机 POV 接管概念跑通（非 POV 的 `player` 槽位暂按 `follow-state` 处理），待后续多人房间与远端输入同步基础设施就绪后，再将非本地 `player` 槽位接入远端输入流即可。
+
+### 2.3 3-2-1 倒计时缺少 "TAKE OVER IN" UI
+- **根因**：`GoalReplayHudOverlay.tsx` 中的 `useGoalReplayAndTakeoverHudState` 与 `GoalReplayHudOverlay` 仅订阅了 `ReplayViewer`、`ReplayToRcsImporter` 和 `Rewinder`，未订阅 `useDynamicTrainingPackStore` 的 `playPhase === 'preroll-countdown'`。
+- **修复**：在 `src/ui-core/hud/GoalReplayHudOverlay.tsx` 新增 `useDynamicTrainingPrerollHud()`，将 Dynamic Training 的倒计时状态、倒计时秒数与 POV 队伍颜色（Blue / Orange）接入 `TakeoverVignetteOverlay` 与 `TakeoverCountdownHUD`。
+
+### 2.4 Timeout 最后 3 秒倒计时音效
+- **修复**：在 `DynamicTrainingMode.onAfterPhysicsTick()` 中监听 `judge.remainingSeconds` 进入 `3 / 2 / 1` 秒区间时触发 `training_countdown` 音效；超时触发 `training_ball_expire`，进球触发 `sfx_goal_poof`。
+
+### 2.5 Slot 显示名称、编号（#1~#6）与队伍标识
+- **修复**：
+  - `src/ui-core/config/dynamicTrainingPackTypes.ts`：在 `DynamicTrainingStateSessionSummary` 与 `summarizeDynamicStateSession()` 中携带按 `slotIndex` 排序的 `roster`。
+  - `src/ui-core/panels/dev/dynamic-training/DynamicTrainingShotEditorCard.tsx`：基于 `sessionSummary.roster` 渲染实际存在的车辆（1v1/2v2/非对称只显示对应车辆），每行显示队伍色点、`#1~#6` 编号（悬停提示 `Slot 0~5`）、玩家名 `userName` 以及当前 `POV` 徽标。
 
 ---
 
-## 4. 关于 Multiplayer 期间“谁是 Player”的建议
+## 3. 验证结果
 
-- **建议等后续联机房间/玩家槽位基础设施完成后再接 Multiplayer 的多人 `player` 选择，本次先把单人 Concept 彻底调通即可**：
-  - 当前单人模式的 `DynamicTrainingShotRef` 已具备 `perCarTakeover`（每车规则）与 `povSlotIndex` 模型；但目前引擎输入管线（`DynamicTrainingMode.readPlayerControls()` / `runtime.playerCarIndex`）和网络同步层默认只有一个本地 `player`。
-  - 后续接 Multiplayer 时，只需在房间分配好每个连接玩家对应的 `slotIndex`（例如 `slot -> peerId` 映射）后，将 `perCarTakeover` 中多个 `'player'` 槽位绑定到对应联机玩家即可，无需推翻现有 `.RCDPack` 格式和 `slotIndex` 逻辑。
+1. **架构与类型检查（`pnpm check`）**：
+   - `radar`（1364/1364 TS，0 循环依赖，0 越级引用，体积合规）：**PASS**
+   - `tsc --noEmit`：**PASS**
+   - `pnpm build`（Vite 生产构建）：**PASS**
+2. **自动化实测（已使用真实 `Captured_From_Replay.RCDPack` + 1v1/2v2/1v3 稀疏对局 + 按键接管模拟）**：
+   - `[PASS] 1. Captured_From_Replay.RCDPack slot hydration & ordering verified`（`[3,4,5,0,1,2]` 乱序数据正确归一化为 `0..5`，Slot 3 精确对应 `Player` 且 boost=69.17，Slot 0 对应 `Nexto #4` 且 boost=100）
+   - `[PASS] 2. Sparse/asymmetric Ducky tests (1v1, 2v2, 1v3) verified`（仅激活对应上场槽位，无越界与串号）
+   - `[PASS] 3. All-player takeover, 3s countdown, jump/front-flip input, and 3s timeout audio verified!`（全员 `player` + 3s 倒计时正常进入 `intervening`，`throttle`/`steer`/`jump`（Single Jump）与 `pitch: -1 + jump`（Front Flip）均精确送达 POV 槽位，最后 3 秒触发 3 次 `training_countdown` 与超时 `training_ball_expire`）

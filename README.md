@@ -1,77 +1,77 @@
-# Track B (`z/agy/rc/track-b-voice-configurator` @ `a44c14d`) 合并评估与 Lobby 语音无声根因诊断报告
+# Track D (`cf5cfeee`) 合入评估与 Telemetry 数据分析报告
 
-> 检验基准提交：`a44c14dd698bcc96a8bfb0aee76347f5effc0d2f`  
-> 对比主干：`origin/alpha` (`ae6c593dd9bde4fa92fbd24a529956b0d3a79502`)  
-> 对比参考：`origin/z/agy/rc/track-d-replication-bus` (`cf5cfee`)
-
----
-
-## 一、 核心结论（直接回答你的三个问题）
-
-### 1. Lobby 期间双方能看到自己电平在动，但互相听不见——这符合预期吗？
-**不符合预期。**
-- 你能在菜单里看到自己的麦克风电平在动，只说明本地采集链路（`navigator.mediaDevices.getUserMedia` -> `localMicAnalyser` -> `voiceChatStore`）是通的，**完全不代表 WebRTC P2P 远端音频链路已经打通**。
-- 在 `a44c14d` 中，`src/game/runtime/RuntimePostprocessingAndSessionBootstrap.ts` 已经在房间连接建立阶段（Host 的 `onPeerConnected` 与 Client 的 `onJoinServer`）调用了 `attachVoiceToPeerChannel`，**设计上在 Lobby 期间只要双方 P2P 连上就应该能互相听见**。
-
-### 2. 是不是应该等 Track D 合并后，再由 Track E / F 来打通语音链路？
-**不是。这是一个关键的架构边界误解。**
-- 已核查 `origin/z/agy/rc/track-d-replication-bus`（`cf5cfee`）的全部 61 个变更文件：**Track D 没有任何 `voice` 或 `audio` 相关改动**。Track D 负责的是 `RoomReplicationBus`（游戏状态 60/120Hz 快照与 Sparse 冻结双模同步、`ROOM_ACTIVITY_SWITCH` 热切换、DataChannel 不可靠/可靠双信道分流）。
-- **Track B（纯原生 WebRTC 语音）从一开始就是 Stage 1 零阻塞独立子系统**：它直接复用 `P2PWebRTCChannel` 的 `RTCPeerConnection.addTrack` 走原生 Opus 媒体流，并通过 `DataChannelTransport.sendVoiceSignal` 走独立的 `voice_signal` 控制帧做 SDP 重协商。
-- Track E（Freeplay/Match/Sandbox 内核）和 Track F（多人观战/接管）运行在 `RoomReplicationBus` 上层，**不会也不应该去接管或修复 Track B 的 WebRTC 音频轨**。语音通话链路必须由 **Track B 自身闭环打通并验收通过后再合并**。
-
-### 3. 当前如何检验 Track B 是否可以开始合并？
-- **静态架构与合并冲突层面**：**已达标**。
-  - `pnpm run check`（Radar 2.0 架构扫描 + `tsc --noEmit`）全绿通过（`EXIT=0`，1361/1361 TS 文件，0 循环依赖，0 越层引用，0 桶文件）。
-  - 与 `origin/alpha`（`ae6c593`）**0 个重叠文件**，合并无冲突。
-  - 分层合规：`IVoiceAudioBridge` 窄接口位于 `src/audio/voice/`，`runtimeVoiceBridge.ts` 位于 `src/ui-system/core/` 进行桥接，UI 位于 `src/ui-core/recipes/settings/components/VoiceChatSettingsSection.tsx`，未违反 `src/ui-core/AGENTS.md` 与 `[TRANSPORT ISOLATION VIOLATION]`。
-- **运行时功能层面**：**暂不建议直接合并**。需先修复下方定位到的 3 个代码级 Bug，并在 Lobby 中完成双端真机语音互通验收。
+> **评估对象**：分支 `z/agy/rc/track-d-replication-bus`（Commit `cf5cfeee60fc0cd54eb2dcdc13dbc2aa845d80a1`）  
+> **数据包**：`rc-net-telemetry-csts-match-complete-2026-11-13T07-21-06.zip`  
+> **结论摘要**：**Track D 可以合并到主干以解锁 Track E / Track F 并行开工**；但需明确它目前交付的是**“协议契约 + 旁路基础设施 + `game_ctrl` 通道建链”**，核心调度器尚未接入现有联机热路径。Client 侧 Telemetry 数据**整体完全符合预期**。
 
 ---
 
-## 二、 Lobby 期间“能看自己电平、但双方互相听不见”的根因定位
+## 一、 Track D 合入前门禁与实测结果
 
-通过逐行审计 `a44c14d` 的信令、连接生命周期与 Web Audio 播放链路，定位到以下 **4 个直接导致无声的问题**：
+在沙盒环境对 `cf5cfeee` 执行了完整静态检查、格式化检查、生产构建与端到端基线脚本：
 
-### 根因 1（致命）：`onVoiceSignal` 注册时序竞态 + Offer Glare 死锁
-- **位置**：
-  - `src/game/runtime/RuntimePostprocessingAndSessionBootstrap.ts`（L259-L269）
-  - `src/network/transport/webrtc/DataChannelTransport.ts`（L214-L223）
-  - `src/audio/voice/WebRtcNativeVoiceBridge.ts`（L474-L489）
-- **原因**：
-  1. Client 侧在 `onJoinServer` 中先 `await sessionCoordinator.joinOnlineServer(opts)`（内部会异步加载 3D Lobby 场景），**之后**才调用 `attachVoiceToPeerChannel` 注册 `channel.onVoiceSignal`。Host 侧在 `onPeerConnected` 中也先 `await rosterSyncCoordinator.onRemotePlayerConnected(...)` 再注册。
-  2. 但此时 `RTCDataChannel` 已经处于 `open` 状态。先完成 `await` 的一端会立刻发出 `voice_identity` 和（若已开启语音）`voice_offer`。
-  3. 另一端此时 `channel.onVoiceSignal` 仍为 `null`，`DataChannelTransport.handleIncomingMessage` 仅执行 `if (this.onVoiceSignal) this.onVoiceSignal(control.signal)`，**不会重放 `transportEvents` 中缓存的 `voice_signal`**，导致 `voice_offer` 被静默丢弃。
-  4. 若双方在进房前都已开启语音：Host 发出的 `voice_offer` 被 Client 丢弃；随后 Client 完成加载并发送自己的 `voice_offer`，Host 此时卡在 `signalingState === 'have-local-offer'` 且 `isPolite === false`，触发 `if (offerCollision && !peer.isPolite) return;`，**把 Client 的 Offer 也丢弃**，双方永久死锁，永远不会触发 `ontrack`。
-
-### 根因 2（致命）：`hiddenAudioEl.muted = true` + `AudioContext` 自动播放拦截 / WKWebView 兼容问题
-- **位置**：`src/audio/voice/WebRtcNativeVoiceBridge.ts`（L370-L397）
-- **原因**：
-  1. `bindRemoteStream` 创建了一个 `audioEl.muted = true` 的隐藏 `<audio>` 元素，把实际声音完全交给 `AudioContext.createMediaStreamSource(stream)` -> `GainNode` -> `masterGainNode` -> `ctx.destination`。
-  2. 如果接收方**尚未点击开启语音**（或未在用户手势中激活 `getAudioContext()`），`ontrack` 属于异步网络事件而非用户手势，此时 `ensureOutputBus()` 里的 `ctx.resume()` 会被浏览器 Autoplay 策略拦截，导致 `AudioContext.state` 停留在 `'suspended'`，完全无声。
-  3. 在 **macOS Tauri (`WKWebView`)** 及部分 Chromium 环境下，对远端 WebRTC `MediaStream` 使用 `createMediaStreamSource` 配合 `muted = true` 的 `<audio>` 常会出现拉流失败或输出全零静音的问题。
-
-### 根因 3（环境依赖）：同机双开若回退到 `CrossTab` (`BroadcastChannel`) 模式，无真实 `RTCPeerConnection`
-- **位置**：`src/ui-system/core/runtimeVoiceBridge.ts`（L123）、`src/network/transport/webrtc/HandshakeSession.ts`
-- **原因**：如果测试时两端的 P2P 连接走的是同源 `CrossTab` 模拟通道而非真实 WebRTC `RTCPeerConnection`，`channel.connection.pc` 未完成真实 ICE/DTLS 建连，无法承载 `MediaStreamTrack` 音频流（但本地 `getUserMedia` 电平依然会正常跳动，极易造成“以为连上了但听不见”的错觉）。
-
-### 根因 4（边界缺陷）：重协商静默跳过与文件体积预警
-- **位置**：`src/audio/voice/WebRtcNativeVoiceBridge.ts`（L331-L345, L423-L448）
-- **问题**：
-  1. `attachPeer` 监听了 `negotiationneeded`，同时 `syncLocalTrackToPeer` 在 `addTrack` 后又手动调用 `renegotiatePeer`。
-  2. 当 `signalingState !== 'stable'`（例如开启/关闭语音切换过快）时，`renegotiatePeer` 直接 `return` 而未排队重试，会导致轨状态与远端不同步。
-  3. `WebRtcNativeVoiceBridge.ts` 当前为 **559 行 / 17.8 KB**，已非常接近 Radar 2.0 的 `800 行 / 18 KB` 硬拦截红线（当前触发软提示），后续修复建议适当拆出音频输出总线或信令状态机子模块。
+1. **`pnpm run check`（Radar 2.0 + `tsc --noEmit`）**：**GREEN（全部通过）**
+   - TypeScript 覆盖率：`1359/1359`（100% TS）
+   - 硬边界：`0` 循环依赖、`0` 值重导出（`index.ts`）、`0` 越界向上引用
+2. **Prettier 格式化检查（针对 Track D 全部 14 个变更文件）**：**PASS**
+   - 注：仓库全局 `pnpm run format:check` 存在 205 个历史遗留未格式化文件，但 **Track D 自身新增/修改的 14 个文件 100% 符合 Prettier 规范**。
+3. **`pnpm run build`（Vite 生产构建）**：**PASS**
+4. **端到端脚本现状（供对比基线）**：
+   - `pnpm run test:baseline`：除既有的 `multiplayer_6car_loadout_stress` 2 项断言（`multiplayer_kickoff_transitioned_to_playing`、`multiplayer_no_phantom_double_jump_on_flip_e`）外，其余 1v0~3v3 矩阵、场景图几何、零运行时报错均 **PASS**。
+   - `pnpm run repro:multiplayer-room`：无新增崩溃，`CSTS` 物理频率扫频 `[60.7..141.99]Hz` 保持 `snaps=0 | starvations=0`；存在的 `3p3ai` 占位车与轨迹诊断告警为既有基线问题，非 Track D 引入。
 
 ---
 
-## 三、 Track B 合并前的修复与验收清单（Actionable Checklist）
+## 二、 为什么“正常打完一局 Multiplayer Match 没受影响”——Track D 真实接线状态
 
-1. **修复信令丢失与死锁**：
-   - 在 `DataChannelTransport` 中为未消费的 `voice_signal` 增加小型队列，在 `attachVoiceToPeerChannel` 绑定 `onVoiceSignal` 时立即回放；或将 `attachVoiceToPeerChannel` 提前到 `await joinOnlineServer` / `onRemotePlayerConnected` 之前执行。
-2. **修复远端音频播放静默**：
-   - 检查接收端 `AudioContext.state`，必要时在 UI 交互时确保 `resume()`，并在 `volumePct <= 100` 且未开启特殊处理时验证 `<audio>` 直出或确认 `WKWebView` 下 `MediaStreamAudioSourceNode` 实际有采样输出（可在 `WebRtcNativeVoiceBridge` 中观察 `peer.audioLevel01` 是否大于 0 来区分“没收到流”还是“收到流但没播出来”）。
-3. **Lobby 实机验收标准（无需等待 Track D/E/F）**：
-   - [ ] 双方进入同一房间 Lobby 后，在 **Developer -> Under Development -> Voice Chat Configurator** 的 `Per-Player Voice Mix` 中不再显示 `0 Peers`，能看到对方名称与 ID。
-   - [ ] 单方开启语音时，另一方界面显示 `Voice active (xx%)` 且对方电平条随说话跳动，能清晰听到声音。
-   - [ ] 双方进房前均已开启语音时，进房后不发生 glare 死锁，双向正常通话。
-   - [ ] `0% - 250%` 增益调节、本地 Mute、关闭语音后重新开启均能正常恢复。
-   - [ ] 运行 `pnpm run check` 保持 0 Error。
+通过全仓引用扫描发现，Track D 的 14 个变更文件中，**绝大多数新模块目前处于“旁路就绪（Side-by-Side Ready）”状态，尚未挂载到现有 Match 热路径上**：
+
+| 模块 / 能力 | 现状 | 是否影响现有 Match |
+| :--- | :--- | :--- |
+| `HandshakeSession.ts` (`game_ctrl` ordered DataChannel) | **已接入建链**：Host 创建 `game_net` + `game_ctrl`，Client 通过 `ondatachannel` 绑定到 `DataChannelTransport.controlDataChannel` | **唯一在真实对局中跑通的改动**，证明双通道握手与 `game_net` 无回归 |
+| `ReplicationBusProtocol.ts` | 定义了 `REPLICATION_MODES`、`ACTIVITY_IDS`、`REPLICATION_PACKET_FLAGS` 与 16B `SparsePingPong16B` 编解码 | 无影响（纯协议） |
+| `RoomActivityOrchestrator.ts` / `ActivityKernel.ts` | 仅在 `HostWorkerMessageRouter.ts` 的 4 个新 `MSG` 分支中被实例化调用；`buildWorkerRoomStateSummary()` 尚未填充 `activeActivityId` / `activityEpoch` / `replicationMode` | 无影响（未被触发） |
+| `AuthoritativeServerHost.ts` 新增方法 (`switchActivity`, `setReplicationMode`, `sendStatePausedAck`, `broadcastCsrSummary`) | 仅向 Worker 发送命令，**尚未将 Worker 回复转发至 `P2PWebRTCChannel`**；客户端也尚未消费 `DataChannelTransport.transportEvents` 中的这 4 类事件 | 无影响（未被调用） |
+| `SyncAuthorityRouter.ts` / `ReplicationStateInterpolator.ts` / `AdaptiveReplicationPacer.ts` | 在上述 14 个文件之外 **0 个外部调用方**；`shouldSendAdaptiveSnapshot()`、`shouldSendSparsePing()` 尚未接入主循环发包器 | 无影响（未被接入） |
+
+**架构评估**：
+- 这正是推荐的渐进式合入策略——**先锁定协议与内核契约，不破坏现有 Match**。
+- Track E（拆解 `FreeplayKernel` / `MatchKernel` / `SandboxKernel`）与 Track F（`Spectator` 观战室与接管交接）依赖的 `RoomActivityKernel`、`RoomActivityOrchestrator`、`SyncAuthorityRouter`、`ReplicationBusProtocol` 均已就位，**可以立即合并 Track D 并让 E/F 开工**。
+
+---
+
+## 三、 PR 合并前针对 Track D 建议补充的测试
+
+虽然主流程无回归，但为了确保 `game_ctrl` 与新协议不是“未经实测的死代码”，建议在合入 PR 前（或作为 Track D 收尾）补齐以下 **4 项轻量验证**：
+
+1. **双 DataChannel（`game_net` + `game_ctrl`）实机连通性验证**
+   - 在真实双端 WebRTC 连接下，确认 `transport.isControlChannelOpen === true`（`control_channel_open` 事件已触发），而非静默回落到 `game_net` 或 `BroadcastChannel`。
+2. **`game_ctrl` 可靠控制帧收发往返测试**
+   - 手动调用 `channel.sendRoomActivitySwitch(...)` / `channel.sendStatePausedAck(...)`，验证对端 `DataChannelTransport.drainTransportEvents()` 能正确收到对应 `room_activity_switch` / `state_paused_ack` 事件。
+3. **16B `SparsePingPong16B` 二进制帧编解码 + 通道往返**
+   - 验证 `sendSparsePingPong16B(PING_PONG_KIND_PING, ...)` 经 WebRTC 发送 `Uint8Array(16)` 后，对端 `isSparsePingPong16B` 能准确识别并自动回传 `PONG` 更新 `simulator.handlePong()`。
+4. **`HostWorkerMessageRouter` 热切换状态机单元测试 / 烟雾测试**
+   - 依次向 Worker 发送 `ROOM_ACTIVITY_SWITCH('freeplay')` -> `('match')` -> `('replay')` -> `('freeplay')`，验证 `epoch` 递增、`MatchDomainState.stateOnlyMode` 随 `ReplayActivityKernel` 正确开启与恢复。
+   - *顺手修复建议*：在 `HostWorkerMessageRouter.ts` 的 `buildWorkerRoomStateSummary()` 中补齐 `activeActivityId`、`activityEpoch`、`replicationMode` 三个字段的赋值。
+
+---
+
+## 四、 Client Telemetry 数据包分析（`rc-net-telemetry-csts-match-complete`）
+
+对 `telemetry.csv`（9,144 ticks，时长 `159.5s`）与 `metadata.json`（`clockPacingMode: "csts"`, `clockPacingPriority: "balanced"`）进行了逐行统计分析：
+
+### 1. 核心指标结论：**完全符合预期，表现优秀**
+- **链路与抖动**：`meanRttMs = 19.1ms`（max `50ms`），`jitterMs` 均值 `1.20ms`（max `9.2ms`）。
+- **时钟平滑度**：`physicsRateHz` 均值 `119.96Hz`，标准差仅 `0.287Hz`；`meanBufferTicks = 3.68`（target `3.09`），`p95BufferAbsError = 1.95 ticks`。
+- **预测与回滚精度**：
+  - **`tier3HardSnapCount = 0`**（全程零硬切闪现）。
+  - **`localPosErrorUu`**：99%+ 的 tick 为 `0.00 uu`，仅 21 个 tick > `1 uu`（max `34.73 uu`），碰撞后 2~4 tick 内收敛回 `0`。
+  - **`ballPosErrorUu`**：99%+ 的 tick 为 `0.00 uu`，仅 58 个 tick > `1 uu`（max `83.01 uu`），快速收敛。
+- **边界事件解释（均为正常现象）**：
+  - `remotePosErrorMaxUu = 4608.01`（`index=7178`）与开局 `index=0`（`2672.76`）：均为单 tick 远程车瞬移（开球/重置），下一 tick（`index=7179`）立即归 `0.00`。
+  - 3 次 `clientTickDiff > 1300` 跳跃（`index=2000, 3050, 7892`）：均伴随 `eventFlags=129`，对应进球回放 / 开球阶段切换。
+  - `starvationCount = 57`（`0.62%`）、`hardResyncCount = 1`：在 159.5s 对局中处于健康阈值内。
+
+### 2. 一个可顺手记录的调优观察（非阻塞，与 Track D 无关）
+- 在 `5,010` 次 Tier-2 回滚（占总 tick 54.8%）中，有 **95.4%（4,781 次）是在 `localPosErrorUu == 0 && ballPosErrorUu == 0` 的情况下，仅因 `remotePosErrorUu` 微小漂移（中位数 `1.59 uu`，P25 `1.12 uu`）触发的**。
+- 后续在调优 CSTS Reconciler 时，可考虑适当放宽远程车辆的 Tier-2 触发死区，以进一步降低不必要的全量回滚开销。

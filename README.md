@@ -1,55 +1,70 @@
-# RocketCompanion PR 整理与分支清理报告
+# Dynamic Training 两个 Commit 对比与玩家无输入问题排查报告
 
-## 1. 已创建的 3 个 Verified Bot PR（目标分支：`alpha`）
+## 一、`0401e7a` vs `f70fbf3` 区别对比
 
-所有提交均通过 GitHub GraphQL `createCommitOnBranch` / REST `git/trees` + `git/commits` 生成，均带有 **Verified GPG 签名**（`verified: true`），且已通过 `pnpm check`（`radar` 架构护栏 + `tsc --noEmit`）校验：
+这两个 Commit 均从同一父提交 `abeab8f`（`origin/z/agy/rc/track-c-dynamic-training`）分叉：
+- `0401e7a205e1681b987a376c9d1450af088c42eb`（`origin/z/agy/rc/track-c-audit`）
+- `f70fbf369eb1c4a3d72013bf2f30925908acb9e7`（`origin/z/agy/rc/track-c-fix-and-audit`）
 
-1. **PR #16 — Notification Collapse Toggle**
-   - 分支：`z/agy/rc/pr-notification-collapse-toggle` -> `alpha`
-   - 链接：https://github.com/Antigravi-ty/RocketCompanion/pull/16
-   - 说明：基于当前 `origin/alpha`（`ebc6e7b`）干净 cherry-pick `d3fb50c85b5d26697875c92e8fbe5601351294ef`，彻底剥离了原父提交 `c61ffe1`（`broked-alpha`）的错误合并历史。
+主要差异如下：
 
-2. **PR #17 — Transparency Glow Post + Driftwoods Hex Grid Opacity 0.03**
-   - 分支：`z/agy/rc/pr-transparency-glow-post` -> `alpha`
-   - 链接：https://github.com/Antigravi-ty/RocketCompanion/pull/17
-   - 说明：基于当前 `origin/alpha`（`ebc6e7b`）干净 cherry-pick `4e9c52717c1027c35966b48a745e0f90ed94dac2`，并将 Driftwood Stadium Tunnel Shield Hex Grid 的默认 Alpha Opacity 从 `0.22` 调整为 `0.03`：
-     - `src/ui-core/config/driftwoods.default.json` (`hexes.opacity: 0.03`)
-     - `src/ui-core/panels/dev/driftwoods-tuner/DriftwoodsTransparentTab.tsx` (`config.hexes.opacity ?? 0.03`)
-   - 已额外通过 `pnpm build` 生产构建验证。
-
-3. **PR #18 — Dynamic Training Takeover (`3e8ce00` 方案)**
-   - 分支：`z/agy/rc/pr-dynamic-training-takeover` -> `alpha`
-   - 链接：https://github.com/Antigravi-ty/RocketCompanion/pull/18
-   - 说明：基于 `3e8ce00a6cf2e51970e165c0998e34888e3a54e9` 合并 `origin/alpha`（`ebc6e7b`），解决了 `src/ui-core/stores/devFloatingPresets.ts` 中 `DYNAMIC_TRAINING_PACK_PRESET` 与 `TELESTRATOR_TOOLBAR_PRESET` 的合并冲突。
+| 维度 | `0401e7a` (`track-c-audit`) | `f70fbf3` (`track-c-fix-and-audit`) |
+| --- | --- | --- |
+| **120Hz 物理步进管线** (`SimulationStage.ts` / `DynamicTrainingMode.ts`) | 在 `SimulationStage.ts` 中把 `dynamic-training-pack` 特判到与 `kickoff-training` 相同的分支，由 `DynamicTrainingMode.onStepPhysicsTick()` 手动调用 `sim?.step?.(1)`；倒计时阶段在 `onBeforePhysicsTick()` 里调用 `stepTick()` 并返回 `false`。 | 保持 `SimulationStage.ts` 统一的 `isCustomStepMode` 路径（`physics.step(1)` + `onAfterPhysicsTick()`），`DynamicTrainingMode` 遵循标准的 `onBeforePhysicsTick()` / `onAfterPhysicsTick()` 生命周期。 |
+| **`playerCarIndex` 同步** (`DynamicTrainingMode.ts`) | **缺失**。未在 `loadAndPlayShot()` 中同步 `runtime.playerCarIndex` 和 `runtime.arena.playerCarIndex`。 | **已修复**。在 `loadAndPlayShot()` 中将 `runtime.playerCarIndex` 与 `runtime.arena.playerCarIndex` 同步为 `shot.povSlotIndex`。 |
+| **暂停时 BoostPad 冻结** (`BoostPadSystem.ts`) | **未真正修复**。仅新增了一个未使用的 `EXTENDED_STATE_OFFSETS` 导入；`safeDt` 仍为 `dt > 0 ? ... : 0.016`，`dt === 0` 时会回退到 `0.016` 继续倒计时。 | **已真正修复**。改为 `dt >= 0`（允许 `0`），并增加 `isBufferFrozen` 判断，在暂停时冻结本地 `padCooldownTimers` 并同步 `bufferCooldown`。 |
+| **双标记截取与桥接** (`ReplayViewerFloatingWindow.tsx` / `runtimeDynamicTrainingBridge.ts` / `RLRCReplaySessionController.ts`) | 在 `replayViewerStore` 中加了标记状态，但 `runtimeDynamicTrainingBridge.ts` 未把选项透传给 `extractCurrentDynamicSession()`，且未覆盖 `RLRCReplaySessionController`（`.replay` 导入器）。 | 完整实现了 `ReplayViewerFloatingWindow` 的双标记操作与 `runtimeDynamicTrainingBridge.ts` 参数透传（同时支持 `StandaloneReplayViewerController` 和 `RLRCReplaySessionController`）。 |
+| **Slot 索引排序与稀疏补齐** (`DynamicTrainingSliceExtractor.ts`) | **独有重要修复**。在 `toCompactFrame`、`compactRoster` 与 `hydrateRLRCFramesFromDynamicSession` 中按 `slotIndex` 排序，并在反序列化时按 `0..maxSlot` 补齐缺失槽位，避免车位索引错乱。 | 未包含该排序与稀疏槽位补齐逻辑。 |
 
 ---
 
-## 2. `3e8ce00` 与 `96dcecb` 的对比结论
+## 二、哪个更好？应该基于谁？
 
-**`3e8ce00` 明显更优**，原因如下：
-- **稀疏 Roster 与 Slot 错乱修复**：`3e8ce00` 在 `hydrateRLRCFramesFromDynamicSession` 中使用 `createInactiveHydratedCar` 补全空缺 slot 并按 `slotIndex` 排序，同时在 `RLRCInterveneFrameStateBuilder.ts` 中将查找改为 `findCarBySlot`（`cars[slot]` O(1) 快速路径 + `.find()` 回退）。
-- **Takeover HUD 接管倒计时修复**：`3e8ce00` 在 `GoalReplayHudOverlay.tsx` 中新增 `useDynamicTrainingPrerollHud()`，使动态训练在 `preroll-countdown` 阶段能够正确显示倒计时与队伍色彩 HUD，而 `96dcecb` 未包含此修复。
-- **玩家输入与 POV 解析修复**：`3e8ce00` 新增 `resolveEffectivePovSlot` 并在 `enterInterveneAtFrame` 之前设置 `r.playerCarIndex = resolvedPovSlot`，同时 `readPlayerControls` 兼容 `r?.playerControls ?? r?.input?.getPlayerControls?.()`，且传入 `onPhaseChanged: () => {}` 避免污染 Replay Importer 的状态。
-- *(注：`96dcecb` 唯一额外做的逻辑是在 `dynamicTrainingPackStore.ts` 中切换某个 slot 为 `player` 时自动把其他 slot 的 `player` 重置为 `as-previous`。这属于小细节，不影响 `3e8ce00` 的核心正确性，已可直接合并 PR #18。)*
+**结论：应该基于 `f70fbf3`（`origin/z/agy/rc/track-c-fix-and-audit`），并将 `0401e7a` 中 `src/replay/DynamicTrainingSliceExtractor.ts` 的 slot 排序与稀疏槽位补齐逻辑合入。**
 
----
-
-## 3. 遗留分支端头清理建议
-
-在 PR #16、#17、#18 合并进 `alpha` 后，**建议保留的未合并端头**：
-1. **Rust 端头**：`z/agy/rc/rust/audio-flip-reset-fix`（`52b8173`）—— 包含 Wave 1-4 + 音频/物理修复链路的最新节点。
-2. **P2P Voice 端头**：`z/agy/rc/track-b-voice-fix`（`3e7cf81`）—— 包含 Track B WebRTC Voice Configurator 及 P2P 信令竞争/静默修复。
-3. **可选确认**：
-   - `a2`（`de978ea`，envinit-worker 相关，如仍在使用请保留）。
-   - `z/agy/rc/track-a-telestrator-defaults`（`1db147f`）：当前 `origin/alpha` 中的笔刷默认值仍为 `width=10, arrowLength=36, arrowWidth=28, presets 100%/70%/50%`，如果你仍想要 `1db147f` 的 `5 / 60 / 30 / 100%/50%/10%`，后续可单独基于 `alpha` 再提一个小 PR；否则可连同 `broked-alpha` 一起删除。
-
-**其余端头均可安全删除**（`broked-alpha`、旧的 `notification-collapse-toggle`、`fix-transparency-glow-post`、`fix-replay-slot-takeover`、`fix-replay-slot-and-timeout`、`track-c-*`、`track-a-telestrator-*`、`telestrator-overlay-*`、已合并的 `brush-diag`/`fix-bootstrap-hangs`/`track-d-replication-bus`、以及 `rust/wave-*` 等中间过程分支）。
+理由：
+1. `f70fbf3` 的 `SimulationStage` / `DynamicTrainingMode` 生命周期接入更符合项目现有架构，且正确同步了 `playerCarIndex`。
+2. `f70fbf3` 真正修好了 `BoostPadSystem.ts` 的暂停冻结，而 `0401e7a` 的该项改动实际上无效。
+3. `f70fbf3` 的双标记截取在 UI、Bridge 和 `RLRCReplaySessionController` 三端是打通的。
+4. 唯一需要从 `0401e7a` 吸收的是 `DynamicTrainingSliceExtractor.ts` 中对 `roster` / `cars` 按 `slotIndex` 排序与缺位填充的防错乱修复。
 
 ---
 
-## 4. 为什么 Agent 总会莫名其妙一口气提交两个 Commit？
+## 三、点击 Play 有倒计时音效，但完全动不了、任何玩家输入都无效的原因
 
-常见原因有三个：
-1. **先 Merge 再 Commit（如 `848a068` + `1db147f`）**：Agent 在旧分支上工作时先执行了一次 `chore: merge alpha into <branch>` 同步上游代码（第 1 个 Commit），随后再提交自己的功能改动（第 2 个 Commit）。
-2. **先提功能 Commit 再提修复 Commit**：Agent 在第一次提交后跑 `pnpm check` / `tsc` 发现漏改或 lint 问题，习惯性直接再 `createCommitOnBranch` 补一个 `fix` Commit，而不是在本地合并成单次提交后再通过 API 一次性上树。
-3. **基于已含历史提交的旧分支继续操作**：如果分支本身已经存在未合并的父提交，Agent 在其基础上再加一次提交，对外表现就是至少两个 Commit。
+### 1. 直接根因：`DynamicTrainingMode.readPlayerControls()` 读取了不存在的方法
+在两个 Commit 的 `src/game/modes/dynamic-training/DynamicTrainingMode.ts` 中，`readPlayerControls()` 写法如下：
+
+```ts
+private readPlayerControls(): RLRCSynthesizedCarControls {
+  const r = this.runtime as unknown as {
+    input?: { getPlayerControls?: () => Partial<RLRCSynthesizedCarControls> } | null;
+  };
+  const raw = r?.input?.getPlayerControls?.();
+  if (!raw) return DEFAULT_NEUTRAL_CAR_CONTROLS;
+  ...
+}
+```
+
+**`GameRuntime` 上根本不存在 `runtime.input.getPlayerControls()`。**
+实际运行流程是：
+1. `SimulationStage` 每帧先执行 `this.runtime.pollInputs()`（`RuntimeInputPoller.ts`），把键盘/手柄输入写入 `this.runtime.playerControls` 并调用 `physics.setControls(playerCarIndex, car0Controls)`。
+2. 紧接着 `SimulationStage` 调用 `DynamicTrainingMode.onBeforePhysicsTick()` -> `readPlayerControls()`。
+3. 由于 `r?.input?.getPlayerControls?.()` 恒为 `undefined`，`readPlayerControls()` **永远返回全 0 / 全 `false` 的 `DEFAULT_NEUTRAL_CAR_CONTROLS`**。
+4. 随后 `interveneController.stepBeforePhysicsTick(playerControls, RLRC_FIXED_DT)` -> `prepareInterveneStepBeforePhysics()` 调用 `applySlotControls(sim, povSlotIndex, playerControls)`，**把 `pollInputs()` 刚写入物理引擎的玩家输入直接覆盖清零**。
+
+因此，倒计时结束进入 `intervening` 阶段（倒计时音效正常）后，物理引擎每帧收到的 POV 控制量永远是空输入，车子完全动不了。
+
+### 2. 为什么把 6 个 slots 全调成 `player` 也不起作用？
+1. POV 槽位本身就被上述 `readPlayerControls()` 的空输入覆盖了。
+2. 在 `DynamicTrainingMode.ts` 的 `mapTakeoverModeToRLRC()` 中：
+   ```ts
+   case 'as-previous':
+   case 'player':
+   default:
+     return 'follow-state';
+   ```
+   非 POV 槽位选 `'player'` 在当前实现里直接映射为 `'follow-state'`（跟随原回放轨迹），并不会读取任何本地玩家输入。
+
+### 3. 修复方向（供后续新建 `z/agy/rc/*` 分支时参考）
+将 `DynamicTrainingMode.readPlayerControls()` 改为直接读取 `this.runtime.playerControls`（即 `RuntimeInputPoller.pollInputs()` 写入的字段），即可恢复 POV 槽位的玩家输入。

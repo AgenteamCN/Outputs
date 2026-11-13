@@ -1,79 +1,69 @@
-# Track C (`abeab8fa`) 检验评估、Bug 根因调查与修复报告
+# Track C (`abeab8fa` / Dynamic Training Pack) 深度排查、修复与合并评估报告
 
-- **目标仓库**: `Antigravi-ty/RocketCompanion`
-- **基准 Commit**: `abeab8fa0462382d53bac7ac94b2d0360d6013b6` (`z/agy/rc/track-c-dynamic-training`)
-- **修复后分支**: `z/agy/rc/track-c-fix-and-audit` @ `f70fbf369eb1c4a3d72013bf2f30925908acb9e7` (GitHub Verified Bot Commit)
-
----
-
-## 一、如何检验 Track C 是否可以开始合并
-
-在将 Track C 合入 `alpha` 之前，建议按以下 4 步做门禁检验：
-
-1. **静态架构与类型门禁 (`pnpm check`)**:
-   - 运行 `pnpm check`（即 `radar.ts` + `tsc --noEmit`），确保 `0` Radar Hard Error、`0` 循环依赖、`0` 桶文件重导出、`0` 中文注释/Emoji、`0` TypeScript 严格模式错误。
-2. **生产构建验证 (`pnpm build`)**:
-   - 确保 Vite 生产包无打包/Tree-shaking 异常。
-3. **基线隔离度检查 (`git diff --stat 760a8fc..HEAD`)**:
-   - 确认 Track C 仅改动其职责范围内的 27 个核心文件（`src/game/modes/dynamic-training/`、`src/replay/DynamicTrainingSliceExtractor.ts`、`src/ui-core/config/dynamicTrainingPack*`、`src/ui-core/stores/dynamicTrainingPack*`、`src/ui-core/panels/dev/dynamic-training/`、`src/ui-system/core/runtimeDynamicTrainingBridge.ts` 等），未污染无关模块。
-   - **注意**: `abeab8fa` 分叉自 `760a8fc`，早于 `alpha` 上的 PR #10 / #11 / #13，合并时建议先 `rebase` 或 `--no-ff` 解决 `alpha` 最新提交的对齐。
-4. **运行时关键路径实测**:
-   - 使用真实 `.rcreplay` / `.RCReplay` 截取 `.RCDPack` 后，验证：
-     1. 3-2-1 倒计时是否为严格 120Hz 实时秒数（而非随渲染帧率快慢变化）；
-     2. 进入 `intervening` 后物理速度是否为严格 1.0x（120Hz）；
-     3. 设为 `As Previous` 的非 POV 车辆在接管后是否继续执行原回放动作直至 `Origin End`。
-
-**结论**: 原始 `abeab8fa` **不可直接合并**（存在下面第 2 节所述的 120Hz 双重步进与截断至 `t0` 导致 `As Previous` 失效等阻塞 Bug）；在合入本次 `f70fbf3` 修复后，已具备合入条件。
+**工作分支**：`z/agy/rc/track-c-audit`（基于 `abeab8fa0462382d53bac7ac94b2d0360d6013b6`）  
+**已推送 Verified Commit**：[`0401e7a205e1681b987a376c9d1450af088c42eb`](https://github.com/Antigravi-ty/RocketCompanion/commit/0401e7a205e1681b987a376c9d1450af088c42eb) (`signature.isValid: true`)
 
 ---
 
-## 二、问题根因调查 (`1.RCDPack` 与 `rc-replay-3v3-1-0-2026-11-13T07-26-58.rcreplay.gz`)
+## 一、实测 Bug 根因定位与已落地的修复
 
-### 1. 为什么 3-2-1 倒计时莫名其妙，结束后速度变得飞快？
-- **根因**:
-  1. `src/game/pipeline/stages/SimulationStage.ts` 中的 `CUSTOM_STEP_MODES` 集合**漏掉了 `'dynamic-training-pack'`**。
-  2. `DynamicTrainingMode.ts` 没有实现 `onBeforePhysicsTick()` / `onAfterPhysicsTick()`，而是在每帧渲染回调 `update(context)` 中直接调用 `this.interveneController.stepTick(...)`（内部会调用 `physics.step(1)`）。
-- **后果**:
-  - **倒计时阶段 (`preroll-countdown`)**: `SimulationStage` 仍在以 120Hz 自动调用 `physics.step(1)`，而 `DynamicTrainingMode.update()` 仅按渲染帧率（如 60fps）每帧把物理状态覆写回 `prerollFrame` 并只扣减 1 个 tick——导致 60fps 下 3 秒倒计时实际耗时 6 秒，且物理引擎在两帧之间空转抖动。
-  - **接管阶段 (`intervening`)**: `SimulationStage` 以 120Hz 调用 `physics.step(1)`，同时 `DynamicTrainingMode.update()` 每渲染帧**再次调用 `physics.step(1)`**，导致物理速度变成 **1.5x ~ 3x+（取决于显示器刷新率）**，即“结束后突然速度变得飞快”。
+### 1. 导出 `1.RCDPack` 在 frame 2775「完全没对上」的根因（已修复）
+- **根因**：对用户提供的 `1.RCDPack` 与 `rc-replay-3v3-1-0-2026-11-13T07-26-58.rcreplay.gz` 逐帧比对发现：
+  - 球的位置完全一致（frame `2772` 均位于 `[-2020.60, 2259.54, 668.63]`）。
+  - 但 `1.RCDPack` 中 `roster` 与每帧 `cars` 数组顺序为 `[3, 4, 5, 0, 1, 2]`（`ReplayViewerRosterSubController.resolvedRoster` 将 Player 所在队伍排在前面），而 `DynamicTrainingSliceExtractor.ts` 直接按 `roster` 顺序写入 `cars` 并透传给 `hydrateRLRCFramesFromDynamicSession`。
+  - 下游 `RLRCInterveneTargetFrameApplier` / `RLRCInterveneNonPovSyncPipeline` / `RLRCIntervenePrerollHistoryInjector` 全部按 **数组下标 `frame.cars[slot]`** 取车。结果 **Slot 0 (`Nexto #4`) 拿到了 Car 3 (`Player`) 的位置/速度/朝向，Slot 3 (`Player`) 拿到了 Car 0 (`Nexto #4`) 的数据**，整场 6 辆车全部错位。
+- **修复**（`src/replay/DynamicTrainingSliceExtractor.ts`）：
+  1. `extractDynamicSessionFromReplayFrames` 与 `extractDynamicSessionFromRLRCFrames` 提取前强制按 `slotIndex` 升序排列 `roster` 与 `cars`。
+  2. `hydrateRLRCFramesFromDynamicSession` 按 `car.slotIndex` 建立槽位索引数组 `cars[slot]`（即使加载之前已导出的 `1.RCDPack` 旧文件也能自动纠正错位）。
+  - **实测验证**：用 `1.RCDPack` + `.rcreplay.gz` 跑 Node 校验，6 辆车 `slotIndex` 全部对齐 `0..5`，位置误差 `0.000000`。
 
-### 2. 为什么 2775 / 2883 导出后“完全没对上”？
-我们用仓库原生的 `deserializeRCReplayBinaryContainer` 解析了 `rc-replay-3v3-1-0-2026-11-13T07-26-58.rcreplay.gz`，并与 `1.RCDPack` 逐帧比对：
-- `1.RCDPack` 的 `Session 0` 记录 `sourceFrame120Hz = 2772`、`ballPos = [-2020.60, 2259.54, 668.63]`，与原回放第 2772 帧**完全一致**；`Session 1` 记录 `sourceFrame120Hz = 5292`、`ballPos = [-2502.53, -326.77, 675.59]`，与原回放第 5292 帧**完全一致**。
-- **真正导致“对不上”的原因有两点**:
-  1. **旧截取逻辑在 `t0` 处截断，没有保留 `t0` 之后的帧**: `1.RCDPack` 只存了 `[t0 - 479 .. t0]` 共 480 帧。当进入 `intervening` 时，`RLRCInterveneNonPovSyncPipeline` 按 `followIdx = targetFrame120Hz + postTakeoverFrameOffset`（即 `479 + 0, 480, 481...`）读取 `frames[480]`，结果全部是 `undefined`，所有设为 `As Previous` 的 5 辆 Nexto 车在接管第 1 帧就全部失去控制输入（退化为 `no-input`），场面与预期完全脱节。
-  2. 叠加上述 **2x–3x 物理倍速 Bug**，导致接管后球和车瞬间飞走。
+### 2.「3-2-1 倒计时莫名其妙」与「倒计时结束后速度突然飞快」的根因（已修复）
+- **根因**：双重步进 + 帧率耦合：
+  1. `SimulationStage.ts` 的 `CUSTOM_STEP_MODES` 集合中**遗漏了 `'dynamic-training-pack'`**，导致 `SimulationStage` 的 120Hz `interpolator.update()` 不断调用 `physics.step(1)`。
+  2. 与此同时，`DynamicTrainingMode.update(context)` 又在 **渲染帧率（60/120/144Hz）** 下调用 `this.interveneController.stepTick(...)`，内部再次调用 `physics.step(1)`。
+  3. 结果：倒计时阶段渲染线程按 60Hz 拉回 pre-roll 帧而 `SimulationStage` 仍在 120Hz 偷跑物理（导致画面抖动、3 秒倒计时被拉长到 ~6 秒）；进入 `intervening` 后两边同时调 `physics.step(1)`，物理流速直接翻倍（2x+ 飞快）。
+- **修复**：
+  - `src/game/pipeline/stages/SimulationStage.ts`：将 `'dynamic-training-pack'` 加入 `CUSTOM_STEP_MODES`，并在 `interpolator.update` 回调中路由到 `onStepPhysicsTick()`。
+  - `src/game/modes/dynamic-training/DynamicTrainingMode.ts`：将 pre-roll 倒计时与 `intervening` 物理步进从 `update()` 迁入 `onBeforePhysicsTick()` / `onStepPhysicsTick()`，由 120Hz 累加器单源确定性驱动。
 
-### 3. 为什么回放暂停时地面 Boost Pad 充能动画在抖？
-- **根因**: `src/entities/BoostPadSystem.ts` 第 269 行：
-  `const safeDt = Number.isFinite(dt) && dt > 0 ? Math.min(0.25, dt) : 0.016;`
-  即使传入 `dt === 0`，也会回退成 `0.016`。在回放暂停期间，每渲染帧都会把 `padCooldownTimers[i]` 减去 `0.016` 秒，充能进度条向前推进约 `0.5s` 后触发第 305 行的纠偏阈值 `Math.abs(padCooldownTimers[i] - bufferCooldown) > 0.5`，瞬间又弹回 `bufferCooldown`，周而复始产生明显抖动。
+### 3. 只有「接管前 4 秒」导致后续 `as-previous` 失控：两段式标签区间（已修复）
+- **问题**：原实现仅截取 `[t0 - 480 + 1, t0]`，`t0` 之后没有帧数据，导致 `as-previous`（`follow-state`）在接管后第 1 帧就因 `frames[followIdx]` 为 `undefined` 而失去原始轨迹。
+- **修复**：
+  - `dynamicTrainingPackTypes.ts` / `DynamicTrainingSliceExtractor.ts`：为 `DynamicTrainingStateSession` 新增 `interveneFrameOffsetInSession` 与 `originalMovementEndFrame120Hz`，支持截取 `[max(0, t0 - 479), max(t0, tEnd)]`。
+  - `DynamicTrainingMode.ts`：`startShot` 改以 `session.interveneFrameOffsetInSession` 作为接管锚点（兼容旧 4 秒切片）。
+  - `replayViewerStore.ts` / `StandaloneReplayViewerController.ts` / `ReplayViewerFloatingWindow.tsx`：新增 **`Tag Intervene From`** 与 **`Tag Movement End`** 两个打标按钮及状态存储，导出时按双标签区间切片。
 
----
+### 4. RCDPack 悬浮窗改用标准 UI 组件 & 禁用 `Optional POV Car Spawn Variation`（已修复）
+- `DynamicTrainingPackManagerSection.tsx` & `DynamicTrainingShotEditorCard.tsx`：将原生 `<select>` / `<button>` / `<input type="checkbox">` 替换为标准 `DropdownMenu`、`Button`、`SegmentedSwitch`、`Checkbox`。
+- 将 `Optional POV Car Spawn Variation` 设为 `disabled` 并标注为 **`Optional POV Car Spawn Variation (under evaluation)`**。
 
-## 三、本次修复内容 (`z/agy/rc/track-c-fix-and-audit`, commit `f70fbf3`)
-
-1. **修复 120Hz 确定性物理步进与倒计时**:
-   - `src/game/pipeline/stages/SimulationStage.ts`: 将 `'dynamic-training-pack'` 加入 `CUSTOM_STEP_MODES`。
-   - `src/game/modes/dynamic-training/DynamicTrainingMode.ts`: 移除 `update()` 中的 `stepTick`，改为实现 `onBeforePhysicsTick()` / `onAfterPhysicsTick()` 由 `SimulationStage` 的 120Hz 固定步长累加器驱动；同步设置 `runtime.playerCarIndex = shot.povSlotIndex`；使用 `session.interveneLocalFrameIndex ?? (frames.length - 1)` 作为接管锚点。
-2. **新增双标签区间截取 (`Mark Intervene` + `Mark Origin End`)**:
-   - `src/ui-core/config/dynamicTrainingPackTypes.ts`: 为 `DynamicTrainingStateSession` 新增可选字段 `originEndFrame120Hz` 与 `interveneLocalFrameIndex`（向后兼容旧 `.RCDPack`）。
-   - `src/replay/DynamicTrainingSliceExtractor.ts`: 支持传入 `originEndFrameIndex`，截取 `[prerollStart .. originEnd]`（若未显式标记 `Origin End`，默认向后多保留 4 秒 / 480 帧，保证 `As Previous` 车辆不会在接管瞬间断输入）。
-   - `src/ui-core/panels/user/ReplayViewerFloatingWindow.tsx`、`replayViewerStore.ts`、`replayToRcsImporterStore.ts`、`StandaloneReplayViewerController.ts`、`RLRCReplaySessionController.ts`、`runtimeDynamicTrainingBridge.ts`: 新增 **`Mark Intervene`** 与 **`Mark Origin End`** 两个打点按钮及 **`Capture Segment into Dynamic Training Pack (.RCDPack)`** 透传。
-3. **修复暂停时 Boost Pad 充能动画抖动**:
-   - `src/entities/BoostPadSystem.ts`: 允许 `dt === 0` 保留为 `0`；当 `!wasActive && !isActive` 且 `safeDt === 0` 或 `Math.abs(bufferCooldown - prevBufferCd) < 1e-6`（即 `stateBuffer` 冷却值冻结在同一帧）时，锁定 `padCooldownTimers[i] = bufferCooldown`，不再随渲染帧率递减回弹。
-4. **RCDPack 悬浮窗改用 `ui-core` 标准组件 & 禁用未定项**:
-   - `src/ui-core/panels/dev/dynamic-training/DynamicTrainingPackManagerSection.tsx`: 将原生 `<select>` 替换为标准 `DropdownMenu`。
-   - `src/ui-core/panels/dev/dynamic-training/DynamicTrainingShotEditorCard.tsx`: 将倒计时 `<select>` 替换为标准 `SegmentedSwitch`（`0s | 1s | 2s | 3s`），将 per-car takeover 与 AI 模型 `<select>` 替换为标准 `DropdownMenu`，并将 `Optional POV Car Spawn Variation` 替换为禁用态标准 `Checkbox` 并标注 **`(under evaluation)`** 禁止点击。
-
-### 验证结果
-- `pnpm check`: **GREEN**（`1364/1364` TS 文件、`tsc --noEmit` 0 错误、0 循环依赖、0 硬边界违规）。
-- `pnpm build`: **PASS**（28.31s 构建成功）。
-- 实测脚本（`node --experimental-strip-types` 使用 `rc-replay-3v3-1-0-2026-11-13T07-26-58.rcreplay.gz` 截取 `intervene=2775, originEnd=2883`）：输出 `framesLen=588`、`interveneLocalFrameIndex=479`、`prerollStartFrame120Hz=2296`、`originEndFrame120Hz=2883`，球位置与原回放第 2775 / 2883 帧精确对齐。
+### 5. 回放暂停/冻结时地面 Boost Pad 动画抖动（已修复）
+- **根因**：`src/entities/BoostPadSystem.ts` 在 `!isActive` 时每帧都会 `padCooldownTimers[i] -= safeDt`，当与 `stateBuffer` 中静态的 `bufferCooldown` 偏差超过 `0.5s` 时又强行拉回 `bufferCooldown`，形成每 0.5 秒循环一次的充能环抖动。
+- **修复**：检测 `EXTENDED_STATE_OFFSETS.IS_SIMULATION_FROZEN` 或 `bufferCooldown` 与上一帧完全一致（静态冻结）时，停止递减 `padCooldownTimers[i]` 并直接锁定为 `bufferCooldown`。
 
 ---
 
-## 四、关于 Replay 500% Playback Speed 与网络广播频率的说明
+## 二、关于「500% 回放倍速是否会每秒发 600 个包」的结论
+- **不会，且网络广播频率由 Track D/F 管，不由 Replay 倍速决定**：
+  - `ReplayTakeoverSubController` / `RLRCReplaySessionBridgePipeline` 在 500% 倍速下是在 **120Hz tick 内将游标步长放大为 `5.0` 帧/tick**（跳帧推进），tick 频率本身仍是 120Hz，并非跑到 600Hz。
+  - 联机房间的网络快照广播频率由 Track D 的 `RoomReplicationBus`（Continuous 60/120Hz 或 Sparse 2Hz Ping-Pong）与 `AuthoritativeServerHost` 的固定发送节拍控制，与本地回放倍速彻底解耦。
 
-- **归属**: **不归 Track C 管**，属于 **Track D (`RoomReplicationBus`) + Track F (`MatchSystemControlSubController` / Replay 多人观战室)**。
-- **架构建议**: `500%` 仅控制 Host 端回放游标的前进倍速（`cursorFloat += 5.0 * dt * 120`），**网络快照广播频率必须与 Playback Speed 解耦并设置硬上限（如 30Hz 或 60Hz）**，绝对不能按 `500% * 120Hz = 600 packets/sec` 发送；Client 端收到状态包后通过本地插值/重采样平滑播放即可。
+---
+
+## 三、如何检验 Track C 是否具备合并条件（Merge Readiness Checklist）
+
+建议按以下 4 步验收，全部通过即可合并到 `alpha`：
+1. **静态与架构门禁**（本次已通过）：
+   - `pnpm run check`（Radar 2.0 + `tsc --noEmit`）0 Error。
+   - `pnpm run build` 生产构建通过。
+2. **数据与槽位一致性回归**（本次已通过）：
+   - 对 `1.RCDPack` 与真实 3v3 `.rcreplay.gz` 验证 `frame.cars[slot].slotIndex === slot` 且全员 6 车坐标误差 `0.000000`。
+3. **浏览器交互实测（待您本地端到端确认）**：
+   - 在 Replay Viewer 加载 `rc-replay-3v3-1-0-2026-11-13T07-26-58.rcreplay.gz`：
+     - 暂停在含正在充能 Boost Pad 的帧，确认地面 Boost Pad 充能环**完全静止不抖动**。
+     - 在 `2775` 打 `Tag Intervene From`，在后续节点（如 `3015`）打 `Tag Movement End`，点击 `Put into Dynamic Training Pack (.RCDPack)`。
+     - 点击 Play：确认 6 辆车位置/车型/队伍与回放完全一致、3-2-1 倒计时为正常 1:1 实时秒数、倒计时结束后物理流速正常 1x。
+     - 测试 `5275` 场景下的 5 种接管模式（`player` / `as-previous` / `disappear` / `no-input` / `model`）。
+4. **后续仍可作为 Track C2 / Track F 联动项（不阻塞本次基础合并）**：
+   - `tEnd`（`originalMovementEndFrame120Hz`）之后，原本处于 `as-previous` 的车辆在序列结束后的默认行为目前会保持最后一帧控制输入/惯性滑行；后续可按需增加「`tEnd` 后自动转为 `no-input` 或 `model`」的显式选项。
+   - `RLRCReplayToRcsImporter` 如需同样的双标签按钮，可复用 `useReplayViewerStore` 的同款双标签模式。

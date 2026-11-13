@@ -1,69 +1,46 @@
-# RocketCompanion UI SF Mono 字体栈修复与分支清理报告
+# Track B Report: Native WebRTC Voice Channel & Developer Settings Controls
 
-## 1. 已合入 `alpha` 的历史分支清理
+- **Branch**: `z/agy/rc/track-b-webrtc-voice`
+- **Verified Commit**: [`1051b1028180250de6f45ec8c3ac1e20b6cb2e65`](https://github.com/Antigravi-ty/RocketCompanion/commit/1051b1028180250de6f45ec8c3ac1e20b6cb2e65) (`signature.isValid: true`, `state: VALID`)
 
-在确认无未合并提交（`git rev-list --count origin/alpha..<branch> == 0`）且无关联 Open PR 后，已安全清理 **26 个** 确认合并到 `origin/alpha` 的 `z/agy/*` 历史分支（保留了 `alpha`、`a2`、`z/user/*` 及未合入分支）：
+## 1. Implemented Architecture (Radar 2.0 Compliant)
 
-- `z/agy/fix-profile-sync` (`80e36ae`)
-- `z/agy/rc/fix-hud-telemetry-and-transport-rtt` (`daf3361`)
-- `z/agy/rc/fix-input-starvation-and-host-loopback` (`00a5442`)
-- `z/agy/rc/fix-join-room-state-and-ui` (`4db613a`)
-- `z/agy/rc/fix-kickoff-replay-freeze` (`39cdc82`)
-- `z/agy/rc/fix-lobby-goal-reset-and-memory-footprint` (`01b2644`)
-- `z/agy/rc/fix-multiplayer-reconcile-and-lobby-diag` (`2634cf2`)
-- `z/agy/rc/fix-online-host-probe-trajectory` (`69b9c50`)
-- `z/agy/rc/fix-room-ui-and-setstate-in-render` (`7c0f450`)
-- `z/agy/rc/hex-thickness-tuning` (`7e776ea`)
-- `z/agy/rc/light-trail-effects` (`77f1996`)
-- `z/agy/rc/multiplayer-fixes-octopus` (`6dd92f1`)
-- `z/agy/rc/multiplayer-octopus-merge` (`b10419f`)
-- `z/agy/rc/performance-boost-tuner` (`391df02`)
-- `z/agy/rc/radar-output-compact` (`1730391`)
-- `z/agy/rc/replay-boxcars-prober` (`e492dab`)
-- `z/agy/rc/replay-smooth-and-viewer-unify` (`5453721`)
-- `z/agy/rc/repro-multiplayer-room` (`c891cdc`)
-- `z/agy/rc/rlrc-replay-fixes` (`677b64b`)
-- `z/agy/rc/tarui/configurator-refinements` (`ca3b841`)
-- `z/agy/rc/tauri/dock-tray-lifecycle-fix` (`9de427e`)
-- `z/agy/rc/tauri/icon-and-build-id` (`3fa2386`)
-- `z/agy/rc/tauri/tray-and-promotion` (`1cfe096`)
-- `z/agy/rc/unify-multiplayer-repro-harness` (`2d4a607`)
-- `z/agy/ui/rework-fixes` (`af69934`)
-- `z/agy/ui/triage-infra` (`cb7ed4d`)
+### A. Decoupled Voice Bridge (`src/audio/voice/`)
+- `IVoiceAudioBridge.ts`: Defines the narrow anti-corruption port (`IVoicePeerConnectionPort`, `IVoiceAudioBridge`, `VoiceRenegotiationSignal`, `VoicePeerAttachmentOptions`, `VoicePeerStateSnapshot`) with `0%–250%` volume clamping (`clampVoiceVolumePct`).
+- `WebRtcNativeVoiceBridge.ts`: Native WebRTC voice implementation using `RTCPeerConnection.addTrack` (Opus) and Web Audio API:
+  - **Default OFF & Explicit Permission Gating**: Never requests microphone permission on startup. Only calls `navigator.mediaDevices.getUserMedia(...)` when the user explicitly toggles Voice Chat ON in Developer Settings; toggling OFF stops all local tracks and removes outbound senders.
+  - **Input Constraints**: Configurable `echoCancellation`, `noiseSuppression`, and `autoGainControl` (applied at `getUserMedia` and dynamically updated via `track.applyConstraints`).
+  - **0%–250% Per-Player & Master Amplification**: Uses `AudioContext.createMediaStreamSource(remoteStream) -> GainNode (0.0–2.5) -> AnalyserNode -> MasterVoiceGain (0.0–2.5) -> DynamicsCompressorNode (optional Output Safety Limiter) -> AudioContext.destination` (bypassing HTML `<audio>.volume`'s 100% cap while preventing clipping). Includes the muted `<audio>` element sink workaround for Chromium remote WebRTC stream decoding.
+  - **Mid-Session Renegotiation**: Supports `voice_offer` / `voice_answer` / `voice_identity` signaling over the existing DataChannel so voice can be toggled on/off without tearing down the multiplayer session.
+  - **No Spatial Attenuation & No Roof Indicator**: Kept as clean, unattenuated team-comms audio per product requirements.
 
----
+### B. Transport Isolation (`src/network/transport/`)
+- `dataChannelFramingPipeline.ts`, `DataChannelTransport.ts`, and `P2PWebRTCChannel.ts`: Added `voice_signal` control-frame parsing, `sendVoiceSignal`, `onVoiceSignal`, and `playerId` / `isRegisteredPlayerId` metadata fields.
+- Zero imports from `src/audio/` inside `src/network/transport/` (0 Radar transport isolation violations).
 
-## 2. SF Mono 字体栈修复详情
+### C. Registered Player ID Flag & Cloud Profile Sync (`src/ui-core/`)
+- `voiceChatConfig.ts` & `voiceChatStore.ts`:
+  - Distinguishes **Registered** player IDs (`cloudProfileSyncStore.loggedInUser.userId`, `isRegistered: true`) from **Guest/Ephemeral** peer IDs (`isRegistered: false`).
+  - Per-player volume (`0%–250%`) and mute states for `isRegistered === true` players are persisted under `rc_voice_chat_prefs_v1` and synced via `cloudProfileSnapshotCollector.ts` (`SYNCABLE_EXTRA_STORAGE_KEYS`).
+  - Ephemeral guest peer IDs are kept in session-only memory (`sessionPeerVolumes` / `sessionPeerMuted`) so random `peer_...` IDs do not pollute cloud profiles.
+  - `enabled` is intentionally never persisted as `true` so microphone permission is always explicitly requested by user action.
 
-基于 `origin/alpha` 创建了新分支 **`z/agy/ui/fix-sf-mono-font-stack`**，完成以下解耦与修复：
+### D. Developer Settings UI & Runtime Bridge (`src/ui-core/recipes/settings/`, `src/ui-system/core/`, `src/game/`)
+- `VoiceChatSettingsSection.tsx` mounted in `AdvancedTab.tsx` (Developer Settings):
+  - Master Voice Chat toggle (Default OFF, shows browser permission state)
+  - Mute Local Mic toggle + live Microphone Input Level bar
+  - Input Noise Suppression (WebRTC NS) & Echo Cancellation / Auto Gain (AEC / AGC) toggles
+  - Voice Output Master Gain slider (`0%–250%`) + Output Safety Limiter toggle
+  - Per-Player Voice Mix list with `Registered` vs `Guest` Player ID indicator, Mute button, and `0%–250%` volume slider
+- `runtimeVoiceBridge.ts` + `runtimeEngineUiPort.ts` + `runtimeBridgeAdapter.ts` + `runtimeUiPort.ts` + `RuntimePostprocessingAndSessionBootstrap.ts`: Wires peer connection attach/detach and local `cloudProfileSyncStore` identity exchange on `onPeerConnected`.
 
-### 2.1 全局 CSS Token 修正
-- `ui-system.css` & `ui-tuner.css`：
-  - 将 `--font-mono` 调整为 `ui-monospace, SFMono-Regular, "SF Mono", "JetBrains Mono", Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace`，确保 Apple 设备优先匹配系统 SF Mono，非 Apple 设备自动 fallback 到 JetBrains Mono。
-  - 移除已废弃的 `--font-jetbrains` 变量（零历史包袱）。
+## 2. Output Denoising Evaluation (Industry Options)
+- **Input Denoising**: Handled natively by WebRTC (`noiseSuppression: true`, `echoCancellation: true`, `autoGainControl: true`) in Chromium/Tauri WebView with zero bundle overhead.
+- **Output Denoising (Remote Peer Audio)**:
+  - **Current**: Web Audio `DynamicsCompressorNode` safety limiter prevents distortion/clipping when boosting quiet teammates up to `250%`.
+  - **Recommended Library if Neural Output Denoising is Needed Later**: Instead of building custom DSP/spectral subtraction, integrate **`@sapphi-red/web-noise-suppressor`** (AudioWorklet + RNNoise/Speex WASM, MIT license, ~50–100KB WASM) or **`@jitsi/rnnoise-wasm`** into the remote peer `AudioWorkletNode` slot between `MediaStreamAudioSourceNode` and `GainNode`.
 
-### 2.2 `ui-core/tokens` 集中化字体 Token（消除多处重复定义）
-- 新增 `typography.ts`（位于 `tokens` 层，严格遵守 `config <- tokens <- stores <- ...` 单向分层架构），导出 `MONO_FONT_STACK` 与 `APPLE_SANS_FONT_STACK`。
-- 移除 `QuickNotification.tsx` 与 `dialogueStyles.tsx` 中重复定义的 `MONO_FONT_STACK`，并将 `QuickNotification.tsx`、`QuickNotificationToastCard.tsx`、`QuickNotificationPage.tsx`、`Dialogue.tsx` 统一改为直接从 `tokens/typography` 导入。
-- 更新 `CircularBoostGauge.tsx`、`EventImpulseScatterChart.tsx`、`telemetrySparklinePainter.ts` 的 Canvas `ctx.font` 使用集中化的 `MONO_FONT_STACK`。
-- 更新 `mainMenuStyleStore.ts`，移除本地 `"JetBrains Mono"` 前置栈，直接复用 `APPLE_SANS_FONT_STACK` 与 `MONO_FONT_STACK`。
-
-### 2.3 NameTag 默认字体与 Renderer 兜底修正
-- `nameTagConfig.ts`：将 `fontFamily` 与 `singleCharFontFamily` 默认值从 `'jetbrains-mono'` 切换为 `'sf-mono'`，并将 `resolveNameTagFontFamilyCss` 中 `sf-mono` 分支的 `ui-monospace, SFMono-Regular` 移至首位。
-- `nameTagOffscreenRenderer.ts`：兜底字体栈同步调整为 `ui-monospace, SFMono-Regular, "SF Mono", "JetBrains Mono", Menlo, Monaco, Consolas, monospace`。
-
-### 2.4 统一替换 `var(--font-jetbrains)` 为 `var(--font-mono)`
-- `ui-core`：`PlayModeCard.tsx`、`playModeCardHelpers.tsx`、`EdgePlayerHudStrip.tsx`、`StepperScoreboardHUD.tsx`、`InGameHUD.tsx`、`TemporalReplayFooterHUD.tsx`、`CenterUpperInfoHUD.tsx`、`TakeoverCountdownHUD.tsx`。
-- `ui-tuner`：`MainMenuTypographyAndOutlineSection.tsx`、`TakeoverArchetypesSection.tsx`、`TakeoverStageCanvas.tsx`、`PlayCardWatermarkAndColorTuner.tsx`、`CenterUpperStageCanvas.tsx`、`CenterUpperArchetypesSection.tsx`、`HudSpatialChoreographyStageCanvas.tsx`、`DialogueSlotControlPanel.tsx`、`DialogueButtonManagerColumn.tsx`。
-
----
-
-## 3. 验证与提交结果
-
-- **架构与类型检查 (`pnpm run check`)**：`radar` + `tsc --noEmit` 全部通过（1354/1354 TS 文件，0 循环依赖，0 越层引用，0 值重导出，状态 `GREEN`）。
-- **生产构建 (`pnpm run build`)**：`vite build` 成功（3732 modules transformed）。
-- **Verified Commit**：
-  - 分支：`z/agy/ui/fix-sf-mono-font-stack`
-  - Commit SHA：`2dfd5c9e98410d4635de9754761b0b1fee1a5d49`
-  - 签名状态：`isValid: true` (`VALID`)
-  - URL：https://github.com/Antigravi-ty/RocketCompanion/commit/2dfd5c9e98410d4635de9754761b0b1fee1a5d49
+## 3. Verification Results
+- `pnpm run format:check` / `npx prettier`: **PASS**
+- `pnpm run check` (`scripts/radar.ts` + `tsc --noEmit`): **PASS** (1359/1359 TS files, 0 Circular Deps, 0 Boundary Violations, 0 TS Errors)
+- `pnpm run build` (Vite production bundle): **PASS** (`dist/` built in 28.19s)

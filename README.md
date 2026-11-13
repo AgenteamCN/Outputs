@@ -1,42 +1,33 @@
-# Wave 4 Implementation Report (`z/agy/rc/rust/wave4-room-kernels-csr-soak`)
+# Wave 2 Completion Report: UE3 `.replay` NetStream & Touch Timeline Rust Offload
 
 - **Repository**: `Antigravi-ty/RocketCompanion`
-- **Base Commit**: `b88102a`
-- **Branch**: `z/agy/rc/rust/wave4-room-kernels-csr-soak`
-- **Verified Bot Commit**: `50b9b01d92d2a1c62aa1f7c5129bb16e5aab4157` (`https://github.com/Antigravi-ty/RocketCompanion/commit/50b9b01d92d2a1c62aa1f7c5129bb16e5aab4157`)
+- **Base Commit**: `b88102a60527e50892564b15b7ff2e1acee401c0`
+- **Branch**: `z/agy/rc/rust/t5-wave2-ue3-replay`
+- **Verified Bot Commit**: [`1409ec743742b234f3b2843a6fd195a987818802`](https://github.com/Antigravi-ty/RocketCompanion/commit/1409ec743742b234f3b2843a6fd195a987818802) (`signature.isValid: true`, `state: VALID`)
 
-## 1. Summary of Changes
+## Summary of Implemented Work
 
-### 1.1 Room Activity Protocol & Hot-Swappable Kernels (`net-04-room-orchestrator-and-kernels`)
-- **`src/network/protocol/RoomActivityProtocol.ts`**: Defined `RoomActivityId` (`freeplay | match | replay_intervene | sandbox`), `ACTIVITY_MODE_FLAGS` bitmask (`SKIP_SCORE_CLOCK`, `SKIP_TELESTRATOR`, `CSR_FOLLOW_HOST`, `SPARSE_FREEZE_MODE`, `TRAINING_RULESET`), `RoomActivitySwitchPayload`, `RoomActivityStateSummary`, `SpectatorTimelineCommand`, `InterveneAuthorizationRequest`, `InterveneHandoffState`, `CsrFollowHostPayload`, and 8-byte binary codec (`encodeCsrFollowHostPacket` / `decodeCsrFollowHostPacket`).
-- **`src/network/protocol/HostWorkerProtocol.ts`**: Added `ROOM_ACTIVITY_SWITCH`, `SPECTATOR_TIMELINE_CMD`, `INTERVENE_HANDOFF_CMD`, and `CSR_FOLLOW_HOST_SYNC` to `HOST_WORKER_MSG_TYPES`.
-- **`src/network/server/activities/`**:
-  - `ActivityKernelPort.ts`: Narrow interface & context port for hot-swappable room kernels.
-  - `FreeplayActivityKernel.ts`: Decoupled multiplayer Freeplay kernel (no scoring/clock freeze, unlimited boost, `disableGoalReset`, ball reset, ghost/solid collision hot-toggle).
-  - `MatchActivityKernel.ts`: Pure competitive Match kernel delegating to `MatchSessionAdmin` without freeplay/sandbox flags.
-  - `SandboxActivityKernel.ts`: Developer Sandbox kernel supporting custom state broadcast and experimental mode switching.
-  - `ReplayInterveneActivityKernel.ts`: Coordinates `SpectatorRoomTimelineController` and `InterveneHandoffCoordinator`.
-  - `RoomActivityOrchestrator.ts`: Hot-swaps active kernels without disconnecting peer sessions and tracks `CsrFollowHostPayload` broadcast state.
-- **Router & Host Wiring**:
-  - Updated `src/network/server/workerReplayAndDiagnosticsRouter.ts` (`WorkerRouterContext.activityOrchestrator`), `src/network/server/HostWorkerMessageRouter.ts` (`buildWorkerRoomStateSummary`, `routeProtocolMessageInWorker`), and `src/network/server/AuthoritativeServerHost.ts` (`switchRoomActivity`, `sendSpectatorTimelineCommand`, `requestInterveneHandoff`, `broadcastCsrFollowHostState`).
+### 1. `t5-01-ue3-bitstream-and-actor-parser` (Rust UE3 `.replay` Decoder in `crates/rc_replay_codec/src/`)
+- **`ue3_crc.rs`**: Rocket League CRC32 (`0x04c11db7`, seed `0xefcbf201`), `Ue3ByteReader`, `read_ue3_property_tree`, and `read_ue3_table`.
+- **`ue3_bitreader.rs`**: LSB-first `Ue3BitReader` (`read_bits_max`, `read_compressed_vector`, `read_rotation_short`, `read_compressed_quat`, `read_fixed_compressed_quat`).
+- **`ue3_prop_types.rs` & `ue3_catalog.rs`**: 45-variant `PropType` enum, `infer_property_type`, UE3 class hierarchy normalization, `build_spawn_trajectory_lookup`, and `build_class_net_cache_lookup`.
+- **`ue3_attributes.rs` & `ue3_prober.rs`**: Version-aware `decode_property_attribute` for all 45 property types, `is_valid_frame_header`, and speculative `probe_unknown_property_bitwidth`.
+- **`ue3_header.rs`**: Part 1 & Part 2 `.replay` header/table parser with dual CRC validation and goals/tickmarks/keyframes bookmark extraction.
+- **`ue3_pad_tracker.rs`, `ue3_actor_state.rs`, `ue3_netstream.rs`**: 34-pad spatial coordinates (`STANDARD_PADS_XY_BIG`), `find_nearest_pad`, `NetStreamExtractState` (actor-to-slot mapping, roster/camera/paint/loadout/demolish/boost-pad tracking), and `decode_ue3_netstream` bitframe loop.
+- **`ue3_resample.rs`**: `resample_ue3_timeline_to_storage` (120Hz Hermite/SLERP resampling, 34-pad boost cooldowns, inverse control packing, Track 0 metadata floats `440..448`).
 
-### 1.2 Spectator Room, 4-3-2-1-0 Intervene Handoff & CSR Follow-Host (`net-05-spectator-csr-and-intervene-handoff`)
-- **`src/network/server/spectator/SpectatorRoomTimelineController.ts`**: Authoritative host-controlled replay timeline (`play`, `pause`, `seek`, `set_rate`, `step_frame`) with sparse frozen-frame ping gating (`isSparseFrozenMode`, `shouldEmitSparsePing`) and `MatchSystemControlSubController.enterStateOnlyMode` integration.
-- **`src/network/server/spectator/InterveneHandoffCoordinator.ts`**: Role-authorized takeover (`host_self` or trainee `sessionId`), 4-3-2-1-0 countdown progression, and non-POV policy enforcement (`disappear | no-input | follow-state | bot-takeover`) at takeover completion.
-- **`src/ui-core/stores/csrFollowHostStore.ts`**: Pure Zustand store in `src/ui-core/stores/` (zero engine/network imports, compliant with `src/ui-core/AGENTS.md`) holding client CSR follow-host state.
-- **`src/ui-system/core/csrFollowHostBridge.ts`** & **`src/ui-system/GameUIRoot.tsx`**: Bridges `useCsrFollowHostStore` with `useQuickNotificationStore` to display a persistent low-priority `background` notification with one-click `Follow Host (CSR)` toggling, and provides `buildTakeoverHudPayloadFromHandoff` for `TakeoverCountdownHUD`.
+### 2. `t5-02-touch-timeline-and-streaming-bridge` (Touch Analysis & Chunked Streaming WASM Bridge)
+- **`crates/rc_replay_codec/src/touch_analyzer.rs`**: Rust port of `ReplayTouchTimelineAnalyzer.ts` (`ReplayTouchEventPod`, `ReplayReboundEventPod`, `ReplayTouchAnalysisSummaryPod`, `analyze_touch_timeline_slices`, `analyze_touch_timeline_from_storage`).
+- **`crates/rc_replay_codec/src/codec_workspace.rs` & `lib.rs`**: Integrated UE3 parser, chunked streaming import (`begin_import_stream`, `alloc_import_chunk_buffer`, `commit_import_chunk`), and `TouchAnalysisWorkspace`.
+- **WASM C-ABI & TS Glue**:
+  - Updated `crates/rocketsim_wasm/src/exports/replay_exports.rs`, `src/physics/core.js`, `src/physics/core.d.ts`, and `src/physics/RocketSimWasm.ts` (`getLoadedRocketSimWasmModule()`).
+  - Added `src/replay/rlrc/RLRCWasmReplayBridge.ts` (512KB chunked WASM streaming `.replay` decode + zero-copy touch timeline analysis).
+  - Updated `src/replay/rlrc/RLReplayToRLRCConverter.ts`, `src/replay/rlrc/synthesis/RLRCHermiteSlerpResampler.ts`, and `src/replay/ReplayTouchTimelineAnalyzer.ts` to delegate to Rust WASM.
 
-### 1.3 Verification & Architecture Audit (`net-06-multiplayer-soak-and-final-radar`)
-- **`scripts/runMultiplayerRoomRepro.mjs`**: Added `--mode=freeplay` and `--mode=room-switch` CLI mode support.
-- **`scripts/verifyWave4Multiplayer.ts`**: End-to-end deterministic verification suite covering CSR binary codec roundtrip, `RoomActivityOrchestrator` hot-switching (`freeplay -> match -> replay_intervene -> sandbox`), `SpectatorRoomTimelineController` sparse ping gating, `InterveneHandoffCoordinator` 4-3-2-1-0 countdown & `disappear` non-POV policy, and `csrFollowHostBridge` notification lifecycle.
+### 3. `t5-03-retire-ts-netstream-parsers` (TS Parser Cleanup)
+- Removed all 20 TS parser files under `src/replay/rlrc/parser/` and orphaned `src/replay/rlrc/catalog/RLRCBoostPadSpatialTracker.ts`.
 
-## 2. Verification Results
-- `pnpm run check` (`radar` + `tsc --noEmit`): **PASS** (`STATUS: GREEN -- 100% TS, tsc --noEmit clean, hard boundaries & volume caps verified`, 0 Circular Deps, 0 Value Re-Exports, 0 Upward Imports).
-- `pnpm run radar:audit`: **PASS** (0 blocking issues).
-- `pnpm run build:wasm:check`: **PASS** (`cargo check --target wasm32-unknown-unknown --workspace` finished cleanly in 8.92s).
-- `scripts/verifyWave4Multiplayer.ts` (bundled via `esbuild` + `node`): **PASS** (`[PASS] Wave 4 Multiplayer Verification: 11 worker envelopes verified.`).
-- Note on `pnpm run test:baseline`: Pre-existing `b88102a` baseline had 2 unrelated failures in `multiplayer_6car_loadout_stress` (`multiplayer_no_phantom_double_jump_on_flip_e`) and `training_and_kickoff` (`kickoff_ppo_ghost_trajectory_and_episode_ste`); all other checks and matrix assertions passed.
-
-## 3. Open Architectural Notes for Downstream Merge
-- When Waves 1–3 merge with Wave 4, `RoomActivityOrchestrator` can feed `ACTIVITY_MODE_FLAGS` directly into the Wave 3 `RoomReplicationBus` frame header to strip unused payload sections (score/clock in Freeplay, telestrator in Match, sparse ping in frozen Replay).
-- Full live WebRTC multi-tab CSR follow-host camera lock can consume `useCsrFollowHostStore` in `CameraManager` / `FreeCameraController` once Wave 1 (`sandbox-01`) and Wave 3 (`net-03`) are merged.
+## Verification
+- `pnpm run build:wasm:dev`: Passed (`core.wasm`, 1157.8 KB, 194 exports).
+- `pnpm run check` (`radar` + `tsc --noEmit`): Passed (`STATUS: GREEN -- 100% TS, tsc --noEmit clean, hard boundaries & volume caps verified.`).
+- Node.js WASM runtime smoke test: Passed (`analyzeReplayTouchTimeline` detected synthetic frame-5 car-0 ball touch; `_physics_beginReplayImportStream` and `_physics_allocReplayImportChunkBuffer` succeeded).

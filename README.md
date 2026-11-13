@@ -1,58 +1,62 @@
-# 工程防崩溃约束、统一弹窗外壳与模块拆分实施报告
+# AgenteamCN/Outputs Token 评估与 Gemma 4 Commit Message 方案可行性报告
 
-已完全采纳并落地该防崩溃与工程约束方案，并同步清理了 Rust 后端的两个 `unused import` 警告，所有改动已通过 Verified Bot Commit 推送至 `origin/a2`（Commit: `bcf350371c7091294f701c9a9d3a0d185c4338df`，`signature.isValid: true`）。
+## 一、仓库近期 Commit 抽样与 Token 占用评估
 
----
+对 `https://github.com/AgenteamCN/Outputs` 最近 25 个 commit 进行了拉取与统计。剔除早期 8 个测试 commit（4～452 字符）后，**17 个真实模型输出 commit**（均为直接覆盖更新 `README.md`）的数据如下：
 
-## 一、已完成的核心改动
+| 类型 | 样本数 | 字符数范围 | 中文字符数 | 预估 Input Token（常规～保守上限） | 典型样本 |
+| :--- | :---: | :---: | :---: | :---: | :--- |
+| **常规小组完工 / 修复报告** | 12 | 2,795 ～ 7,787 | 422 ～ 1,778 | **1,050 ～ 3,930 tokens**（中位数 ~2,300） | `8bf9c6d` (2,795字 / ~1,046 tok)<br>`1a33aa5` (7,787字 / ~3,167 tok) |
+| **中大型架构调研 / 审查** | 3 | 10,880 ～ 13,221 | 2,730 ～ 3,042 | **5,070 ～ 7,135 tokens** | `4859365` (10,880字 / ~5,067 tok)<br>`9ba4a58` (13,221字 / ~5,720 tok) |
+| **大型全景开发计划书** | 2 | 18,453 ～ 23,238 | 3,953 ～ 4,379 | **7,770 ～ 11,586 tokens** | `66bcfd5` (18,453字 / ~7,768 tok)<br>`4fdc7ef` (23,238字 / ~9,341 tok) |
 
-### 1. 硬性静态门禁：ESLint + `eslint-plugin-react-hooks`
-- 新增 `eslint.config.mjs`：
-  - 启用 `react-hooks/rules-of-hooks: "error"`，在 lint / check 阶段直接拦截条件分支或提前 `return` 之后的 Hook 调用。
-  - 启用 `react-hooks/exhaustive-deps: "warn"` 与 `max-lines: ["warn", { max: 450, skipBlankLines: true, skipComments: true }]`，持续暴露超大文件。
-- 在 `package.json` 中新增脚本：
-  - `pnpm lint` (`eslint src`)
-  - `pnpm test` (`vitest run`)
-  - `pnpm check` (`tsc --noEmit && pnpm lint && pnpm test`)
+> 注：Token 估算按中英文混排 + Markdown 语法的 SentencePiece 分词特征计算（常规估算：中文 ~1.0 tok/字、ASCII ~3.8 字符/tok；保守上限：中文 ~1.3 tok/字、ASCII ~3.2 字符/tok）。
 
-### 2. 架构防呆：统一弹窗外壳 `<PrimerModalShell>`
-- 新增 `src/components/common/PrimerModalShell.tsx`：
-  - 统一托管 `if (!isOpen) return null;` 条件挂载、`useBackdropClose` 点击防误触、`Escape` 快捷键关闭、`document.body` 滚动锁定以及 `role="dialog"` / `aria-modal="true"` 无障碍属性。
-  - 内部 `PrimerModalShellContent` 仅在 `isOpen === true` 时挂载，彻底消除各业务弹窗手动维护 `useBackdropClose` 位置的心智负担。
-- 全量迁移全部 11 个弹窗外壳（13 个弹窗组件）至 `<PrimerModalShell>`：
-  - `ImportTaskModal.tsx`
-  - `TaskAbortRefreshModal.tsx`
-  - `TaskDeleteConfirmModal.tsx`
-  - `EnvironmentDeleteConfirmModal.tsx`
-  - `DraftBatchDuplicateModal.tsx`
-  - `LanQrScannerModal.tsx`
-  - `AppSettingsModal.tsx`
-  - `StatementSnippetModal.tsx`（含 `InsertRepoModal.tsx`、`InsertScanModal.tsx`）
-  - `EnvironmentManagerModal.tsx`
-  - `RequestQuotaModal.tsx`
-  - `CredentialsSettingsModal.tsx`
-
-### 3. 超大文件拆解：`CredentialsSettingsModal.tsx`（1074 行 → ~330 行）
-按凭据域拆分为独立低耦合子模块（位于 `src/components/settings/credentials/`）：
-- `credentialFieldStyles.ts`：共享缺失告警输入/标签样式
-- `ApiKeyAndGithubWorkerSection.tsx`：Gemini API Key、GitHub Worker Request ID、Co-Author 与 `required_instruction` 覆盖区
-- `EmqxAndTelemetrySection.tsx`：SZ (Bemfa)、EMQX CN、EMQX GB 与 Webhook 配置及连接控制区
-- `LegacyGithubPemSection.tsx`：Legacy GitHub App PEM 手动模式配置区
-
-### 4. 轻量烟雾测试：Vitest + React Testing Library
-- 新增 `vitest.config.ts`、`src/test/setup.ts` 与 `src/test/modals.smoke.test.tsx`。
-- 覆盖全部 13 个弹窗的 `closed -> open -> closed` 状态切换渲染与 `Escape` 关闭测试，实时捕获任何 `Rendered more hooks` 类运行时崩溃。
-
-### 5. Rust 后端编译警告清理
-- 移除 `src-tauri/src/google_api/client.rs` 与 `src-tauri/src/google_api/output_recovery.rs` 中未使用的 `redact_sensitive_blocks` 导入，消除 `cargo check` / `pnpm tauri dev` 中的 2 个 `unused_imports` 警告。
+### 文本格式特征
+抽样检查所有 17 个真实输出，格式高度规律：
+- **16 / 17 个文档**在第 1 行就是标准的 Markdown 一级标题（`# 标题`），紧接着是元数据引用块（`> **报告标识**`、`> **审计范围**`）或 `## 一、已完成的核心改动` 等核心摘要。
+- **仅 1 个例外**（`19b1ba5`）未带 `#` 标题，但前 6 行依然直接给出了仓库名、分支、Commit ID 和改动总结列表。
 
 ---
 
-## 二、验证结果
+## 二、15K TPM 限制下的方案可行性评估
 
-- `pnpm check`（`tsc --noEmit && pnpm lint && pnpm test`）：
-  - `tsc --noEmit`：**通过（0 错误）**
-  - `pnpm lint`：**通过（0 错误**，`react-hooks/rules-of-hooks` 0 违规）
-  - `pnpm test`：**13/13 弹窗烟雾测试全部通过**
-- `pnpm build`（`tsc && vite build`）：**通过**
-- GitHub Verified Commit：[`bcf350371c7091294f701c9a9d3a0d185c4338df`](https://github.com/Antigravi-ty/agyPreviewInstant/commit/bcf350371c7091294f701c9a9d3a0d185c4338df)（`signature.isValid: true`, `state: VALID`）
+### 1. 如果「全文直传」Gemma 4：**不可靠，高并发下必然撞限（不推荐）**
+- **单篇大计划接近上限**：如 `4fdc7ef` 单篇即消耗 **9,300 ～ 11,600 tokens**，直接吃掉 15K TPM 额度的 **62% ～ 77%**。
+- **历史记录已出现同分钟撞车**：在已有记录中，`4859365`（14:31:28）与 `9ba4a58`（14:31:54）仅间隔 **26 秒**，两篇合计 **10,800 ～ 13,500 tokens**，已贴近 15K 极限。
+- **小组集中完工必然触发 429**：若 1 分钟内集中 POST 6～8 份常规报告（每份 ~2,300 tokens），瞬时总输入可达 **13,800 ～ 18,400+ tokens**，直接触发 `429 Too Many Requests`。
+
+### 2. 如果采用「头部裁切 + Gemma 4 概括」：**完全可行，且效果几乎无损（强烈推荐）**
+由于几乎所有报告的标题、背景与核心结论都在文档最前面，**无需传入全文**：
+- **裁切策略**：在 Worker 侧只截取 `content.slice(0, 800)`（前 600～800 字符，超长则末尾拼 `...`）。
+- **单次 Token 消耗**：800 字符中英文混排约 **350 ～ 550 tokens**，加上精简的 System/User Prompt（约 80～100 tokens），单次请求总输入仅 **~450 ～ 650 tokens**。
+- **吞吐能力**：`15,000 TPM ÷ 550 tokens ≈ 27 次/分钟`。即便十几个小组在同一分钟内密集 POST，也完全在 15K TPM 安全线以内，彻底解决 TPM 瓶颈。
+
+---
+
+## 三、Worker 侧工程落地建议
+
+为保证这套“灾备/旁路”方案在 Antigravity 波动时**绝对稳定、不丢数据**，建议在 Worker 中采用以下设计：
+
+1. **短超时 + 零阻塞降级（Graceful Fallback）**
+   - 备份网关的核心职责是**把输出安全存进 GitHub**，Gemma 4 总结只是锦上添花。
+   - 调用 Gemma 4 时设置较短超时（例如 `3000ms ～ 5000ms`）。
+   - **三级降级链**：
+     1. **首选**：截取前 800 字符调用 Gemma 4，生成 15～25 字以内的简短中文/双语概括标题。
+     2. **降级 1（Gemma 超时 / 429 / 报错）**：正则提取原文第一个 `# ` 一级标题（或第一行非空文本前 50 字符）。
+     3. **降级 2（无有效文本）**：兜底使用 `Backup agent output`。
+   - 这样即使 Google API 限流或抖动，GitHub push 依然 **100% 成功**。
+
+2. **Commit Message 格式建议**
+   - 推荐格式：`<简短概括标题> (2026-11-13T01:46:47.915Z)`（或东八区时间）。
+   - 配合当前覆盖 `README.md` 的机制，在 GitHub Commits 列表页即可直接通过标题和时间精准定位每一条历史输出，无需 Agent 侧关心 Commit ID。
+
+3. **Prompt 极简化（省 Token + 控输出）**
+   - 例如：`用不超过20个字概括以下Markdown报告的核心内容，作为Git commit标题。只输出标题本身，不要引号或多余解释：\n\n<前800字符>`
+   - 设置 `maxOutputTokens: 60`，避免模型啰嗦拖慢 Worker 响应时间。
+
+---
+
+## 四、结论
+
+**方案完全可行。** 只要在 Worker 端做一层 **“前 800 字符裁切 + 429/超时自动降级提取首行标题”** 的处理，15K TPM 的限制不仅完全够用，还能支撑每分钟 20+ 次的并发上报。后续注入环境变量与 Worker Token 后，即可直接联调上线。

@@ -1,73 +1,77 @@
-# Track C (`5aab06257b65d6a39128dcb498e23eb62e794efa`) 合并前验收与实操指引报告
+# Track B (`z/agy/rc/track-b-voice-configurator` @ `a44c14d`) 合并评估与 Lobby 语音无声根因诊断报告
 
-## 1. 一句话结论
-
-**Track C 并不是“啥也没干”，它已经完成了核心后端/引擎/存储/Dev UI 闭环（21 个文件，+2290 / -12 行），代码静态检查、TypeScript 编译、Radar 架构红线与 Vite 构建全部通过。**
-
-你之所以在界面上看到 **“Dynamic Training Pack” 是灰色的** 且 **导入回放后没看到入口**，是因为：
-1. **主菜单入口故意/暂未解锁**：`src/ui-core/recipes/Layer3SelfTrainingRecipe.tsx` 第 66–73 行仍保留 `disabled: true`（且第 142 行直接 `return`），Track C 把入口放在了 **Dev Sandboxes（开发者沙盒）** 里，而不是面向普通玩家的 Self-Training Hub。
-2. **回放入口走错了窗口**：从 Self-Training Hub 点 **Replay Viewer** 打开的是 `REPLAY_VIEWER_PRESET`；而 Track C 的捕获按钮 **`Put 4s Pre-Roll into Dynamic Training Pack (.rcd)`** 挂载在 **Dev Sandboxes -> `Replay to RCS Replay Importer`**（`ReplayToRcsImporterFloatingWindow.tsx`）里。
+> 检验基准提交：`a44c14dd698bcc96a8bfb0aee76347f5effc0d2f`  
+> 对比主干：`origin/alpha` (`ae6c593dd9bde4fa92fbd24a529956b0d3a79502`)  
+> 对比参考：`origin/z/agy/rc/track-d-replication-bus` (`cf5cfee`)
 
 ---
 
-## 2. 自动化门禁与构建验证结果（已实测）
+## 一、 核心结论（直接回答你的三个问题）
 
-在 commit `5aab06257b65d6a39128dcb498e23eb62e794efa`（分支 `z/agy/rc/track-c-dynamic-training`）上实测：
+### 1. Lobby 期间双方能看到自己电平在动，但互相听不见——这符合预期吗？
+**不符合预期。**
+- 你能在菜单里看到自己的麦克风电平在动，只说明本地采集链路（`navigator.mediaDevices.getUserMedia` -> `localMicAnalyser` -> `voiceChatStore`）是通的，**完全不代表 WebRTC P2P 远端音频链路已经打通**。
+- 在 `a44c14d` 中，`src/game/runtime/RuntimePostprocessingAndSessionBootstrap.ts` 已经在房间连接建立阶段（Host 的 `onPeerConnected` 与 Client 的 `onJoinServer`）调用了 `attachVoiceToPeerChannel`，**设计上在 Lobby 期间只要双方 P2P 连上就应该能互相听见**。
 
-| 检查项 | 命令 | 结果 | 说明 |
-| :--- | :--- | :--- | :--- |
-| **架构雷达 + 类型检查** | `pnpm run check` | **PASS (0)** | `radar.ts` 1364/1364 TS，0 循环依赖 / 0 越层引用 / 0 桶导出 / 0 中文或 Emoji 违规；`tsc --noEmit` 0 错误 |
-| **Track C 改动文件格式** | `prettier --check` (21 files) | **PASS (0)** | Track C 提交的 21 个文件全部符合 Prettier 规范（注：仓库历史其他目录有 205 个未格式化文件，与本分支无关） |
-| **生产构建** | `pnpm run build` | **PASS (0)** | Vite 打包通过，无编译/模块解析错误 |
+### 2. 是不是应该等 Track D 合并后，再由 Track E / F 来打通语音链路？
+**不是。这是一个关键的架构边界误解。**
+- 已核查 `origin/z/agy/rc/track-d-replication-bus`（`cf5cfee`）的全部 61 个变更文件：**Track D 没有任何 `voice` 或 `audio` 相关改动**。Track D 负责的是 `RoomReplicationBus`（游戏状态 60/120Hz 快照与 Sparse 冻结双模同步、`ROOM_ACTIVITY_SWITCH` 热切换、DataChannel 不可靠/可靠双信道分流）。
+- **Track B（纯原生 WebRTC 语音）从一开始就是 Stage 1 零阻塞独立子系统**：它直接复用 `P2PWebRTCChannel` 的 `RTCPeerConnection.addTrack` 走原生 Opus 媒体流，并通过 `DataChannelTransport.sendVoiceSignal` 走独立的 `voice_signal` 控制帧做 SDP 重协商。
+- Track E（Freeplay/Match/Sandbox 内核）和 Track F（多人观战/接管）运行在 `RoomReplicationBus` 上层，**不会也不应该去接管或修复 Track B 的 WebRTC 音频轨**。语音通话链路必须由 **Track B 自身闭环打通并验收通过后再合并**。
 
----
-
-## 3. 如何在本地手测验证 Track C（完整操作路径）
-
-请按以下路径启动并验证功能闭环：
-
-1. **打开回放导入器**：
-   - 进入主菜单 -> **Developer / Dev Sandboxes** -> 打开 **`Replay to RCS Replay Importer`**。
-2. **加载回放并定位到想练习的时刻**：
-   - 在窗口中导入 `.replay` 文件，拖放时间轴或播放到目标介入帧（例如某次扑救或进攻前 4 秒窗口的结束帧）。
-3. **一键捕获 4 秒 Pre-Roll 到 `.rcd` 训练包**：
-   - 点击窗口最下方的青色按钮：
-     **`Put 4s Pre-Roll into Dynamic Training Pack (.rcd)`**
-   - 触发后会自动：
-     - 调用 `RLRCReplaySessionController.extractCurrentDynamicSession()` 截取目标帧前 480 帧（4 秒 @ 120Hz）的完整物理状态与 Roster；
-     - 存入 IndexedDB（`rc-dynamic-training-db`），并写入默认包 `"Captured From Replay"`；
-     - 自动弹出 **`Dynamic Training Pack (.rcd)`** 悬浮窗（也可在 **Dev Sandboxes** 中直接找到 **`Dynamic Training Pack (.rcd)`** 卡片打开）。
-4. **在 `Dynamic Training Pack (.rcd)` 窗口中验证**：
-   - **Pack 管理**：新建 Pack、切换 Pack、导出 `.rcd` JSON / 导入 `.rcd` JSON、查看 `"Captured From Replay"` 下的 Shot 列表。
-   - **Shot 编辑与单车接管（Per-Car Takeover）**：
-     - 调整 `povSlotIndex`（主视角控制哪辆车）、`downCounterSeconds`（倒计时秒数）、`timeoutSeconds`；
-     - 逐车配置 `as-previous` / `disappear` / `model`（指定 Bot 模型）/ `no-input` / `player`；
-     - 可选开启 POV 车辆的出生点位置/朝向微扰（`optionalCarSpawnVariation`）。
-   - **Pack 间调度**：`Move to` / `Duplicate to` 其他 Pack、`Delete`（带 Session 引用计数检查）。
-   - **实机试玩与判定**：点击 **Play Shot**，进入 `DynamicTrainingMode`（Pre-roll 倒计时 -> 物理接管 -> 进球 / 超时判定 -> 战绩写回）。
+### 3. 当前如何检验 Track B 是否可以开始合并？
+- **静态架构与合并冲突层面**：**已达标**。
+  - `pnpm run check`（Radar 2.0 架构扫描 + `tsc --noEmit`）全绿通过（`EXIT=0`，1361/1361 TS 文件，0 循环依赖，0 越层引用，0 桶文件）。
+  - 与 `origin/alpha`（`ae6c593`）**0 个重叠文件**，合并无冲突。
+  - 分层合规：`IVoiceAudioBridge` 窄接口位于 `src/audio/voice/`，`runtimeVoiceBridge.ts` 位于 `src/ui-system/core/` 进行桥接，UI 位于 `src/ui-core/recipes/settings/components/VoiceChatSettingsSection.tsx`，未违反 `src/ui-core/AGENTS.md` 与 `[TRANSPORT ISOLATION VIOLATION]`。
+- **运行时功能层面**：**暂不建议直接合并**。需先修复下方定位到的 3 个代码级 Bug，并在 Lobby 中完成双端真机语音互通验收。
 
 ---
 
-## 4. 代码审查发现（合入前需注意的细节与小瑕疵）
+## 二、 Lobby 期间“能看自己电平、但双方互相听不见”的根因定位
 
-整体架构拆解很干净（Schema/Codec、IndexedDB 存储、Slice 提取、Mode Runner、Judge、Dev UI、Bridge 全部独立成文件，且全部遵守 Radar 红线）。有 **3 个小问题** 建议在合并前或合入后顺手修掉：
+通过逐行审计 `a44c14d` 的信令、连接生命周期与 Web Audio 播放链路，定位到以下 **4 个直接导致无声的问题**：
 
-1. **Self-Training Hub 入口仍被锁死（预期行为但需确认合并后是否解锁）**
-   - 文件：`src/ui-core/recipes/Layer3SelfTrainingRecipe.tsx`（第 66–73 行 `disabled: true`、第 142 行早退）。
-   - 建议：若本阶段仅作 Dev 内部验收，保持灰色是合理的；若希望合入 `alpha` 后直接对玩家开放，需决定是跳转到独立的 Pack 浏览页还是直接拉起 `DYNAMIC_TRAINING_PACK_PRESET`。
-2. **`DynamicTrainingMode.ts` 第 193 行兜底读取 `ballY` 索引有误**
-   - 代码：`const ballY = ballView?.posY ?? (sim?.state ? Number(sim.state[SIM_OFFSETS.BALL] ?? 0) : 0);`
-   - 问题：`SIM_OFFSETS.BALL` 是球状态块起始偏移（`posX`），`posY` 应是 `SIM_OFFSETS.BALL + 1`。当前运行环境下 `sim?.getBallStateView?.()` 存在时不会走到兜底分支，但建议顺手修正。
-3. **缺少自动化 Scenario / E2E 回归用例**
-   - 本次提交未在 `src/game/scenario/` 新增 `DynamicTrainingMode` 的无头场景测试（如：构造一段 `DynamicTrainingStateSession` -> `startShot` -> 步进至进球/超时 -> 断言 `onOutcome`）。后续在 Track F `branch22` 或合入后建议补齐。
+### 根因 1（致命）：`onVoiceSignal` 注册时序竞态 + Offer Glare 死锁
+- **位置**：
+  - `src/game/runtime/RuntimePostprocessingAndSessionBootstrap.ts`（L259-L269）
+  - `src/network/transport/webrtc/DataChannelTransport.ts`（L214-L223）
+  - `src/audio/voice/WebRtcNativeVoiceBridge.ts`（L474-L489）
+- **原因**：
+  1. Client 侧在 `onJoinServer` 中先 `await sessionCoordinator.joinOnlineServer(opts)`（内部会异步加载 3D Lobby 场景），**之后**才调用 `attachVoiceToPeerChannel` 注册 `channel.onVoiceSignal`。Host 侧在 `onPeerConnected` 中也先 `await rosterSyncCoordinator.onRemotePlayerConnected(...)` 再注册。
+  2. 但此时 `RTCDataChannel` 已经处于 `open` 状态。先完成 `await` 的一端会立刻发出 `voice_identity` 和（若已开启语音）`voice_offer`。
+  3. 另一端此时 `channel.onVoiceSignal` 仍为 `null`，`DataChannelTransport.handleIncomingMessage` 仅执行 `if (this.onVoiceSignal) this.onVoiceSignal(control.signal)`，**不会重放 `transportEvents` 中缓存的 `voice_signal`**，导致 `voice_offer` 被静默丢弃。
+  4. 若双方在进房前都已开启语音：Host 发出的 `voice_offer` 被 Client 丢弃；随后 Client 完成加载并发送自己的 `voice_offer`，Host 此时卡在 `signalingState === 'have-local-offer'` 且 `isPolite === false`，触发 `if (offerCollision && !peer.isPolite) return;`，**把 Client 的 Offer 也丢弃**，双方永久死锁，永远不会触发 `ontrack`。
+
+### 根因 2（致命）：`hiddenAudioEl.muted = true` + `AudioContext` 自动播放拦截 / WKWebView 兼容问题
+- **位置**：`src/audio/voice/WebRtcNativeVoiceBridge.ts`（L370-L397）
+- **原因**：
+  1. `bindRemoteStream` 创建了一个 `audioEl.muted = true` 的隐藏 `<audio>` 元素，把实际声音完全交给 `AudioContext.createMediaStreamSource(stream)` -> `GainNode` -> `masterGainNode` -> `ctx.destination`。
+  2. 如果接收方**尚未点击开启语音**（或未在用户手势中激活 `getAudioContext()`），`ontrack` 属于异步网络事件而非用户手势，此时 `ensureOutputBus()` 里的 `ctx.resume()` 会被浏览器 Autoplay 策略拦截，导致 `AudioContext.state` 停留在 `'suspended'`，完全无声。
+  3. 在 **macOS Tauri (`WKWebView`)** 及部分 Chromium 环境下，对远端 WebRTC `MediaStream` 使用 `createMediaStreamSource` 配合 `muted = true` 的 `<audio>` 常会出现拉流失败或输出全零静音的问题。
+
+### 根因 3（环境依赖）：同机双开若回退到 `CrossTab` (`BroadcastChannel`) 模式，无真实 `RTCPeerConnection`
+- **位置**：`src/ui-system/core/runtimeVoiceBridge.ts`（L123）、`src/network/transport/webrtc/HandshakeSession.ts`
+- **原因**：如果测试时两端的 P2P 连接走的是同源 `CrossTab` 模拟通道而非真实 WebRTC `RTCPeerConnection`，`channel.connection.pc` 未完成真实 ICE/DTLS 建连，无法承载 `MediaStreamTrack` 音频流（但本地 `getUserMedia` 电平依然会正常跳动，极易造成“以为连上了但听不见”的错觉）。
+
+### 根因 4（边界缺陷）：重协商静默跳过与文件体积预警
+- **位置**：`src/audio/voice/WebRtcNativeVoiceBridge.ts`（L331-L345, L423-L448）
+- **问题**：
+  1. `attachPeer` 监听了 `negotiationneeded`，同时 `syncLocalTrackToPeer` 在 `addTrack` 后又手动调用 `renegotiatePeer`。
+  2. 当 `signalingState !== 'stable'`（例如开启/关闭语音切换过快）时，`renegotiatePeer` 直接 `return` 而未排队重试，会导致轨状态与远端不同步。
+  3. `WebRtcNativeVoiceBridge.ts` 当前为 **559 行 / 17.8 KB**，已非常接近 Radar 2.0 的 `800 行 / 18 KB` 硬拦截红线（当前触发软提示），后续修复建议适当拆出音频输出总线或信令状态机子模块。
 
 ---
 
-## 5. 是否可以开始合并？
+## 三、 Track B 合并前的修复与验收清单（Actionable Checklist）
 
-**结论：可以合入 `alpha`（低风险）。**
-- 对现有主流程的影响极小：仅在 `GameModeManager.ts` 注册了 `'dynamic-training-pack'` 模式、在 `runtimeBridgeAdapter.ts` 绑定了 Bridge、在 `ReplayToRcsImporterFloatingWindow.tsx` 底部增加了一个按钮，并对 `RLRCIntervene*` 扩展了可选的 `perSlotModes` / `perSlotModelIds` / `isCountdownPreroll` 参数（完全向后兼容原有 `nonPovMode` 行为）。
-- 建议合并步骤：
-  1. 按上述第 3 节路径在浏览器/Tauri 中实测一次「导入 `.replay` -> Put 4s Pre-Roll -> 调 Per-Car Takeover -> Play Shot 进球/超时」；
-  2. 顺手修复 `DynamicTrainingMode.ts` 第 193 行的 `SIM_OFFSETS.BALL + 1`；
-  3. 使用 `--no-ff` 合并到主干即可。
+1. **修复信令丢失与死锁**：
+   - 在 `DataChannelTransport` 中为未消费的 `voice_signal` 增加小型队列，在 `attachVoiceToPeerChannel` 绑定 `onVoiceSignal` 时立即回放；或将 `attachVoiceToPeerChannel` 提前到 `await joinOnlineServer` / `onRemotePlayerConnected` 之前执行。
+2. **修复远端音频播放静默**：
+   - 检查接收端 `AudioContext.state`，必要时在 UI 交互时确保 `resume()`，并在 `volumePct <= 100` 且未开启特殊处理时验证 `<audio>` 直出或确认 `WKWebView` 下 `MediaStreamAudioSourceNode` 实际有采样输出（可在 `WebRtcNativeVoiceBridge` 中观察 `peer.audioLevel01` 是否大于 0 来区分“没收到流”还是“收到流但没播出来”）。
+3. **Lobby 实机验收标准（无需等待 Track D/E/F）**：
+   - [ ] 双方进入同一房间 Lobby 后，在 **Developer -> Under Development -> Voice Chat Configurator** 的 `Per-Player Voice Mix` 中不再显示 `0 Peers`，能看到对方名称与 ID。
+   - [ ] 单方开启语音时，另一方界面显示 `Voice active (xx%)` 且对方电平条随说话跳动，能清晰听到声音。
+   - [ ] 双方进房前均已开启语音时，进房后不发生 glare 死锁，双向正常通话。
+   - [ ] `0% - 250%` 增益调节、本地 Mute、关闭语音后重新开启均能正常恢复。
+   - [ ] 运行 `pnpm run check` 保持 0 Error。

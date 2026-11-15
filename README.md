@@ -1,116 +1,105 @@
-# RocketCompanion PR #21 合并结果 & UI Variation 全量扫描报告与重构计划
+# RocketCompanion 全链路同步（Sync All / CSR Broadcast）扫描与推进方案
 
-## 1. PR 提交、合并与工具链验证结果
+## 一、已完成的仓库操作与基线验证
 
-- **PR 创建与合并**：已将 `z/agy/ui/tier-variation-rework` (`6b6ace3064738b5eeba484253cbd2b517f061a8d`) 提交为 [PR #21](https://github.com/Antigravi-ty/RocketCompanion/pull/21) 并无冲突合并至 `alpha` (`8b6b0a2b91036d03c05886c0ddbe0e5f1b403f87`)。
-- **工具链安装与基线校验**：
-  - 环境缺少 `pnpm`，已安装 `pnpm@12.21.0` 并执行 `pnpm install --frozen-lockfile`。
-  - 在合并后的 `alpha` (`8b6b0a2`) 上执行 `pnpm run check` 与 `pnpm run radar:audit` 全部通过（`STATUS: GREEN` — `1389/1389` 文件 100% TS，`tsc --noEmit` 零错误，边界与体积守卫全绿）。
-
----
-
-## 2. 对「先 Merge 再分叉再改」工作流的评估
-
-**完全同意先合并 `6b6ace3` 到 `alpha` 再开新分支重构**，原因有三点：
-1. **PR #20 是跨 57 个文件的横向破坏性重构**（统一 `FloatingWindowIcon`、`SURFACE_META`、`iconLookup`、`radarUiAndRepoGuards.ts`、`devFloatingPresets`、`AdvancedTab`、`DeveloperTab`）。如果不在 `alpha` 基线上汇合，后续任何 variation 扩展都会与 `radarUiAndRepoGuards.ts` 和 `surfaceMetaTypes.ts` 产生二次冲突。
-2. **当前最大问题不是「代码跑不起来」，而是「声明层（`SURFACE_META.variants`）、遍历层（`menuLayerLinearPlaylists.ts`）、路由层（`MenuLayerStageRecipeRouter.tsx`）与审批账本（`uiApprovalLedger.json`）四者脱节」**。在合并后的 `alpha` 上统一抽象，可以一次性用破坏性重构对齐这四层契约。
-3. **每个 commit 靠 `pnpm run check`（Radar + `tsc --noEmit`）兜底**，适合以「契约先行 + 自动生成遍历队列」的方式推进。
+1. **已将最新 `alpha`（`8b6b0a2b91036d03c05886c0ddbe0e5f1b403f87`）合并至 `z/agy/rc/multiplayer-recheck`（`e6bb6378`）并完成 Verified Bot Push**：
+   - 合并提交：`0fb08304e80343c37880c8ccb6f0f5c4d6bf8d2c`（`verified: true`，`antigravity-fine-grained-token[bot]` 自动签名，0 冲突）。
+   - 确认了先合并 `alpha` 的必要性：PR #20（`2fb9052`）对 Floating Window 做了结构性重构，强制 `PresetConfig`（`iconName` / `iconColor` / `title`）与 `SURFACE_META`、`floatingSurfaceRegistry.ts` 保持 1:1 一致，并由 `scripts/radar/radarUiAndRepoGuards.ts` 静态门禁强制校验。
+2. **工具链与门禁实测全绿**：
+   - 已修复沙盒 `pnpm` shim 问题，安装 `pnpm@10.28.2` 并完成 `pnpm install`。
+   - 合并后树上实测通过：
+     - `pnpm run check`：PASS
+     - `pnpm run radar:audit`：PASS
+     - `pnpm run test:multiplayer-suite`：10/10 ALL PASS
 
 ---
 
-## 3. 针对已知疑点的精确核查结论
+## 二、核心策略判断：先验证"完全同步（Sync All / Pure CSR）"，还是先全做完再切分？
 
-### 3.1 `Layer2SettingsRecipe [user-l2-settings-advanced]` 是否区分「已导入 / 未导入」？
+**明确结论：必须采用"先跑通并验证 Pure CSR 完全同步（Sync All），再按模式逐步开放特定用户输入"的路线。**
 
-**结论：在 Unified Approval Playlist（审批遍历队列）中完全没有区分，存在明确漏洞。**
-
-1. **导入了却未使用**：`src/ui-tuner/pages/menu-layer/menuLayerLinearPlaylists.ts` 第 7 行导入了 `SETTINGS_TAB_VARIANTS`，但全文未使用：
-   - `USER_LINEAR_PLAYLIST`（第 118-121 行）仅展开了 `USER_SETTINGS_QUICK_TABS`，只生成 4 个扁平步骤（`user-l2-settings-gameplay` / `audio` / `display` / `advanced`），**没有任何 `storeOverrides` 与 `profileTier`**。
-   - 结果：`AdvancedTab.tsx` 中定义的 `settings:advanced-anonymous`、`settings:advanced-pack-imported`、`settings:advanced-developer` 以及 `DisplayTab.tsx` 中的 `settings:display-tauri-fullscreen` **全部没有进入审批队列**。在审批流里点击 `user-l2-settings-advanced` 时，它只会读取当前全局残留的 store 状态。
-   - 反观 `src/ui-tuner/pages/recipes/recipeStateMatrixSpecs.ts`（第 109-130 行）却正确映射了全部 8 个 `SETTINGS_TAB_VARIANTS`，导致「Matrix 视图」和「Unified Approval Playlist」严重不一致。
-2. **Router 层的 `StoreSnapshotScope` 覆盖 Bug**：
-   - `src/ui-tuner/pages/menu-layer/MenuLayerStageRecipeRouter.tsx` 第 181-201 行在 `displayedRoute === 'settings'` 内部又包了一层 `<StoreSnapshotScope overrides={{ appStore: { settingsTargetTab: settingsTab, developerMode: visibilityTier === 'developer', ... } }}>`。
-   - 这会**强制覆写**外层 `activePlaylistStep.storeOverrides.appStore.developerMode`。即使未来在 User 队列里加入 `settings:advanced-developer` 或在 Dev 队列测试不同 tier，内层 Scope 也会把 `developerMode` 锁死为 `visibilityTier === 'developer'`。
-3. **`AdvancedTab.tsx` 本身的状态盲区**：
-   - `SignalingProfileSection` 有 4 种 `source`（`'public' | 'custom' | 'imported-bundle' | 'dev-private'`），目前缺少 `'custom'`（自建中继）变体。
-   - `SignalingProfileSection`、`AudioDebugSection`、`RealisticBgmSection` 均使用组件局部 `useState(false)` 控制 `isExpanded`，在静态快照预览中默认全部折叠，导致 `.rctbnspib` 导入/PIN 解锁/中继探测面板在审批中不可见。
-
-### 3.2 Garage Sync 三模式与 `pack imported`（未登录 vs 已登录）
-
-**结论：分类枚举模型本身只有 3 态，无法表达 4 态正交现实。**
-
-- `src/ui-core/manifest/surfaceMetaTypes.ts` 第 43 行定义：
-  `export type ProfileTierVariantKind = 'anonymous' | 'signed-in' | 'developer';`
-- 实际业务存在 **4 个独立状态**（当引入 `.rctbnspib` pack 导入后）：
-  1. **Anonymous（未导入 Pack）**：`signalingProfileStore.source = 'public'`，`cloudProfileSyncStore.available = false`，`loggedInUser = null`
-  2. **Pack Imported · Signed Out（已导入 Pack，未登录）**：`source = 'imported-bundle'`，`available = true`，`loggedInUser = null`
-  3. **Pack Imported · Signed In（已导入 Pack，已登录）**：`available = true`，`loggedInUser != null`，`developerMode = false`
-  4. **Developer（开发者模式）**：`developerMode = true`，`canManageAccounts = true`，`source = 'dev-private'`
-- 因为 `ProfileTierVariantKind` 缺少 `'pack-imported'`，`garageSyncVariants.ts` 的 `sync-sign-in` 和 `AdvancedTab.tsx` 的 `settings:advanced-pack-imported` 被迫全部标成 `profileTier: 'anonymous'`。
-- 此外，`GarageCloudAccountSyncSection` / `GarageCloudProfileSlotCard` 还缺少 `conflicts.length > 0`（`CloudProfileConflictDialogue` 3-way merge 冲突弹窗）、`syncStatus === 'syncing'`、`errorMessage != null` 三个关键 UI 状态变体。
+原因如下：
+1. **Pure CSR（只读渲染广播）是所有上层联机模式的数学超集**：
+   - 在 Pure CSR 模式下，Host 是唯一物理与状态权威（`SNAPSHOT` + `GlobalWorkspaceBroadcast` + `TELESTRATOR_SYNC`），Client 全程处于 `clientInputEnabled = false` 的纯渲染态。
+   - 一旦 Pure CSR 跑通并验证通过：
+     - **Replay Watch Together** = Pure CSR + `StandaloneReplayViewerController` 注入 `enterStateOnlyMode`；
+     - **Coaching / 教学观战** = Pure CSR + Telestrator 画画；
+     - **Custom Training Pack** = CSR + `training_shot_reset` + 按需开启 `clientInputEnabled`；
+     - **Room Match 自动拉入** = 复用已建好的 P2P `DataChannel`，切换 `activityId: 'match'` 并开放 `clientInputEnabled`。
+2. **如果先把所有模式与输入逻辑全堆上去再整体验证**，一旦出现画面抖动、状态不同步或模式跳变，很难区分是 `PredictionReconciler` 预测回滚问题、`GameModeManager.setMode()` 本地副作用问题，还是传输层同步问题。
+3. **先验证 Sync All 再逐层解禁输入**，每一步都可以独立在 `test:multiplayer-suite` 和 Headless Chrome 中卡点验收，风险完全可控。
 
 ---
 
-## 4. 全仓 UI Variation 覆盖面扫描报告
+## 三、底层 Signaling 与数据包解析是否需要改动？
 
-### 4.1 整体资产盘点（`alpha` @ `8b6b0a2`）
-- **Menu Recipes 顶层文件**：33 个（`src/ui-core/recipes/*.tsx`），含子组件共 107 个 `.tsx`。
-- **Floating Windows**：43 个（8 User + 35 Dev）。
-- **审批账本 (`uiApprovalLedger.json`)**：仅记录 67 个 surface / 57 个 variant（且存在 key 命名分裂，如 `recipe:Layer2GarageRecipe` 同时存在 `'car'` 与 `'user-l2-garage-car'`）。
+### 1. 底层 Signaling：不需要改动
+- `WebSocketSignalingClient`、`SupabaseRealtimeSignalingClient`、`SignalingProtocolHandler`、`HostSignalingNegotiationSubController`、`ClientJoinNegotiationSubController` 均与房间内具体活动（Freeplay / Replay / Training / Match）完全解耦。
+- 普通 Client 通过 `Layer3JoinRoomRecipe` -> `onJoinOnlineWarmup` 输入 Room Code 即可完成 SDP/ICE/Relay/Tunnel 建连，无需任何 URL 后缀或信令协议改动。
 
-### 4.2 声明了 `SURFACE_META.variants` 却未在 `menuLayerLinearPlaylists.ts` 展开的 Recipe（共 9 个 + Settings）
-
-对比 `floatingWindowsLinearPlaylists.ts`（第 126-134 行已实现自动读取 `SURFACE_META.variants`），Menu Recipe 的 `menuLayerLinearPlaylists.ts` 仍是手工拼接，导致以下 **9 个已声明多变体的 Recipe 在审批队列中被压缩成单一步骤**：
-
-| Recipe | 声明的 `variants` 数量 | `menuLayerLinearPlaylists.ts` 现状 |
-| --- | --- | --- |
-| `Layer2SettingsRecipe` | 8 (`SETTINGS_TAB_VARIANTS`) | 仅 4 user + 1 dev（无 `storeOverrides`） |
-| `Layer3AcousticsEqualizerRecipe` | 2 (`dynamic-default`, `night-compressed`) | 仅 1 步 (`dev-l3-audio-eq`) |
-| `Layer3BallTrajectoryRecipe` | 2 (`user-tier`, `developer-tier`) | 仅 1 步 (`user-l3-trajectory`) |
-| `Layer3CameraRecipe` | 2 (`default`, `developer`) | 仅 1 步 (`user-l3-camera`) |
-| `Layer3DevSelfTestRecipe` | 2 (`dev-private`, `public-default`) | 仅 1 步 (`dev-l3-self-test`) |
-| `Layer3ExhibitionRecipe` | 2 (`standard-necto`, `duel-nexto`) | 仅 1 步 (`user-l3-exhibition`) |
-| `Layer3KeybindingsRecipe` | 3 (`all`, `Driving`, `Aerial`) | 仅 1 步 (`user-l3-keybindings`) |
-| `Layer3KickoffTrainingRecipe` | 3 (`instant`, `easy-learning`, `realistic`) | 仅 1 步 (`user-l3-kickoff`) |
-| `Layer3TrainingConfigRecipe` | 2 (`default`, `standard-no-reset`) | 仅 1 步 (`user-l3-training`) |
-| `Layer4StaticTrainingPackBrowseRecipe` | 2 (`user`, `dev`) | 仅 1 步 (`user-l4-rcspack`) |
-
-### 4.3 跨子组件状态依赖与未覆盖分支（按轴扫描）
-
-通过全量扫描 `src/ui-core/recipes/**/*.tsx` 的 Store 依赖与条件渲染分支，发现以下高风险遗漏：
-
-1. **完全缺席审批队列的 Recipe**：
-   - `Layer1TauriConfiguratorRecipe.tsx`：未出现在 `USER_LINEAR_PLAYLIST` 或 `DEV_LINEAR_PLAYLIST` 中。
-2. **多 Tab 但只遍历 1 步的 Recipe**：
-   - `Layer3DevSandboxesRecipe.tsx`（含 6 个 Tab，队列仅 `dev-l3-isolation` 1 步）。
-3. **子组件依赖 `signalingProfileStore` / `cloudProfileSyncStore` / `isTauri`，但顶层声明为 `tier-invariant` 或未建模变体**：
-   - `Layer2PlayRecipe.tsx`：声明 `tier-invariant` / 无 variants，但实际读取 `signalingProfile`（影响联机入口提示/不可用状态）。
-   - `Layer3HostMatchRecipe.tsx` & `Layer3HostTrainingRecipe.tsx`：子组件 `OnlineRoomIdentityFields.tsx` 依赖 `signalingProfile`（`imported-bundle` vs `public` vs `dev-private`）与错误状态，但当前变体只遍历了创建进度（`idle` / `running-step-*` / `completed` / `error-step-*`），未覆盖 signaling source 差异。
-   - `Layer3DevQuickActionsRecipe.tsx`、`Layer4AdvancedAudioRecipe.tsx`、`Layer4ControllerSettingsRecipe.tsx`：均声明了 `profileTierPolicy: 'user-dev-split'` 且读取 `developerMode`，但全部没有 `variants` 定义。
-   - `DisplayTab.tsx`：存在 8 处 `isTauri` 分支（桌面端全屏/窗口模式切换），依赖 `SETTINGS_TAB_VARIANTS` 展开后才能被审到。
-4. **Radar 守卫 (`scripts/radar/radarUiAndRepoGuards.ts`) 的盲区**：
-   - 第 190-204 行仅正则检查顶层 `Layer*Recipe.tsx` 单文件是否出现 `developerMode` 或 `useCloudProfileSyncStore`，**不会递归检查子组件**（如 `GarageSyncTab`、`AdvancedTab`、`SignalingProfileSection`、`OnlineRoomIdentityFields`），导致顶层与子组件契约不一致时 Radar 仍然报 GREEN。
-   - Radar 目前没有检查「`SURFACE_META.variants` 是否全部被 `menuLayerLinearPlaylists.ts` 消费」，导致出现类似 `SETTINGS_TAB_VARIANTS` 导入却未使用的静默漏检。
+### 2. 底层二进制数据包解析：核心编解码器无需大改，仅需两处增量接线
+- `TunnelProtocol.ts` 已完整定义 `PHYSICS_SNAPSHOT (0x01)`、`USER_INPUT (0x02)`、`RELIABLE_CONTROL (0x03)`、`PING_PONG_16B (0x04)`、`TELESTRATOR_SYNC (0x05)`、`CSR_STATE_BROADCAST (0x20)`、`ROOM_ACTIVITY_SWITCH (0x21)`。
+- `GlobalPayloadCodec.ts` 已包含 `stateSnapshot`（球、车、34 个 Boost Pad 位掩码、确认控制帧）、`signals`（进球/爆炸/Boost/跳跃/触球等音效与特效事件）与 `allUserRtt`。
+- **仅需两处轻量接线**：
+  1. **打通 `TELESTRATOR_SYNC (0x05)` 的传输层收发**：`TelestratorWireCodec.ts` 和 `ReliableTunnelFramer.ts` 已就绪，但 `DataChannelTransport.ts`、`dataChannelFramingPipeline.ts` 和 `P2PWebRTCChannel.ts` 目前缺少 `sendTelestratorBytes` / `onTelestratorBytes` 的收发分发。
+  2. **扩展 `GlobalWorkspaceProtocol.ts`（JSON 控制帧）**：在 `GlobalWorkspaceBroadcastPayload` 中补充 `clientInputEnabled: boolean`、`followHostWorkspace: boolean` 与可选的 `arenaPreset` / `cameraSync` 字段，复用已有的 `sendGlobalWorkspaceBroadcast` 通道下发。
 
 ---
 
-## 5. 重构与全遍历计划（建议按 Phase 推进）
+## 四、Drawing（Telestrator 画画）同步现状与隐藏坑点
 
-### Phase 1：统一 Tier 与正交轴模型（解决 3 态 vs 4 态错配）
-1. 扩展 `src/ui-core/manifest/surfaceMetaTypes.ts`：
-   - 将 `ProfileTierVariantKind` 扩展为 `'anonymous' | 'pack-imported' | 'signed-in' | 'developer'`（或拆分 `authTier` + `bundleSource` + `runtimePlatform` 三个正交元数据字段）。
-   - 更新 `GARAGE_SYNC_VARIANT_METAS` 中的 `sync-sign-in` 为 `profileTier: 'pack-imported'`，并在 `GarageSyncTab` 补充 `sync-conflict` / `sync-error` 变体。
-   - 更新 `AdvancedTab.tsx` 变体矩阵：区分 `advanced-anonymous`（Public Broker）、`advanced-pack-imported`（已导入未登录）、`advanced-signed-in`（已导入已登录 + 远程部署开关）、`advanced-custom-broker`（自建中继）、`advanced-developer`，并支持通过 store/prop 控制 `SignalingProfileSection` 默认展开快照。
+1. **现有基础**：`TelestratorWireCodec.ts` 已实现 `STROKE_COMMIT`、`STROKE_HASH_ACK`、`STROKE_UNDO`、`STROKE_CLEAR`、`STROKE_DRAFT`、`HOST_PERMISSION_SYNC` 的紧凑二进制编解码；`TelestratorOverlaySubsystem` 当前仅在 `telestratorOverlayHelpers.ts` 中做本地自环编解码校验（`verifyTelestratorStrokeWire`）。
+2. **扫描发现的 3 个关键坑点**：
+   - **权限与相机同步门控卡死 Client 绘制**：`telestratorOverlayHelpers.ts` 的 `canTelestratorDrawNow()` 中硬编码了 `if (!st.isCameraSynced) return false;`。在 Sync All 房间中，若未将 Client 的 `isCameraSynced` 置为 `true`（或在 `everyone` 权限下放行），Client 即使拿到权限也无法落笔。
+   - **双 Store 未联动**：`useTelestratorStore`（`allowClientDrawing` / `isHost` / `isCameraSynced`）与 `useSpectateWorkspaceStore`（`telestratorPermission`）是两个独立 Store，收到 `GlobalWorkspaceBroadcast` 时必须同步更新两者。
+   - **3D 世界坐标特性**：Telestrator 笔画基于相机射线投射到场地 3D 几何体上（只要 Host 与 Client 加载相同场地，不同分辨率下天然对齐，无需屏幕坐标换算）。
 
-### Phase 2：消除手工拼接，Playlist 自动从 `SURFACE_META.variants` 生成
-1. 像 `floatingWindowsLinearPlaylists.ts` 一样，重构 `menuLayerLinearPlaylists.ts`：
-   - 对所有声明了 `SURFACE_META.variants` 的 Recipe（含 `Layer2SettingsRecipe` 及上述 9 个被折叠的 L3/L4 Recipe）**自动展开所有 `variants`**，自动注入 `storeOverrides`、`profileTier`、`subtab` 与标准化的 `variantId`。
-   - 补全 `Layer1TauriConfiguratorRecipe` 与 `Layer3DevSandboxesRecipe`（6 Tabs）的遍历条目。
-2. 修复 `MenuLayerStageRecipeRouter.tsx` 第 182-201 行的 `StoreSnapshotScope` 覆写问题：
-   - 将 `activeStepStoreOverrides` 置于最内层或与路由默认 overrides 做深度合并，确保 `activePlaylistStep.storeOverrides.appStore.developerMode` 不会被 `visibilityTier === 'developer'` 强行覆盖。
+---
 
-### Phase 3：对齐 Ledger Key 与 Radar 自动化守卫
-1. **统一 `unitKey`**：在 `reviewLedgerAdapter.ts` 中严格使用 `${surfaceId}::${variant.variantId}`，清理 `uiApprovalLedger.json` 中类似 `car` vs `user-l2-garage-car` 的重复历史键。
-2. **增强 `scripts/radar/radarUiAndRepoGuards.ts`**：
-   - 增加「Playlist 覆盖率守卫」：校验每个 `Layer*Recipe.tsx` 的 `SURFACE_META.variants`（以及 `Layer1`、`Garage`、`Settings`）必须 100% 出现在 `ALL_UNIFIED_APPROVAL_PLAYLIST` 中，否则 `pnpm run radar` 直接报错阻断。
-   - 增加「跨子组件 Store 依赖审计」：提示顶层 `profileTierPolicy: 'tier-invariant'` 但子组件读取了 `cloudProfileSyncStore` / `signalingProfileStore` / `developerMode` 的表面。
+## 五、全面扫描发现的其他遗漏点（关键风险清单）
+
+除原报告已列出的点外，本次全量扫描还发现以下 **6 个关键遗漏**：
+
+1. **`applyClientRoomActivitySwitch()` 模式 ID 不匹配与本地文件加载冲突**（`src/game/runtime/onlineSessionEnvironmentPipeline.ts:305-325`）：
+   - 该函数将 `'multiplayer_training'` 映射为 `'training'`、将 `'replay'` 映射为 `'replay'`，但 `GameModeManager.ts` 注册的模式 ID 实际上是 `'static-training-pack'` 和 `'replay-viewer'`，导致静默回退到 `'freeplay'`。
+   - 更重要的是：Client 本地**没有** Host 的 `.RCDPack` / `.RCSPack` / `.RCReplay` 文件，若切入本地模式会尝试加载不存在的文件或覆盖物理状态。因此 Client 在 CSR 房间中应保持轻量化 CSR 接收态（仅由 Host `SNAPSHOT` + `stateSummary` 驱动画面与 HUD），同时当 `activityId === 'match'` 时需避免 `store.setMatchMode('match')` 意外触发本地 `BotMatchMode` AI。
+2. **场地 / 地图预设（Arena / Throwback Stadium）未同步**：
+   - `GlobalPayloadCodec` 的物理快照不包含地图 ID。如果 Host 在 Under Development 中切到 `throwback` 球场或特定训练包球场，Client 若仍停留在 `standard` 球场，碰撞体与 Boost Pad 位置将错位。需在 `ROOM_ACTIVITY_SWITCH` / `GlobalWorkspaceBroadcast` 中携带 `arenaPreset`。
+3. **Host 视角 / 相机同步（`FOLLOW_HOST_CAMERA`）尚未实现**：
+   - `ReplicationBusProtocol.ts` 定义了 `FOLLOW_HOST_CAMERA` 标志位，但当前没有任何路径在广播 Host 的相机模式（BallCam / CarCam / FreeCam）或观战目标车索引。在 Replay 观看或教学演示时，若不同步相机目标，Client 视角会停在原地。
+4. **Workspace 镜像默认未自动激活**：
+   - `spectateWorkspaceStore.ts` 默认 `spectateMode: 'spectate_state_only'` 且 `isSpectating: false`。如果不由 Host 房间策略触发 `spectate_mirror`（同时利用已有的 `localSnapshotBeforeMirror` 在退房时无损恢复 Client 本地浮窗），Client 收到 `GlobalWorkspaceBroadcast` 后不会自动打开/同步 Host 的浮窗和菜单路由。
+5. **Room Match 自动拉入已连入 P2P Client 的机制缺失**：
+   - 当 Host 将一个已建立 P2P 连接的 Sync 房间直接切到 `Match` 时，不需要重新走 Signaling 邀请（`DataChannel` 已连通），但目前 `MatchRosterPolicyState` 会等待 Client 手动发 `arena_loaded_ack` 与 `match_ready_ack`。需要在 `MatchActivityKernel.onMount` 或 `OnlineMatchControlBridge.switchRoomActivity('match')` 中支持自动为已连接的 P2P Peer 分配蓝/橙队槽位并触发自动 Ready/Start。
+6. **Replay Takeover 已有现成 `enterStateOnlyMode` 桥接**（`src/replay/ReplayTakeoverSubController.ts:169`）：
+   - `ReplayTakeoverSubController` 已实现 `server.enterStateOnlyMode?.(snap, param1)`，且 `simulationNetworkReconcilePipeline.ts` 已处理 `reconciler.replayPlaybackMode`。Replay CSR 只需补齐 `StandaloneReplayViewerController` 在线房间播放时的逐帧推流与暂停心跳同步即可，工作量比原报告预估更小。
+
+---
+
+## 六、调整后的 5 步推进方案（单分支 `z/agy/rc/multiplayer-recheck` 串行收拢）
+
+### Step 1：Pure CSR "Sync All" 房间闭环 + 对齐 `alpha` 新规范的 `DevRoomSyncFloatingWindow`
+- 在 `Layer3DevUnderDevelopmentRecipe.tsx` 新增 "Create Developer Sync Room" 入口，调用 `bridge.onHostOnlineWarmup` 并打开 `DevRoomSyncFloatingWindow`（严格遵循 `alpha` `2fb9052` 的 `PresetConfig` + `SURFACE_META` + `floatingSurfaceRegistry` 1:1 规范）。
+- 扩展 `GlobalWorkspaceProtocol.ts` 与 `spectateWorkspaceStore.ts`（`clientInputEnabled`、`followHostWorkspace`、`arenaPreset`），在 `HostSessionController` / `MultiplayerSessionManager` 接入 `broadcastGlobalWorkspace`。
+- 实现前后双端 Input 门控（`PredictionReconciler.sampleAndPredictInput` + `HostWorkerMessageRouter` `clientInput` 清零）。
+- 修复 `applyClientRoomActivitySwitch()`，确保 Client 在 CSR 房间中不触发本地文件加载或 `BotMatchMode` 抢占。
+- **验收**：`pnpm run check && pnpm run radar:audit && pnpm run test:multiplayer-suite`（新增 Test 11 验证 Sync All + Input 门控 + Workspace 广播）。
+
+### Step 2：Telestrator（0x05）全链路实时同步
+- 在 `DataChannelTransport.ts`、`dataChannelFramingPipeline.ts`、`P2PWebRTCChannel.ts` 接入 `TELESTRATOR_SYNC (0x05)` 收发。
+- 在 `HostSessionController.ts` 实现权限校验（`host_only` / `everyone`）与全房间转发 + `STROKE_HASH_ACK`。
+- 联动 `useTelestratorStore` 与 `useSpectateWorkspaceStore`，修复 `isCameraSynced` 在 CSR 房间中的绘制门控。
+- **验收**：`test:multiplayer-suite` 新增 Test 12（双端 `STROKE_DRAFT` / `STROKE_COMMIT` / `STROKE_UNDO` / `STROKE_CLEAR` 与权限拦截）。
+
+### Step 3：Replay Watch Together（Pure CSR + 相机同步）
+- 将 `StandaloneReplayViewerController` 播放/暂停/倍速/拖拽时间轴接入 `authoritativeServer.enterStateOnlyMode(snap, tick)` 与 `GlobalWorkspaceBroadcast`（`playbackPaused`、`pausedAtTick`、相机目标）。
+- **验收**：`test:multiplayer-suite` 新增 Test 13（Replay 帧注入 -> Client CSR 插值同步误差 < 1e-3 + 暂停/拖拽同步）。
+
+### Step 4：按需开放用户输入（Custom Training Pack 教练模式 & Room Match 自动拉入）
+- **Custom Training Pack**：扩展 `MultiplayerTrainingActivityKernel` 支持 `training_shot_reset`（服务端重置球/车位姿）与 `stateSummary` 题目元信息同步；Client 无需本地 `.RCDPack` 文件即可同步渲染并按 Host 开关参与击球训练。
+- **Room Match 自动拉入**：在 `switchRoomActivity({ activityId: 'match' })` 时自动将当前房间已建连的 P2P Peer 分配至蓝/橙队并触发自动 `arena_loaded_ack` / 开局，无需重新建房或二次邀请。
+- **验收**：`test:multiplayer-suite` 新增 Test 14。
+
+### Step 5：Linux Headless Chrome 真实多标签页 E2E 验收
+- 扩展 `scripts/runMultiplayerRoomRepro.mjs`（或新增 `runDevRoomSyncE2E.mjs`），在无 GUI 沙盒下用双标签页 Headless Chrome 跑通：Host Dev UI 建房 -> 普通无后缀 Client UI 加房 -> Pure CSR Sync All -> Input 门控 -> Telestrator 画画 -> Replay 同步 -> Training Pack -> Match 自动拉入。
+- **硬断言**：`runtime_error === 0`、`poseAnomalies === 0`、`stuckInGoal === false`。

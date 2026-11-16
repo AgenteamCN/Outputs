@@ -1,69 +1,59 @@
-# `?fastest=1` 进一步优化与检查报告
+# RocketCompanion UI Variation & Approval Pipeline Deep Scan 验收报告
 
-**仓库 / 分支**：`Antigravi-ty/RocketCompanion` (`z/agy/rc/fastest-ultra-low-power`)  
-**已提交 Verified Bot Commit**：[`cd5292d1bca4ee9b862bd39a1ed80e2115fa087b`](https://github.com/Antigravi-ty/RocketCompanion/commit/cd5292d1bca4ee9b862bd39a1ed80e2115fa087b) (`signature.isValid: true`)
-
----
-
-## 一、已完成的代码改动
-
-### 1. 恢复指定音效（`?fastest=1`）
-在保留原本精简原则（跳过引擎合成器 `turtle_modem`、球体循环音、普通碰撞/进球/超音速等）的基础上，加回以下 3 类音效及其资源加载：
-- **碰撞门柱 / 横梁音效**：
-  - `src/audio/audioAssetLoader.ts`：加载 `goalpost` 与 `crossbar_ping_*`（含 `crossbar_ping_small_*`）。
-  - `src/audio/IncidentAudioEngine.ts`：在 `isFastestModeEnabled()` 分支中放行 `BALL_GOALPOST_HIT`，以及 `surfaceTag` 为 `GOALPOST` / `CROSSBAR` 或 `isCrossbar` 的 `BALL_WORLD_HIT`，转发至 `worldImpactHandler.handleBallGoalpostHit`。
-- **倒计时音效**：
-  - `src/audio/audioAssetLoader.ts`：加载 `match_countdown`、`training_countdown`、`match_countdown_10s`、`match_start_go`。
-  - `src/audio/SignalAudioEngine.ts`：`handleSignal` 与 `play` 在 `?fastest=1` 下放行 `match_countdown_321`、`training_countdown`、`match_countdown_10s`、`match_start_go`（其余 60s/30s 播报、加时、结束等仍保持跳过）。
-- **Flip Reset 音效**：
-  - `src/audio/audioAssetLoader.ts`：加载 `reset`。
-  - `src/audio/VehicleAudioManager.ts`：移除 `FLIP_RESET_GAINED` 分支中的 `if (isFastestModeEnabled()) break;` 拦截。
-
-### 2. 旁路 `AudioMixer` 后处理与分析节点
-- `src/audio/AudioMixer.ts`：在 `isFastestModeEnabled()` 下跳过 `MasterAcousticProcessor`（3 段 EQ + 压缩器）与 `AnalyserNode` 的创建及连接，直接 `this.input.connect(this.output)`；`getAcousticSnapshot()` 兼容返回 `null`。
-
-### 3. 精简 `WebGLRenderer` 上下文配置
-- `src/game/runtime/RuntimeSceneBootstrap.ts`：在 `?fastest=1` 下初始化 `THREE.WebGLRenderer` 时显式传入：
-  ```ts
-  {
-    antialias: false,
-    alpha: false,
-    stencil: false,
-    precision: 'mediump',
-    powerPreference: 'low-power',
-  }
-  ```
-  减少移动端 Tile GPU 的帧缓冲带宽与着色器精度开销。
-
-### 4. `ReachabilityVisualizer` 状态核查与彻底跳过
-- **核查结论**：`DEFAULT_REACHABILITY_CONFIG.enabled` 默认确实为 `false`（`src/ui-core/stores/reachabilityStore.ts`），且 `ReachabilityVisualizer.update()` 在 `!config || !config.enabled` 时会直接 `return`，**并未**在关闭状态下参与每帧计算。
-- **发现的冗余**：`src/game/runtime/RuntimePostprocessingAndSessionBootstrap.ts` 在 `?fastest=1` 下仍会实例化 `new ReachabilityVisualizer(...)`，导致创建 Three.js Group/Mesh/Material 并调用 `preloadGroundReachabilityLut()`。
-- **改动**：在 `RuntimePostprocessingAndSessionBootstrap.ts` 中将 `ReachabilityVisualizer` 移入 `if (!isFastestModeEnabled())` 块内，彻底零分配、零预加载。
-
-### 5. 裁剪 `BallSpeedTrail`（保留 `BallLocatorArrow` 与 `SupersonicWheelTrail`）
-- `src/entities/ArenaWorld.ts`：`?fastest=1` 下不将 `ballSpeedTrail.object` 加入场景，`prepareBallSpeedTrail` 仅调用 `supersonicWheelTrailSystem.prepare(camera, this)`，跳过 `ballSpeedTrail.prepare(camera)`。
-- `src/entities/arena/ArenaEnvironmentManager.ts` & `src/entities/vehicle/supersonic-trail/SupersonicWheelTrailReplaySync.ts`：`?fastest=1` 下跳过 `ballSpeedTrail.reset()` 与 `ballSpeedTrail.update()`。
-- `BallLocatorArrow` 与 `SupersonicWheelTrailSystem` 均完整保留。
+> 分支：`origin/z/agy/ui/phase1-tier-orthogonal-variants`
+> 最新验证提交：`d309d1d`（Verified Bot Commit on top of `6c1c7a8`）
 
 ---
 
-## 二、额外检查与新发现的优化点
+## 一、现在到底需要验收什么？（不仅仅是“系统没坏”）
 
-### 1. Bloom 与单面片特效核查
-- **Bloom 确认未开启**：在 `RuntimeSceneBootstrap.ts` 与 `GameRenderSubsystem.ts` 中，`?fastest=1` 下 `r.composer` 与 `r.boostBloom` 均为 `null`，渲染直接走 `r.renderer.render(r.arena.scene, activeCamera)`，因此 **Boost 与 SupersonicWheelTrail 不会触发 Bloom 后处理**。
-- **新发现 1 — `SupersonicWheelRibbon` 双 Pass 绘制（已修复）**：
-  - `src/entities/vehicle/supersonic-trail/SupersonicWheelRibbon.ts` 原本为每条轮迹创建两个 Mesh：`preOcclusionMesh`（Pass A）和基于模板测试（`stencilRef = 2, mask = 0x02`）的 `foregroundMesh`（Pass B，用于穿透半透明球场边框）。
-  - 在 `?fastest=1` 下不仅已关闭 `stencil: false`，而且球场为线框模式、不存在半透明边框遮挡。本次已在 `rebuildGeometry()` 中设置 `this.foregroundMesh.visible = !isFastestModeEnabled()`，**直接将超音速轮迹的 Draw Call 减半**。
-- **新发现 2 — `VehicleBoostEmitter.preload()` 预加载（已修复）**：
-  - `src/entities/vehicle/boost/vehicleBoostEmitter.ts` 的 `preload()` 原先会无条件调用 `this.goldRush.preload()`。本次在 `isFastestModeEnabled()` 下直接提前返回，避免加载多余贴图资源。
+Phase 1–3 完成后，UI-Tuner 的**审批覆盖面从过去的手工子集扩展为 181 个精确去重单元（User 87 + Dev 94）**。这次真正需要人工视觉验收的是以下 **4 类新增可见状态**：
 
-### 2. 其他可参考的底层观察（本次未大改，供后续按需推进）
-- **HUD / Zustand 同步**：核查 `src/ui-core/stores/hudStore.ts` 后发现，`setBoost` 已走 `globalHudTransientChannel` 直改 DOM 且做了数值去重，`setHasFlip` 也已做 20Hz 量化节流，因此当前 HUD 并非主要瓶颈。
-- **`VehicleBoostEmitter` 构造期内存**：即使当前主题为单面片 `light-wave`（`PerformanceBoost`），`VehicleBoostEmitter` 构造函数仍会预先创建 `ArcadeBoostParticleMesh`（`drive`/`trail`）、`cone`、`nozzleFlash` 与 `RealisticBoostEmitter`（`goldRush`）；若后续想进一步压低内存与场景树节点数，可改为按需懒初始化。
-- **`PerformanceBoostShader.ts` 片元循环**：其片元着色器中 `evalCubicBezier01` 含 5 次牛顿迭代，若在极低端移动 GPU 上仍觉像素填充率吃紧，可在 `?fastest=1` 下替换为线性插值渐变。
+1. **4 态正交 Auth / Bundle / Platform 矩阵**：
+   - `Settings → Advanced`（5 态：`anonymous` / `pack-imported` / `signed-in` / `custom-broker` / `developer`），其中 `SignalingProfileSection` 与 `DeveloperProfileExportSection` 在快照中默认展开（`snapshotExpanded: true`），可直接审阅 `.rctbnspib` 导入/导出与中继探测 UI。
+   - `Garage → Sync`（新增 `sync-syncing`、`sync-conflict` 3-way merge 冲突弹窗、`sync-error` 错误态，且 `sync-sign-in` 已修正为 `pack-imported`）。
+   - `Settings → Display` 的 **`settings:display-tauri-fullscreen`**（Tauri 桌面端 Window Mode：`Fullscreen` / `Borderless` / `Windowed`，本次已修复其浏览器快照不生效的 Bug）。
+2. **此前被折叠的 9 个 L3/L4 Recipe + Layer1 Tauri Configurator + Dev Sandboxes（8 态）**：
+   - 包括 `Layer3AcousticsEqualizerRecipe`、`Layer3BallTrajectoryRecipe`、`Layer3CameraRecipe`、`Layer3DevSelfTestRecipe`、`Layer3ExhibitionRecipe`、`Layer3KeybindingsRecipe`、`Layer3KickoffTrainingRecipe`、`Layer3TrainingConfigRecipe`、`Layer4StaticTrainingPackBrowseRecipe`（User/Dev 双路由拆流）、`Layer3DevSandboxesRecipe`（overview + 7 labs）、`Layer1TauriConfiguratorRecipe`。
+3. **子组件驱动的 Signaling Source 与 Tier 分流**：
+   - `Layer2PlayRecipe`、`Layer3HostMatchRecipe`、`Layer3HostTrainingRecipe`、`Layer3JoinRoomRecipe` 的 `public` vs `imported-bundle` vs `dev-private` 联机入口差异。
+   - `Layer3DevQuickActionsRecipe`、`Layer4AdvancedAudioRecipe`、`Layer4ControllerSettingsRecipe` 的 User/Dev 分流与 `resolvedDeveloperMode` 路由对齐。
+4. **统一的 Review Queue 账本状态**：
+   - 打开 UI-Tuner → Review Queue，确认所有新展开的变体都能按 `${surfaceId}::${variantId}` 精确跳转并渲染，且无旧分裂键残余。
 
 ---
 
-## 三、验证结果
-- `pnpm run check`（`radar` + `tsc --noEmit`）：**通过**
-- `pnpm run build`：**通过**
+## 二、Deep Scan 全量核查结果
+
+通过 Vite SSR 实际加载运行时模块（`menuLayerLinearPlaylists.ts`、`floatingWindowsLinearPlaylists.ts`、`surfaceCalibration.ts`、`reviewLedgerAdapter.ts` 及全部 33 个顶层 `Layer*Recipe.tsx`），核查结果如下：
+
+| 核查维度 | 扫描结果 | 状态 |
+| :--- | :--- | :---: |
+| **Playlist 总量与去重** | `ALL_UNIFIED_APPROVAL_PLAYLIST` 共 **181** 步（User **87** / Dev **94**）；重复 `step.id` = **0**；重复 `unitKey` = **0** | PASS |
+| **路由与审计回退** | `resolveRouteAuditInfo` 意外回退到 `Layer1MainMenuRecipe` = **0** | PASS |
+| **Floating Windows 覆盖** | 38 个 `SURFACE_META` 表面 / 64 个单元（User 7 + Dev 57），`SURFACE_META.variants` 覆盖率 **100%**（缺失 = 0） | PASS |
+| **Ledger 历史孤立/分裂键** | `uiApprovalLedger.json` 中不存在任何 Playlist 无法命中的孤立 surface 或孤立 variant key（孤立数 = **0**） | PASS |
+| **待人工首次审阅的表面** | `recipe:Layer1TauriConfiguratorRecipe` 及 3 个 Floating 窗口（`performance-boost-tuner`、`dynamic-training-pack`、`telestrator-toolbar`）尚未录入 `uiApprovalLedger.json`（队列中正常归为 `deferred` 待审） | INFO |
+| **在线/主菜单命名体系差异** | `Layer1MainMenuRecipe`（用 `user-l1-*` / `dev-l1-*`）、`Layer2ManageRoomRecipe`、`Layer3HostMatchRecipe`、`Layer3HostTrainingRecipe`、`Layer3JoinRoomRecipe` 共 29 个 `SURFACE_META` 原始 `variantId` 未按原名进入 Playlist，而是通过 `menuLayerOnlineRoomSteps.ts` 的 18+ 扩展步覆盖（`radarUiAndRepoGuards.ts` 对这 5 个文件做了白名单跳过） | INFO |
+
+---
+
+## 三、本次发现并修复的隐蔽 Bug（Commit `d309d1d`）
+
+在核查所有 `storeOverrides` 顶层键（`appStore`, `cloudProfileSyncStore`, `experimentalMultiBotsStore`, `kickoffTrainingStore`, `signalingProfileStore`, `subsystemIsolationLabStore`, `tauriRuntime`）的消费情况时，发现 `tauriRuntime` 未接入快照作用域：
+
+1. **`DisplayTab.tsx` & `DisplayRefreshRateCard.tsx` 忽略 `storeOverrides.tauriRuntime`**
+   - **问题**：`DisplayTab.tsx` 为 `settings:display-tauri-fullscreen` 声明了 `storeOverrides: { tauriRuntime: { isTauri: true, platform: 'windows', windowMode: 'fullscreen' } }`，但组件内部直接调用 `isTauriRuntime()`（检测 `window.__TAURI_INTERNALS__`），导致在浏览器中运行的 UI-Tuner 永远判定为非 Tauri，无法渲染 Window Mode 选择器。
+   - **修复**：在 `src/ui-core/recipes/settings/tabs/DisplayTab.tsx` 与 `src/ui-core/compounds/DisplayRefreshRateCard.tsx` 中接入 `useStoreSnapshotOverride('tauriRuntime')`，优先读取快照覆盖的 `isTauri`、`platform` 与 `windowMode`。
+2. **`Layer1TauriConfiguratorRecipe.tsx` 挂载时污染 UI-Tuner 全局主题**
+   - **问题**：组件挂载后 `refreshFromBackend()` 会无条件调用 `applyDocumentTheme(state.config.themeMode)` 修改 `document.documentElement` 的 `dark`/`light` class。
+   - **修复**：在 `src/ui-core/recipes/Layer1TauriConfiguratorRecipe.tsx` 中改为仅当 `propIsLight === undefined`（非 UI-Tuner 托管模式）时才同步全局 `document.documentElement` 主题。
+
+---
+
+## 四、工具链与验证结果
+
+- 环境：`pnpm` v12.21.0 已安装，`pnpm install --frozen-lockfile` 完成。
+- `pnpm run check`（Radar + `tsc --noEmit`）：**GREEN**（1390/1390 TS 文件，0 循环依赖，0 边界违规）。
+- `pnpm run radar:audit`：**GREEN**。
+- `pnpm run build`：**PASS**（Vite 生产构建成功）。

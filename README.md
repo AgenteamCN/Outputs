@@ -1,55 +1,36 @@
-# Developer Sync Room (Pure CSR) & Tauri Console Error Fix Report
+# RocketCompanion Multiplayer & UI PR Report
 
-**Repository:** `Antigravi-ty/RocketCompanion`  
-**Branch:** `z/agy/rc/multiplayer-recheck`  
-**Commit:** [`df4a3c80c569c21c1670d6027fed2fe3b2a3f570`](https://github.com/Antigravi-ty/RocketCompanion/commit/df4a3c80c569c21c1670d6027fed2fe3b2a3f570) (`verified: true`, signed bot commit)
+## 1. UI Automated Scan PR & Merge (`z/agy/ui/phase1-tier-orthogonal-variants` -> `alpha`)
+- Created PR #25 (`https://github.com/Antigravi-ty/RocketCompanion/pull/25`) from `z/agy/ui/phase1-tier-orthogonal-variants` into `alpha`.
+- Merged cleanly into `alpha` (`merged: true`).
 
----
+## 2. Root Cause Analysis: Dev Sync Room Host Dropping to `NOT HOSTING` & Client `RTCErrorEvent`
 
-## 1. Root Causes Identified
+### What happened in the logs
+1. **Client log**: `game_net` and `game_ctrl` opened, `color_change` was received, and `PredictionReconciler` snapped its timeline to server tick `2731`. Immediately afterward, both DataChannels received `OperationError: User-Initiated Abort, reason=Close called`, which happens when the remote peer (Host) tears down the `RTCPeerConnection` / `RTCDataChannel`.
+2. **Host log (Tauri)**: After `DataChannel "game_net" OPEN!` and `Remote answer SDP applied`, the Host UI switched to `NOT HOSTING` and WKWebView logged `WebSocket connection to 'ws://127.0.0.1:53286/tunnel?token=...' failed: The operation couldn't be completed. Socket is not connected` (without `[LocalBridgeClient]` error logs, proving `LocalBridgeClient.close()` was invoked intentionally via `stopHosting()` -> `closeSessionTunnel()`).
 
-1. **Developer Sync Room was coupled to `online-warmup` / `lobby` UI & `leave-room` teardown:**
-   - `Layer3DevUnderDevelopmentRecipe` launched the room via `onHostOnlineWarmup({ roomType: 'warmup', ... })` without an independent `isDevSyncRoom` flag.
-   - `OnlineSessionCoordinator.hostOnlineServer` / `onlineSessionEnvironmentPipeline.finalizeHostLaunchState` forced `matchMode` to `'online-warmup'` and `OnlineMatchControlBridge` switched activity to `'multiplayer_training'`.
-   - `Layer1MainMenuRecipe` / `deriveLayer1ContextVariation` saw `hasActiveOnlineRoom = true`, hijacking the main menu into `'online-warmup-host'` / `'online-warmup-client'` (replacing `Play` with `Manage Room` and putting `Leave Room` at the bottom).
-   - Clicking `Leave Room` in `MenuContainer` or `menuRouteNavigationPipeline` called `bridge.onLeaveOnlineServer()`, which tore down the entire P2P WebRTC/Tunnel session instead of just returning to Free Play and syncing state.
+### Why it happened (Universal Lifecycle Bug, Not a Tauri-only Edge Case)
+- In `src/game/runtime/MatchModeTransitionBridge.ts` and `src/ui-system/core/runtimeModeBridgeHandlers.ts`:
+  - `stopActiveOnlineOrLoopbackSessionIfNeeded` (called by `transitionToTrainingMode` and `transitionToExpMultiBotsMode`) and `returnToFreeplay` unconditionally called `teardownMultiplayerSignalingSession` (`session.stopHosting()`) and `teardownNetworkCoordinatorSession` (`stopOnlineServer()`).
+  - `onReturnToFreeplay()` unconditionally reset `onlineSession` with `isHosting: false, roomId: ''`.
+  - Worse, commit `df4a3c8` routed "Leave Room" in `MenuContainer.tsx` and `menuRouteNavigationPipeline.ts` to `onReturnToFreeplay()` when `isDevSyncRoom` was true, assuming `onReturnToFreeplay()` would keep the Dev Sync Room alive — when in fact `onReturnToFreeplay()` tore down the entire Host session!
+  - Whenever the Host switched modes (Freeplay, Training, Replay Viewer, Dev Test Lab, Exp Multi Bots) or returned to Freeplay, `stopHosting()` was triggered, closing the Tauri Rust tunnel WS bridge and all WebRTC DataChannels.
 
-2. **Host Workspace was not auto-synced (`Broadcast Sync Now` was manual-only):**
-   - `GlobalWorkspaceBroadcast` was only sent when manually clicking `Broadcast Sync Now` or toggling switches in `DevRoomSyncFloatingWindow`.
-   - Navigating menus (`activeRoute`, `isOpen`), changing `matchMode`, or opening/closing/minimizing floating windows on Host did not automatically broadcast to Clients.
+### Why `test:multiplayer-suite` did not catch it
+- `scripts/runMultiplayerSuiteTests.ts` previously only tested `P2PWebRTCChannel`, `HostSessionController`, `MultiplayerSessionManager`, and `PredictionReconciler` in isolation, and never exercised `MatchModeTransitionBridge` (`stopActiveOnlineOrLoopbackSessionIfNeeded` / `returnToFreeplay`) with `onlineSession.isDevSyncRoom === true`.
+- `scripts/runDevRoomSyncE2E.mjs` requires full browser bootstrap with local private microkernel/assets (`ERR_POV_MICROKERNEL_TAMPERED` when those untracked assets are absent).
 
-3. **Host Tauri (`LocalBridgeClient`) WebSocket Console Error:**
-   - The `UPNP_MAPPING_FAILED` and `WEBTRANSPORT_FALLBACK_TO_WEBSOCKET` warnings are expected in macOS Tauri WKWebView (no WebTransport API, UPnP timeout).
-   - However, when `LocalBridgeClient` tore down or the local loopback WebSocket closed after WebRTC `DataChannel` opened, `ws.onerror` fired (`Socket is not connected`) and logged `console.error` even during intentional `close()` or post-connect teardown.
+### Secondary Issue: Client Default Spectate State on Join
+- In `src/game/runtime/OnlineMatchReconcilerBinder.ts`, when a Client received `handshake_ack` with `isDevSyncRoom: true`, `clientInputEnabled` was not gated to `false` until a subsequent `GlobalWorkspaceBroadcast` arrived, and `lobbyDualWorld.focusCameraOnCar(activePlayerCarIndex)` focused on `entityId` (car `1`, which does not exist in Host Freeplay) instead of Host car `0`.
 
-4. **Headless Linux E2E (`runDevRoomSyncE2E.mjs`) Stage 5 Occlusion:**
-   - Stage 5 drew a Telestrator stroke at `(640, 440)`, which was directly occluded by the open `DevRoomSyncFloatingWindow` (`blocked-button-or-ui`).
+## 3. Fixes Applied (`z/agy/rc/multiplayer-recheck`, commit `74fe936`)
+- `src/game/runtime/MatchModeTransitionBridge.ts`: Skip `teardownMultiplayerSignalingSession` and `teardownNetworkCoordinatorSession` in `stopActiveOnlineOrLoopbackSessionIfNeeded` and `returnToFreeplay` when `useAppStore.getState().onlineSession?.isDevSyncRoom` is `true`.
+- `src/ui-system/core/runtimeModeBridgeHandlers.ts`: Preserve `onlineSession` in `onReturnToFreeplay` when `onlineSession?.isDevSyncRoom` is `true`.
+- `src/game/runtime/OnlineMatchReconcilerBinder.ts`: On `msg?.isDevSyncRoom` handshake ack, default `reconciler?.setClientInputEnabled?.(false)` and focus camera on Host car `0`.
+- `scripts/runMultiplayerSuiteTests.ts`: Added Test 15 (`Dev Sync Room Lifecycle Preservation on Mode Switch & Client Spectate Default`).
 
----
-
-## 2. Changes Implemented
-
-- **Independent `isDevSyncRoom` Lifecycle:**
-  - Added `isDevSyncRoom` across `appStoreTypes`, `navigationAndCarSlice`, `runtimeOnlineBridgeHandlers`, `runtimeDomainPortTypes`, `onlineLobbyTransitionPipeline`, `OnlineMatchControlBridge`, `MatchRosterPolicyState`, `AuthoritativeServerWorker`, `HostServerFallbackSubController`, and `OnlineMatchReconcilerBinder`.
-  - Host creating a Developer Sync Room (`Layer3DevUnderDevelopmentRecipe`) stays in `'freeplay'` (no forced `'online-warmup'` or `'multiplayer_training'`), and `MatchRosterPolicyState.buildHandshakeJson` propagates `isDevSyncRoom` to joining Clients so Clients enter Pure CSR mirror mode without `lobbyDualWorldMode` or diagnostic probes.
-  - `Layer1MainMenuRecipe` excludes `isDevSyncRoom` from `hasActiveOnlineRoom` / `isOnlineMatchRoom`, preserving normal `Play` / `Freeplay` / mode menus.
-  - `MenuContainer` and `menuRouteNavigationPipeline` (`leaveOnlineRoomAndCloseMenu`) guard against `isDevSyncRoom`: normal `Leave Room` / `Return to Freeplay` actions only return to Free Play and switch room activity to `'freeplay'` without closing the P2P room.
-  - Closing/leaving a Developer Sync Room is strictly done via `Stop Room` (Host) or `Leave Sync Room` (Client) inside `DevRoomSyncFloatingWindow`.
-
-- **Continuous Host Workspace Auto-Sync:**
-  - Added `matchMode` to `GlobalWorkspaceBroadcastPayload` (`GlobalWorkspaceProtocol.ts`) and synced it in `runtimeSpectateWorkspaceBridge.ts`.
-  - Added `startDevSyncWorkspaceAutoBroadcast` / `stopDevSyncWorkspaceAutoBroadcast` in `runtimeSpectateWorkspaceBridge.ts` (started on Dev Sync Room host launch, stopped on `onLeaveOnlineServer`), watching `useAppStore` (`isOpen`, `activeRoute`, `matchMode`, `stadiumPreset`) and `floatingStore` (`windows` open/minimized state while ignoring window `(x, y)` coordinates) to auto-broadcast `GlobalWorkspaceBroadcast` within 16ms.
-
-- **Quiet `LocalBridgeClient` WebSocket Teardown:**
-  - Detached `ws` event handlers in `LocalBridgeClient.close()` before calling `ws.close()`, suppressed `ws.onerror` when `this.closed` is true, and downgraded post-connect `ws.onerror` to `console.warn`.
-
-- **Headless E2E Fix:**
-  - Updated Stage 5 in `scripts/runDevRoomSyncE2E.mjs` to draw at unobstructed canvas coordinates (`x: 960..1080, y: 440..480`).
-
----
-
-## 3. Verification
-
-- `pnpm run check` (`radar` + `tsc --noEmit`): **PASS** (1415/1415 TS files, 0 errors, 0 boundary violations).
-- `pnpm run test:multiplayer-suite`: **PASS** (14/14 test suites passed).
-- `pnpm run test:dev-room-sync-e2e`: **PASS** (all 9 E2E stages passed in headless Chrome, `runtime_error=0`, `poseAnomalies=0`, `stuckInGoal=false`).
+## 4. Verification
+- `pnpm run check` (`radar` + `tsc --noEmit`): PASS (1415/1415 TS files, 0 errors).
+- `pnpm run test:multiplayer-suite`: PASS (15/15 tests passed).
+- Verified bot commit `74fe936e5eb11b5c3ffa2382b18460f6a8df029c` pushed to `z/agy/rc/multiplayer-recheck` (`signature.isValid: true, state: "VALID"`).

@@ -1,41 +1,49 @@
-# Git Checkout 自动重启与刷新机制重构报告
+# UI Tuner (`dev:tuner`, Port 3002) 启动性能优化报告
 
-- **分支**: `z/agy/rc/git-hook-auto-reload`（基于 `alpha` 最新提交 `8b6b0a2`）
-- **Verified Bot Commit**: `ec5d23d3861fca169cc7ad52df6421a9e693b5df`（`verified: true`，`antigravity-fine-grained-token[bot]`，含 `Co-authored-by: Mark <29165094+MaBoCoMark@users.noreply.github.com>`）
+- **分支**: `z/agy/ui/tuner-startup-optimization` (基于 `alpha` 最新提交 `8b6b0a2`)
+- **Verified Bot Commit**: [`68c3ae37504259092e102a67b14e028afedd4f44`](https://github.com/Antigravi-ty/RocketCompanion/commit/68c3ae37504259092e102a67b14e028afedd4f44) (`signature.state: VALID`)
 
-## 一、核心架构升级（Hook 确定性通知 + 外层 Supervisor + Ready Gate）
+---
 
-放弃原先纯轮询打补丁的模式，重构为以下四层协同机制：
+## 一、核心优化内容
 
-1. **版本化 Git Hooks (`.githooks/`) 与自动安装 (`scripts/git/ensureGitHooks.ts`)**
-   - 新增 `.githooks/post-checkout`、`.githooks/post-merge`、`.githooks/post-rewrite`（`100755`）：Git 保证仅在工作区文件全部落盘且 `index.lock` 释放后触发。
-   - Hook 原子写入 `.cache/git-checkout-event.json`（含 `eventId`、`tauriChanged`、`depsChanged`），并异步非阻塞 POST `/__rc_git_checkout_done` 实现 0ms 瞬时唤醒。
-   - 在 `package.json` 增加 `prepare` / `hooks:install` 脚本，并在 `devLauncher.ts` 与 `tauriDevWatch.ts` 启动时自动执行 `ensureGitHooks()`，将 `core.hooksPath` 设为 `.githooks`。
+### 1. 彻底消除启动期 549+ 次 `?raw` 请求，并保障审批页实时 Hash 准确性
+- **`scripts/vite/tunerWsSyncPlugin.ts`** (`rcUiTunerSyncPlugin`):
+  - 新增 Node 服务端预热缓存接口 `/__rc_ui_core_hashes`：在服务监听后异步扫描 `src/ui-core/**/*.{ts,tsx}`，复用 `src/ui-core/manifest/visualFileHash.ts` 的 `computeVisualFileHash` 在服务端直接计算并缓存全量 Hash（550 个文件实测仅 **~67–120ms**），以单次 JSON 响应返回给浏览器。
+  - 通过 `server.watcher` 监听 `src/ui-core/` 的 `change` / `add` / `unlink` 事件，毫秒级增量更新服务端缓存，并通过 `server.ws.send('rc-ui-tuner:ui-core-hashes-updated', ...)` 实时推送给前端。
+  - 增加清晰的控制台启动日志：`[rc-tuner] Initializing UI Tuner dev server & pre-warming hash cache...` 与 `[rc-tuner] UI Core hash cache ready: 550 files hashed in ...ms`。
+- **`src/ui-tuner/components/review/liveSubtreeHashScanner.ts`**:
+  - 移除顶层同步 `import.meta.glob('../../../ui-core/**/*.{ts,tsx}', { query: '?raw', eager: true })` 及主线程全量 Hash 计算。
+  - 改为按需（首次调用 `detectChangedSubtreeFiles` / `computeLiveSubtreeCombinedHash` / `getLiveFileVisualHash` 时）通过 `fetch('/__rc_ui_core_hashes')` 单次拉取并缓存，同时订阅 `rc-ui-tuner:ui-core-hashes-updated` HMR 事件。
+- **`src/ui-tuner/components/review/reviewLedgerStore.ts`**:
+  - 新增 `hashesRevision` 状态并订阅 `subscribeLiveSubtreeHashes`，确保审批/审阅页面在异步拉取完成或 `src/ui-core/` 源码修改后自动触发 React 重渲染，保持审阅状态与过期检测实时准确。
 
-2. **外层 Supervisor 统一编排 (`scripts/devLauncher.ts` + `scripts/devWorker.ts`)**
-   - 将原 4 端口 Vite 启动逻辑拆分至 `scripts/devWorker.ts`，`scripts/devLauncher.ts` 升级为纯外层守护进程。
-   - 检测到 checkout（Hook HTTP / `.cache/git-checkout-event.json` 监听 / submodule fallback）后，立即通过 IPC (`rc:checkout-settling`) 通知 4 个 Vite 实例进入静默态，等待 **1000ms 尾随防抖**（上限 3000ms）后统一重启 `devWorker.ts` 子进程。
-   - 彻底解决 4 端口并发 `server.restart()` 争抢以及 `vite.config.ts` / `scripts/vite/*.ts` ESM 模块缓存不更新的问题。
+### 2. 关闭 `tuner` 的全量 esbuild 依赖扫描 + 消除 Vite 5 二次重载 + 补齐预热
+- **`vite.config.ts`**:
+  - 为 `role === 'tuner'` 开启 `optimizeDeps.noDiscovery: true`（复用已完整声明的 `uiInclude` 白名单），免除冷启动 7~8.8 秒的全量文件爬取。
+  - 同时设置 `optimizeDeps.holdUntilCrawlEnd: role === 'tuner' ? false : undefined`，解决 Vite 5.4.21 在 `noDiscovery: true` 下仍会在首次请求后触发二次 `runOptimizer` 与 `optimized dependencies changed. reloading` 页面重载的问题。
+  - 为 `tuner` 补齐 `server.warmup: { clientFiles: ['./src/ui-tuner/main.tsx', './src/ui-tuner/UITunerApp.tsx'] }`。
+- **`scripts/devLauncher.ts`**:
+  - 在统一启动器中，除 `entry` 外同样为 `tuner` 调用 `server.warmupRequest('/src/ui-tuner/main.tsx')`。
 
-3. **Ready Gate 与 HMR 抑制 (`scripts/vite/gitHeadAutoRestartPlugin.ts`)**
-   - 每次 `configureServer` 生成唯一 `bootId`，并通过 `transformIndexHtml` 注入客户端。
-   - 在锁文件存在、Hook 静默期或重启期间，`/__rc_git_head` 严格返回 `{ restarting: true, signature: null, bootId }`，同时拦截 `server.ws.send` 的 `update` / `full-reload` 消息，杜绝半成品状态抢跑刷新。
-   - 客户端在检测到 `restarting: true` 或 WS 断开后显示顶部非侵入提示条，以 400ms 间隔探测直到 `restarting === false && data.bootId !== INITIAL_BOOT_ID` 才执行 `window.location.reload()`。
+### 3. 非阻塞外链字体加载
+- **`tuner.html`**:
+  - 将 Google Fonts (`JetBrains Mono`) `<link rel="stylesheet">` 改为 `media="print" onload="this.media='all'"`，避免离线或受限网络阻塞首屏渲染。
 
-4. **Tauri 开发守护优化 (`scripts/tauriDevWatch.ts`) 与 Watcher 降噪 (`vite.config.ts`)**
-   - `tauriDevWatch.ts` 不再在每次切换分支时无脑杀掉 Rust/Tray 进程：仅当 `src-tauri/` 目录发生变更（`tauriChanged: true`）时才等待 1000ms 并重启 `tauri dev`；纯前端/脚本变更时保持 Tauri 托盘常驻，由 `devLauncher.ts` 重启 4 端口 Vite 后 WebView 自动无感刷新。
-   - `vite.config.ts` 的 `server.watch.ignored` 补充忽略 `**/.git/**`、`**/.cache/**`、`**/dist/**`、`**/rc-vite-cache/**`、`**/.DS_Store`、`**/._*`、`**/._AppleDouble`。
+---
 
-## 二、关于后台常驻命令 `pnpm tauri:dev:tray` 的建议
+## 二、沙盒实测对比与验证
 
-- **日常开发继续使用 `pnpm tauri:dev:tray` 即可**：本次优化后，纯前端分支切换不再重启 Tauri Rust/Tray 外壳，只会平滑重启 4 端口 Vite Worker，体验会比之前快且稳得多。
-- **高频对比特定 Commit 推荐使用 `git worktree`**：如果需要在 2–3 个固定 commit 之间频繁对比效果，建议用 `git worktree add ../RocketCompanion-compare <commit>` 开出独立工作目录，避免反复触发磁盘 IO 与 Vite 缓存失效。
+### 工具链补充
+- 沙盒已预装 Node v22.23.5 / npm 10.9.9 / Google Chrome 157；补充全局安装了 `pnpm` (`12.21.0`) 并完成 `pnpm install --frozen-lockfile`。
 
-## 三、验证结果
+### Headless Chrome 首屏实测 (`RC_VITE_ROLE=tuner` Port 3002)
 
-- 工具链：已全局安装 `pnpm` (`12.21.0`) 并执行 `pnpm install --frozen-lockfile`。
-- 静态检查：`pnpm run check`（`radar` 1389/1389 TS + `tsc --noEmit`）通过（GREEN）。
-- 端到端闭环实测（本地启动 `devLauncher.ts` 监听 `:3003`）：
-  - 初始 `/__rc_git_head` 返回 `bootId: e8148cc2-...`，`restarting: false`，HTML 中嵌入的 `INITIAL_BOOT_ID` 与之一致。
-  - 触发 `POST /__rc_git_checkout_done` 后，立即进入 `settling: true, restarting: true, signature: null`。
-  - 等待 1000ms settle + Worker 重启后，返回新 `bootId: e8d4db1d-...`，`restarting: false`。
+| 测试场景 | 优化前 | 优化后 | 改善 |
+| :--- | :--- | :--- | :--- |
+| **冷启动**（清空 `.vite/tuner` 缓存） | 16.602s | **9.973s** | 消除 esbuild 扫描与二次 reload，提速 ~40% |
+| **热启动**（已有 `.vite/tuner` 缓存，默认首页 `/`） | 7.134s（报告原测 15~17s） | **3.191s** | 提速 **2.2x+（对比原环境 ~5x）** |
+| **审批页** (`/?workspace=approval`) `?raw` 请求数 | 549 次 | **0 次**（由 1 次 `/__rc_ui_core_hashes` 替代，550 文件服务端缓存命中） | `?raw` 瀑布流完全消除 |
+
+### 架构与类型检查
+- `pnpm run check`（`radar` + `tsc --noEmit`）：**STATUS: GREEN**（1389/1389 TS 文件，`tsc --noEmit` 0 错误，0 循环依赖/越界导入）。

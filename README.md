@@ -1,92 +1,61 @@
-# RocketCompanion `?fastest=1` 低功耗模式对比、优化交付与音频杂音诊断报告
+# RocketCompanion Multiplayer Step 4 推进报告
 
-## 1. 分支对比与清理结果
-
-对两个目标提交进行了逐文件 diff 对比：
-- `ef4ad1caf514ab7388ed26060444659629d39242`（`z/agy/rc/fastest-low-power`）
-- `01f5153344b841fde3cbd2f6c84af8f721f71653`（`z/agy/rc/fastest-ultra-low-power`）
-
-### 功耗对比结论：**保留 `z/agy/rc/fastest-ultra-low-power`（`01f5153`），删除 `z/agy/rc/fastest-low-power`（`ef4ad1c`）**
-
-| 维度 | `z/agy/rc/fastest-ultra-low-power` (`01f5153`) | `z/agy/rc/fastest-low-power` (`ef4ad1c`) | 胜出 |
-| :--- | :--- | :--- | :--- |
-| **球场渲染** | 仅渲染 CMF `EdgesGeometry` 线框并释放表面三角面（0 表面像素填充） | 同时渲染 `MeshBasicMaterial` 实体表面 + `EdgesGeometry` 线框（双倍 Draw Call + 全屏填充率） | `01f5153`（功耗显著更低） |
-| **球体渲染** | Wireframe 二十面体（`wireframe: true`） | 实心 `MeshBasicMaterial` 二十面体 | `01f5153` |
-| **车轮材质** | 全局共享 `sharedFastestWheelMaterial` | 每个车轮新建 `LineBasicMaterial` | `01f5153` |
-| **灯光与阴影** | 未关闭 `ArenaLighting` 与 `PointLight` | 显式关闭 `carSun`、`ballSun`、`hemiLight`、`keyLight` 与 `boost` 点光源 | `ef4ad1c`（已将此项优化合入保留分支） |
-
-- **已删除分支**：`origin/z/agy/rc/fastest-low-power`（GitHub API `DELETE` 返回 `204`）
-- **已保留并更新分支**：`z/agy/rc/fastest-ultra-low-power`
-- **已签名 Bot 提交**：[`1ce8ee6cf560af7063c1785684a2b14a82ea1cf2`](https://github.com/Antigravi-ty/RocketCompanion/commit/1ce8ee6cf560af7063c1785684a2b14a82ea1cf2)（`signature.isValid: true`, `state: VALID`）
+- **仓库 / 分支**: `Antigravi-ty/RocketCompanion` @ `z/agy/rc/multiplayer-recheck`
+- **Verified Bot Commit**: `938f846b7ad7f32f63ad49c57d4b779703d4019b` (`signature.isValid: true`, `state: VALID`, author: `antigravity-fine-grained-token[bot]`)
+- **Commit 链接**: https://github.com/Antigravi-ty/RocketCompanion/commit/938f846b7ad7f32f63ad49c57d4b779703d4019b
 
 ---
 
-## 2. 本次代码修改摘要（`?fastest=1` 模式）
+## 一、前序基础状态核查（Steps 1–3）
 
-1. **默认渲染倍率与帧率上限**
-   - 默认 `renderScale` 从 `10%` 调整为 `30%`（`0.3`）。
-   - 默认 `maxFps` 从 `90` 调整为 `75`。
-   - 涉及文件：`src/ui-core/config/trainingDefaults.ts`、`src/game/runtime/RuntimeSceneBootstrap.ts`、`src/game/runtime/RuntimeDOMEventManager.ts`。
-
-2. **关闭轨迹预测器（Trajectory Predictor）**
-   - 在 `src/game/runtime/RuntimePostprocessingAndSessionBootstrap.ts` 中，当 `isFastestModeEnabled()` 为 `true` 时不再实例化 `BallTrajectoryPredictor`（保持为 `null`），彻底消除每帧物理预测采样、几何体构建与异常桥接开销。
-
-3. **简化轮胎几何与运动更新**
-   - `src/entities/arena/VehicleFactory.ts`：移除 `createFastestWheelWireframe` 中的十字辐条，仅保留 12 段外圈轮廓。
-   - `src/entities/VehicleSuspensionSystem.ts`：在 `isFastestModeEnabled()` 下跳过 `getWheelSusLength`、`getWheelSteerAngle`、左右转向角（`steer.rotation.y`）及悬挂臂/弹簧计算，轮胎直接固定在碰撞盒相对位置，仅保留正常的滚动自转（`spin.rotation.z`）。
-
-4. **音频精简与低功耗防爆音**
-   - 仅保留 6 类音效：**jump**、**double jump**、**dodge**、**boost**（含 start / loop / release）、**boost collect**、**empty boost**（`sfx_error_no_boost`）。
-   - 关闭并跳过加载/更新：引擎颗粒合成器（`turtle_modem`）、球体滚动/飞行循环音、超音速进入与循环音、翻转重置音效、碰撞/撞墙/门柱/爆破/进球/倒计时与提示音。
-   - `src/audio/audioAssetLoader.ts`：在 `?fastest=1` 下仅拉取并解码上述 6 类所需音频资源，大幅减少网络/磁盘 I/O 与内存占用。
-   - `src/audio/audioContext.ts`：在 `?fastest=1` 下将 `AudioContext` 的 `latencyHint` 从 `0` 改为 `'playback'`。
-   - 涉及文件：`src/game/subsystems/GameAudioSubsystem.ts`、`src/audio/IncidentAudioEngine.ts`、`src/audio/VehicleAudioManager.ts`、`src/audio/SignalAudioEngine.ts`、`src/audio/audioAssetLoader.ts`、`src/audio/audioContext.ts`。
-
-5. **移植灯光与点光源关闭优化**
-   - `src/entities/arena/ArenaLighting.ts`：在 `?fastest=1` 下不向场景添加太阳光/半球光/方向光，并将阴影模式设为 `'off'`，短路 `shouldRenderShadowMap()` 与 `updateShadows()`。
-   - `src/entities/vehicle/boost/vehicleBoostEmitter.ts`：在 `?fastest=1` 下不创建动态 `PointLight`。
-
-### 验证结果
-- `pnpm run check`（`radar` + `tsc --noEmit`）：**PASS**（1390/1390 TS 文件通过，`0` 错误，架构边界 `GREEN`）。
-- `pnpm run build`（`vite build`）：**PASS**。
+基于 `origin/z/agy/rc/multiplayer-recheck`（基线 `2e76b7d`）检查并实测：
+- **Step 1** (`91ed3b5`): Pure CSR Sync All、双端 Input 门控与 `DevRoomSyncFloatingWindow` 已就绪。
+- **Step 2** (`9af302d`): Telestrator (`0x05`) 全链路实时同步与权限/双 Store 联动已就绪。
+- **Step 3** (`2e76b7d`): Replay Watch Together（Pure CSR 帧注入、暂停心跳、相机同步）已就绪。
+- 基线 `pnpm run check`、`pnpm run radar:audit` 与 `pnpm run test:multiplayer-suite`（Tests 1–13）均通过。
 
 ---
 
-## 3. 低性能设备音频“滋啦滋啦响”根因分析报告
+## 二、Step 4 核心实现详情
 
-### 现象回顾
-高配/桌面设备音频正常，仅低功耗、低性能移动设备出现持续“滋啦滋啦”的破音/杂音，且由于移动端无控制台难以直接排查。
+### 1. Custom Training Pack 教练模式与无本地 `.RCDPack` 同步
+- **`src/network/server/activities/MultiplayerTrainingPolicy.ts`**:
+  - 新增 `TrainingShotMetadata`、`TrainingShotResetPayload`、`extractTrainingShotMetadata()` 与 `applyTrainingShotResetToSim()`。
+  - 服务端收到 `training_shot_reset` 时直接重置球位姿（`setBallState`）与单车/全车/多车位姿（`setCarState`），并同步重置 `resetGoalLatch()` 与 Boost Pads，递增 `shotResetSeq`。
+- **`src/network/server/activities/ActivityKernel.ts` (`MultiplayerTrainingActivityKernel`)**:
+  - `onMount` 提取并保存 `shotMetadata`（`trainingPackId`/`packId`、`packName`、`shotIndex`、`totalShots`、`shotName`、`shotDescription`），若携带初始位姿则立即执行服务端重置。
+  - `onControlMessage` 新增 `training_shot_reset` 与 `training_state_summary_update` 分发。
+  - `getStateSummary` 透出完整 `shotMetadata` 供 `CSR_STATE_BROADCAST` 与 `stateSummary` 同步。
+- **Worker / Host 通道打通**:
+  - `src/network/protocol/HostWorkerProtocol.ts`: 新增 `ACTIVITY_CONTROL`。
+  - `src/network/server/RoomActivityOrchestrator.ts`: 新增 `handleControlMessage()` 委派当前激活的 `ActivityKernel.onControlMessage`。
+  - `src/network/server/workerActivityAndInputRouter.ts`: 新增 `MSG.ACTIVITY_CONTROL` 路由并回传最新 `csr` 摘要。
+  - `src/network/server/AuthoritativeServerHost.ts`: 新增 `sendActivityControl()` 与 `resetTrainingShot()`。
+- **Bridge & Client 无本地文件渲染同步**:
+  - `src/ui-core/stores/appStoreTypes.ts`、`src/game/runtimeDomainPortTypes.ts`、`src/ui-system/core/runtimeOnlineBridgeHandlers.ts`: 扩展 `onlineSession.trainingPackSummary` 与 `bridge.onResetTrainingShot`。
+  - `src/game/runtime/OnlineMatchControlBridge.ts`: 实现 `resetTrainingShot()` 同步服务端、更新本地 Store 并广播 `ROOM_ACTIVITY_SWITCH`。
+  - `src/game/runtime/onlineSessionEnvironmentPipeline.ts` (`applyClientRoomActivitySwitch`): Client 保持轻量 CSR 接收壳，解析 `trainingPackSummary` 并按 Host 开关同步 `reconciler.setClientInputEnabled(...)`，无需本地 `.RCDPack` 文件。
 
-### 代码层面定位到的核心根因
-
-1. **最主要根因：`AudioContext({ latencyHint: 0 })` 强制极小硬件缓冲区导致欠载（Buffer Underrun / XRun）**
-   - 在 `src/audio/audioContext.ts` 第 202 行中，初始化 `AudioContext` 时默认传入 `{ latencyHint: 0 }`。
-   - 在 Web Audio 规范中，`latencyHint: 0` 会向底层系统音频驱动（Android AAudio/OpenSL ES 或 iOS CoreAudio）请求**最小可能缓冲区**（通常仅 128 或 256 采样帧，48kHz 下仅约 **2.6ms – 5.3ms** 的渲染时间窗口）。
-   - 在低性能移动设备上（尤其是小核调度、温控降频或与 120Hz WASM 物理步进、WebGL 绘制、JS GC 并发时），音频渲染线程或 IPC 只要偶尔超过 3–5ms，就会发生**周期性音频缓冲区欠载（XRun）**，人耳听感正是连续的“滋啦滋啦”电子杂音/爆音。
-   - **修复**：本次已在 `?fastest=1` 模式下将 `latencyHint` 切换为 `'playback'`（由系统分配约 20–50ms 的安全缓冲余量），可从根源消除低性能设备的 XRun 杂音。
-
-2. **次要叠加因素：高并发 Web Audio 图节点与主线程参数调度负载**
-   - **引擎颗粒合成器（`RemoteEngineAudioLodController` / `turtle_modem`）**：每帧持续调制多路 `AudioBufferSourceNode` + `BiquadFilterNode` + `GainNode` + 空间总线。
-   - **多路空间音频节点**：`AudioSlotPool` 预创建了 16 路 `PannerNode` + `StereoPannerNode`，每辆车与球体各有独立的 `PannerNode`，叠加 `MasterAcousticProcessor`（3 段 EQ + `DynamicsCompressorNode`）以及持续连接的 `AnalyserNode`（`fftSize = 256`）。
-   - 在低端移动 CPU 上，上述节点与每帧大量的 `AudioParam` 调度会加剧音频线程抖动，进一步放大 `latencyHint: 0` 的欠载问题。本次关闭引擎音效与多余声道后，音频线程负载已大幅下降。
+### 2. Room Match 自动拉入已建连 P2P Peer
+- **`src/network/server/activities/ActivityKernel.ts` (`MatchActivityKernel` + `autoPullConnectedPeersForMatch`)**:
+  - 在 `MatchActivityKernel.onMount` 时自动收集 `roster.players`、`roster.spectators`、`sessionManager.sessions` 及 `stateSummary.connectedPeers` 中的非 Bot 人类 Peer。
+  - 自动为尚未分配槽位的 Peer 分配玩家槽位（或从 `spectator` 切换为 `player`），并在蓝队（0）/橙队（1）之间均衡分配（若多人集中在同一队则自动交替分队）。
+  - 自动将所有已连接人类 Peer 标记为 `ready = true` 与 `arenaLoaded = true`，随后直接触发 `startMatch(duration)` 进入 `KICKOFF`，无需重新建房、二次邀请或等待手动 `arena_loaded_ack`。
+- **`src/network/server/workerActivityAndInputRouter.ts` & `src/game/runtime/OnlineMatchControlBridge.ts`**:
+  - 切换 `activityId: 'match'` 时自动将已连接 P2P Peer 传入 `stateSummary` 并同步标记 `HostSessionController.recordPeerReadyState(peerId, { ready: true, arenaLoaded: true })`。
+  - 默认自动开放 `clientInputEnabled: true`（服务端 `dataHandler` + 广播 `ROOM_ACTIVITY_SWITCH` / `GlobalWorkspaceBroadcast`），Client 侧 `applyClientRoomActivitySwitch` 在 `match` 下保持轻量 CSR 壳（不误触发本地 `BotMatchMode`）并解锁输入。
+- **`src/ui-core/panels/dev/DevRoomSyncFloatingWindow.tsx`**:
+  - 新增 `Room Activity Mode` 快捷切换栏（`Freeplay` / `Training` / `Replay` / `Match`）及训练模式下的 `Reset Shot` 按钮。
 
 ---
 
-## 4. 进一步降低功耗、冲击稳定 90 FPS 的优化建议
+## 三、自动化验收结果
 
-当前低性能设备在 Free Play 已能稳定 75 FPS；若希望进一步压榨功耗以冲击 **90 FPS**，建议按优先级推进以下措施：
-
-1. **绕过 `MasterAcousticProcessor` 与 `AnalyserNode`（音频零后处理）**
-   - 在 `?fastest=1` 下，`AudioMixer`（`src/audio/AudioMixer.ts`）仍默认串联了 `MasterAcousticProcessor`（多段 BiquadFilter + DynamicsCompressor）和 `AnalyserNode`。在低功耗模式下可直接 `input.connect(output)` 旁路压缩器与分析器，进一步节省音频线程 DSP 开销。
-
-2. **WebGL 上下文参数极简化**
-   - 在 `RuntimeSceneBootstrap.ts` 创建 `WebGLRenderer` 时，可在 `?fastest=1` 下显式传入 `{ antialias: false, alpha: false, stencil: false, powerPreference: 'low-power', precision: 'mediump' }`。关闭 `alpha` 合成与 `stencil` 缓冲可减少移动端 Tile-based GPU（Mali / Adreno）的内存带宽与片上显存开销。
-
-3. **裁剪辅助视觉器与拖尾更新**
-   - 检查 `?fastest=1` 下是否仍需要 `ReachabilityVisualizer`、`BallLocatorArrow`、`BallSpeedTrail`、`SupersonicWheelTrailSystem`。若训练场景不需要，可在启动时跳过创建或停止其每帧几何/矩阵更新。
-
-4. **降低 React HUD / Zustand 高频状态同步频率**
-   - 75–90 FPS 下，若每帧向 React HUD（如 boost 数值、速度表、计时器）派发状态更新，会触发 DOM 重排与合成器（Compositor）额外功耗。可对 `?fastest=1` 的 HUD 刷新做节流（例如限制在 15–20 Hz 更新 UI，或仅在数值变化超过阈值时更新）。
-
-5. **主循环帧调度与物理步进对齐**
-   - 在 90 FPS 目标下，120Hz 物理步进会出现每帧 1~2 次 WASM 步进的交替抖动（1-2-1-2 帧耗时不均），在低端设备容易造成掉帧体感。可结合 `clockScheduler` 优化时间步长平滑，并在不可见/菜单冻结时完全暂停物理与渲染循环（`menuPowerSave: 'freeze'`）。
+1. **`pnpm run check`** (`radar` + `tsc --noEmit`): **PASS (GREEN)** — `1415/1415` TS 文件，0 循环依赖，0 越层导入，所有文件体积在硬上限（800L/18KB）内。
+2. **`pnpm run radar:audit`**: **PASS (GREEN)** — 无违规耦合。
+3. **`pnpm run test:multiplayer-suite`**: **14/14 PASS**
+   - 新增 **Test 14**: `14. Custom Training Pack (training_shot_reset + Metadata Sync) & Room Match Auto-Pull`，覆盖：
+     - `multiplayer_training` 切换 + 无本地 `.RCDPack` 的 `trainingPackSummary` 同步；
+     - `ACTIVITY_CONTROL` (`training_shot_reset`) 重置服务端球/车位姿、`resetGoalLatch`、Boost Pads 与 `shotResetSeq`；
+     - Host 开关 `clientInputEnabled` 对 Client 输入的门控与解锁；
+     - 已建连 P2P Peer（含 CSR `spectator` 与仅在 `sessionManager` 中的 Peer）一键切入 `match` 后自动分至蓝/橙队、自动 `ready/arenaLoaded`、立即进入 `KICKOFF` 并解锁输入，且 Client 不触发 `BotMatchMode`。

@@ -1,61 +1,45 @@
-# RocketCompanion Multiplayer Step 4 推进报告
+# RocketCompanion `z/agy/rc/multiplayer-recheck` Step 5 推进与全链路验收报告
 
-- **仓库 / 分支**: `Antigravi-ty/RocketCompanion` @ `z/agy/rc/multiplayer-recheck`
-- **Verified Bot Commit**: `938f846b7ad7f32f63ad49c57d4b779703d4019b` (`signature.isValid: true`, `state: VALID`, author: `antigravity-fine-grained-token[bot]`)
-- **Commit 链接**: https://github.com/Antigravi-ty/RocketCompanion/commit/938f846b7ad7f32f63ad49c57d4b779703d4019b
+## 1. 前序状态检查与关键修复
 
----
+在推进 Step 5（Linux Headless Chrome 真实多标签页 E2E 验收）之前，检查了分支 `origin/z/agy/rc/multiplayer-recheck` 的 Step 1-4 基线（`91ed3b5`、`9af302d`、`2e76b7d`、`938f846`）以及沙盒运行环境：
 
-## 一、前序基础状态核查（Steps 1–3）
+1. **工具链与静态资源子模块补全**：
+   - 安装 `pnpm`（`12.21.0`）并完成 `pnpm install`。
+   - 初始化 `public` 子模块（`RocketCompanionStatics.git`），补全 `public/assets/camera/camera.wasm` 以通过 `ERR_POV_MICROKERNEL_TAMPERED` 启动校验。
+2. **发现并修复 BroadcastChannel 可靠控制帧静默丢弃问题**（`src/network/transport/webrtc/webrtcHandshakePipeline.ts`）：
+   - 在真实双标签页无外部信令服务器的跨标签页（`BroadcastChannel`）通信中，`transmitReliableControlFrame` 会将 `{ type: 'global_workspace_broadcast', ... }`、`{ type: 'room_activity_switch', ... }` 等控制帧对象通过 `roomChannel.postMessage(messageObj)` 发送。
+   - 原 `classifyRoomMessage` 仅处理 `cross_tab_join` / `cross_tab_ack` / `room_answer` / `color_change` / `ping` / `pong` / `p2p_packet`，其余对象一律返回 `{ action: 'ignore' }`，导致 `global_workspace_broadcast` 与 `room_activity_switch` 在跨标签页模式下无法送达 Client。
+   - 已在 `classifyRoomMessage` 中补充对 `global_workspace_broadcast`、`room_activity_switch`、`replication_mode_set`、`state_paused_ack`、`room_csr_state_broadcast`、`tunnel_endpoint_advertise`、`peer_kick`、`peer_leave`、`voice_signal`、`diagnostic_fleet_toggle` 的识别并转为 `{ action: 'raw_packet', payload: JSON.stringify(msg) }`，打通完整控制面。
+3. **只读 E2E 诊断接口**：
+   - 在 `src/game/GameRuntime.ts`、`src/game/runtime/RuntimePostprocessingAndSessionBootstrap.ts` 与 `src/ui-core/stores/spectateWorkspaceStore.ts` 中挂载只读 `window.__rcE2E` 访问器，用于 Headless Chrome CDP 精确校验物理姿态、球位置及多 Store 状态。
 
-基于 `origin/z/agy/rc/multiplayer-recheck`（基线 `2e76b7d`）检查并实测：
-- **Step 1** (`91ed3b5`): Pure CSR Sync All、双端 Input 门控与 `DevRoomSyncFloatingWindow` 已就绪。
-- **Step 2** (`9af302d`): Telestrator (`0x05`) 全链路实时同步与权限/双 Store 联动已就绪。
-- **Step 3** (`2e76b7d`): Replay Watch Together（Pure CSR 帧注入、暂停心跳、相机同步）已就绪。
-- 基线 `pnpm run check`、`pnpm run radar:audit` 与 `pnpm run test:multiplayer-suite`（Tests 1–13）均通过。
+## 2. Step 5：Linux Headless Chrome 真实双标签页 E2E 验收
 
----
+新增自动化 E2E 脚本 `scripts/runDevRoomSyncE2E.mjs`（并注册 `package.json` 中的 `test:dev-room-sync-e2e`），在无 GUI 沙盒下通过 SwiftShader WebGL + CDP 双标签页验证完整链路（**Host 与 Client 均使用无 `?reproRole=` 后缀的普通 URL `/?skipShaderPrewarm=1`**）：
 
-## 二、Step 4 核心实现详情
+1. **Stage 1 — Host Dev UI 建房**：Host 打开 `dev-under-development` 页面点击 `Create Developer Sync Room`，生成房间号并打开 `DevRoomSyncFloatingWindow`。
+2. **Stage 2 — 普通无后缀 Client UI 加房**：Client 打开无后缀页面，导航至 `join-room` 输入房间号并提交 `Join`，通过 `BroadcastChannel` 完成建连（`connectedPeers >= 1`）。
+3. **Stage 3 — Pure CSR Sync All**：验证 Client 自动进入 `spectate_mirror`、`clientInputEnabled === false`、`followHostWorkspace === true`，以及通过 `DevRoomSyncFloatingWindow` 按钮切换 `arenaPreset`（`throwback` <-> `standard`）实时同步。
+4. **Stage 4 — Dual-End Input 门控**：验证 `clientInputEnabled === false` 时 `PredictionReconciler.sampleAndPredictInput` 将输入清零；Host 开启 `Allow Client Driving Input` 后保留输入；关闭后恢复清零。
+5. **Stage 5 — Telestrator (`0x05`) 实时同步**：Host 开启 `everyone` 权限后，通过真实 CDP `Input.dispatchMouseEvent`（`mousePressed` / `mouseMoved` / `mouseReleased`）在 Host 与 Client 3D 场地画布上双向绘制笔画并验证 `0x05` 同步计数，随后执行 Host 两步 Clear 验证双端同步清空。
+6. **Stage 6 — Replay Watch Together**：Host 切换活动至 `Replay`，验证 Client 保持轻量 CSR `freeplay` 壳且 `replayPlaybackMode === true`；Host 调用 `enterStateOnlyMode(snap, 420)` 并广播 `playbackPaused: true, pausedAtTick: 420, cameraSync`，验证 Client 同步到位。
+7. **Stage 7 — Custom Training Pack**：Host 切换活动至 `Training` 并点击 `Reset Shot`，验证 Client 无需本地 `.RCDPack` 文件即同步 `activeRoomActivity === 'multiplayer_training'` 与递增的 `shotResetSeq`。
+8. **Stage 8 — Room Match 自动拉入**：Host 点击 `Match`，验证已连接 P2P Peer 自动被拉入 Match 且 `clientInputEnabled === true`（无需二次建房/邀请）。
 
-### 1. Custom Training Pack 教练模式与无本地 `.RCDPack` 同步
-- **`src/network/server/activities/MultiplayerTrainingPolicy.ts`**:
-  - 新增 `TrainingShotMetadata`、`TrainingShotResetPayload`、`extractTrainingShotMetadata()` 与 `applyTrainingShotResetToSim()`。
-  - 服务端收到 `training_shot_reset` 时直接重置球位姿（`setBallState`）与单车/全车/多车位姿（`setCarState`），并同步重置 `resetGoalLatch()` 与 Boost Pads，递增 `shotResetSeq`。
-- **`src/network/server/activities/ActivityKernel.ts` (`MultiplayerTrainingActivityKernel`)**:
-  - `onMount` 提取并保存 `shotMetadata`（`trainingPackId`/`packId`、`packName`、`shotIndex`、`totalShots`、`shotName`、`shotDescription`），若携带初始位姿则立即执行服务端重置。
-  - `onControlMessage` 新增 `training_shot_reset` 与 `training_state_summary_update` 分发。
-  - `getStateSummary` 透出完整 `shotMetadata` 供 `CSR_STATE_BROADCAST` 与 `stateSummary` 同步。
-- **Worker / Host 通道打通**:
-  - `src/network/protocol/HostWorkerProtocol.ts`: 新增 `ACTIVITY_CONTROL`。
-  - `src/network/server/RoomActivityOrchestrator.ts`: 新增 `handleControlMessage()` 委派当前激活的 `ActivityKernel.onControlMessage`。
-  - `src/network/server/workerActivityAndInputRouter.ts`: 新增 `MSG.ACTIVITY_CONTROL` 路由并回传最新 `csr` 摘要。
-  - `src/network/server/AuthoritativeServerHost.ts`: 新增 `sendActivityControl()` 与 `resetTrainingShot()`。
-- **Bridge & Client 无本地文件渲染同步**:
-  - `src/ui-core/stores/appStoreTypes.ts`、`src/game/runtimeDomainPortTypes.ts`、`src/ui-system/core/runtimeOnlineBridgeHandlers.ts`: 扩展 `onlineSession.trainingPackSummary` 与 `bridge.onResetTrainingShot`。
-  - `src/game/runtime/OnlineMatchControlBridge.ts`: 实现 `resetTrainingShot()` 同步服务端、更新本地 Store 并广播 `ROOM_ACTIVITY_SWITCH`。
-  - `src/game/runtime/onlineSessionEnvironmentPipeline.ts` (`applyClientRoomActivitySwitch`): Client 保持轻量 CSR 接收壳，解析 `trainingPackSummary` 并按 Host 开关同步 `reconciler.setClientInputEnabled(...)`，无需本地 `.RCDPack` 文件。
+## 3. 自动化验证结果
 
-### 2. Room Match 自动拉入已建连 P2P Peer
-- **`src/network/server/activities/ActivityKernel.ts` (`MatchActivityKernel` + `autoPullConnectedPeersForMatch`)**:
-  - 在 `MatchActivityKernel.onMount` 时自动收集 `roster.players`、`roster.spectators`、`sessionManager.sessions` 及 `stateSummary.connectedPeers` 中的非 Bot 人类 Peer。
-  - 自动为尚未分配槽位的 Peer 分配玩家槽位（或从 `spectator` 切换为 `player`），并在蓝队（0）/橙队（1）之间均衡分配（若多人集中在同一队则自动交替分队）。
-  - 自动将所有已连接人类 Peer 标记为 `ready = true` 与 `arenaLoaded = true`，随后直接触发 `startMatch(duration)` 进入 `KICKOFF`，无需重新建房、二次邀请或等待手动 `arena_loaded_ack`。
-- **`src/network/server/workerActivityAndInputRouter.ts` & `src/game/runtime/OnlineMatchControlBridge.ts`**:
-  - 切换 `activityId: 'match'` 时自动将已连接 P2P Peer 传入 `stateSummary` 并同步标记 `HostSessionController.recordPeerReadyState(peerId, { ready: true, arenaLoaded: true })`。
-  - 默认自动开放 `clientInputEnabled: true`（服务端 `dataHandler` + 广播 `ROOM_ACTIVITY_SWITCH` / `GlobalWorkspaceBroadcast`），Client 侧 `applyClientRoomActivitySwitch` 在 `match` 下保持轻量 CSR 壳（不误触发本地 `BotMatchMode`）并解锁输入。
-- **`src/ui-core/panels/dev/DevRoomSyncFloatingWindow.tsx`**:
-  - 新增 `Room Activity Mode` 快捷切换栏（`Freeplay` / `Training` / `Replay` / `Match`）及训练模式下的 `Reset Shot` 按钮。
+全部命令均已执行并通过（退出码 0）：
 
----
+- `pnpm run check`：GREEN（`1415/1415` TS，`tsc --noEmit` 0 错误，0 循环依赖，0 越层引用）。
+- `pnpm run radar:audit`：GREEN（9 个审计目标结构耦合与 Ping-Pong 均在阈值内）。
+- `pnpm run test:multiplayer-suite`：ALL PASSED（Test 1 ~ Test 14 全通过）。
+- `pnpm run test:dev-room-sync-e2e`：ALL E2E CHECKS PASSED（耗时 `95335ms`）：
+  - `runtime_error === 0`
+  - `poseAnomalies === 0`
+  - `stuckInGoal === false`
 
-## 三、自动化验收结果
+## 4. 提交记录
 
-1. **`pnpm run check`** (`radar` + `tsc --noEmit`): **PASS (GREEN)** — `1415/1415` TS 文件，0 循环依赖，0 越层导入，所有文件体积在硬上限（800L/18KB）内。
-2. **`pnpm run radar:audit`**: **PASS (GREEN)** — 无违规耦合。
-3. **`pnpm run test:multiplayer-suite`**: **14/14 PASS**
-   - 新增 **Test 14**: `14. Custom Training Pack (training_shot_reset + Metadata Sync) & Room Match Auto-Pull`，覆盖：
-     - `multiplayer_training` 切换 + 无本地 `.RCDPack` 的 `trainingPackSummary` 同步；
-     - `ACTIVITY_CONTROL` (`training_shot_reset`) 重置服务端球/车位姿、`resetGoalLatch`、Boost Pads 与 `shotResetSeq`；
-     - Host 开关 `clientInputEnabled` 对 Client 输入的门控与解锁；
-     - 已建连 P2P Peer（含 CSR `spectator` 与仅在 `sessionManager` 中的 Peer）一键切入 `match` 后自动分至蓝/橙队、自动 `ready/arenaLoaded`、立即进入 `KICKOFF` 并解锁输入，且 Client 不触发 `BotMatchMode`。
+- 分支：`z/agy/rc/multiplayer-recheck`
+- 已签名 Bot 提交：`745ab8e1ed27856cf6f4acdfa4a88f59abe43df2`（`verified: true`, `web-flow` 签名，含 `Co-authored-by: Mark <29165094+MaBoCoMark@users.noreply.github.com>`）。

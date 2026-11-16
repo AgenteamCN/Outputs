@@ -1,45 +1,38 @@
-# RocketCompanion `z/agy/rc/multiplayer-recheck` Step 5 推进与全链路验收报告
+# RocketCompanion Multiplayer Step 1–5 Verification & Step 5 E2E Report
 
-## 1. 前序状态检查与关键修复
+- **Branch**: `z/agy/rc/multiplayer-recheck`
+- **Commits**:
+  - `745ab8e`: `feat(multiplayer): implement Step 5 Headless Chrome multi-tab E2E & fix BroadcastChannel control relay`
+  - `0719bf9`: `fix(multiplayer): buffer early GlobalWorkspaceBroadcast & preserve hideFooter on mirror` (`verified: true`, GPG signed as bot)
 
-在推进 Step 5（Linux Headless Chrome 真实多标签页 E2E 验收）之前，检查了分支 `origin/z/agy/rc/multiplayer-recheck` 的 Step 1-4 基线（`91ed3b5`、`9af302d`、`2e76b7d`、`938f846`）以及沙盒运行环境：
+## 1. 前序基础状态检查（Step 1–4）与补充修复
 
-1. **工具链与静态资源子模块补全**：
-   - 安装 `pnpm`（`12.21.0`）并完成 `pnpm install`。
-   - 初始化 `public` 子模块（`RocketCompanionStatics.git`），补全 `public/assets/camera/camera.wasm` 以通过 `ERR_POV_MICROKERNEL_TAMPERED` 启动校验。
-2. **发现并修复 BroadcastChannel 可靠控制帧静默丢弃问题**（`src/network/transport/webrtc/webrtcHandshakePipeline.ts`）：
-   - 在真实双标签页无外部信令服务器的跨标签页（`BroadcastChannel`）通信中，`transmitReliableControlFrame` 会将 `{ type: 'global_workspace_broadcast', ... }`、`{ type: 'room_activity_switch', ... }` 等控制帧对象通过 `roomChannel.postMessage(messageObj)` 发送。
-   - 原 `classifyRoomMessage` 仅处理 `cross_tab_join` / `cross_tab_ack` / `room_answer` / `color_change` / `ping` / `pong` / `p2p_packet`，其余对象一律返回 `{ action: 'ignore' }`，导致 `global_workspace_broadcast` 与 `room_activity_switch` 在跨标签页模式下无法送达 Client。
-   - 已在 `classifyRoomMessage` 中补充对 `global_workspace_broadcast`、`room_activity_switch`、`replication_mode_set`、`state_paused_ack`、`room_csr_state_broadcast`、`tunnel_endpoint_advertise`、`peer_kick`、`peer_leave`、`voice_signal`、`diagnostic_fleet_toggle` 的识别并转为 `{ action: 'raw_packet', payload: JSON.stringify(msg) }`，打通完整控制面。
-3. **只读 E2E 诊断接口**：
-   - 在 `src/game/GameRuntime.ts`、`src/game/runtime/RuntimePostprocessingAndSessionBootstrap.ts` 与 `src/ui-core/stores/spectateWorkspaceStore.ts` 中挂载只读 `window.__rcE2E` 访问器，用于 Headless Chrome CDP 精确校验物理姿态、球位置及多 Store 状态。
+1. **Step 1–4 基线完备性**：
+   - `91ed3b5`（Step 1 Pure CSR Sync All & `DevRoomSyncFloatingWindow`）、`9af302d`（Step 2 Telestrator 0x05 全链路同步）、`2e76b7d`（Step 3 Replay Watch Together + 相机同步）、`938f846`（Step 4 Custom Training Pack & Room Match 自动拉入）均已在 `z/agy/rc/multiplayer-recheck` 就绪。
+2. **Headless Chrome 真实多标签页联调中发现并修复的遗漏点**：
+   - **CrossTab BroadcastChannel 控制帧路由缺失**（`src/network/transport/webrtc/webrtcHandshakePipeline.ts`）：`classifyCrossTabRoomMessage` 原先未识别 `global_workspace_broadcast`、`room_activity_switch`、`replication_mode_set`、`state_paused_ack`、`room_csr_state_broadcast`、`tunnel_endpoint_advertise`、`peer_kick`、`peer_leave`、`voice_signal`、`diagnostic_fleet_toggle` 等可靠控制帧对象，导致跨标签页通信时直接被忽略。已补全路由至 `raw_packet` 交由 `DataChannelTransport` 分发。
+   - **早到 `GlobalWorkspaceBroadcast` 竞态丢包**（`src/network/transport/P2PWebRTCChannel.ts`）：若 Host 在 `onConnected` 立即下发 `activeGlobalWorkspace`，而 Client 尚未挂载 `onGlobalWorkspaceBroadcast` 回调，首帧广播会被静默丢弃。已在 `P2PWebRTCChannel` 增加 `pendingGlobalWorkspaceBroadcast` 缓冲并在挂载回调时立即回放。
+   - **Client 镜像浮窗缺少 `hideFooter` 导致运行时 Console Error**（`src/ui-system/core/runtimeSpectateWorkspaceBridge.ts`）：`applyWorkspaceStateLocally` 调用 `floatingStore.spawnWindow` 时未透传 `preset` 元数据与显式 `hideFooter: preset?.hideFooter ?? false`，触发 `[FLOATING WINDOW SCHEMA ERROR]`。已补全透传与显式 `hideFooter` 默认值。
 
 ## 2. Step 5：Linux Headless Chrome 真实双标签页 E2E 验收
 
-新增自动化 E2E 脚本 `scripts/runDevRoomSyncE2E.mjs`（并注册 `package.json` 中的 `test:dev-room-sync-e2e`），在无 GUI 沙盒下通过 SwiftShader WebGL + CDP 双标签页验证完整链路（**Host 与 Client 均使用无 `?reproRole=` 后缀的普通 URL `/?skipShaderPrewarm=1`**）：
+- **测试脚本**：`scripts/runDevRoomSyncE2E.mjs`（`pnpm run test:dev-room-sync-e2e`）
+- **覆盖流程（无 `?reproRole` 快捷后缀）**：
+  1. **Stage 1**：Host Dev UI 创建 Developer Sync Room（`1408`）并打开 `DevRoomSyncFloatingWindow`。
+  2. **Stage 2**：普通无后缀 Client UI（`/?skipShaderPrewarm=1`）通过 Play -> Join Room 输入房间码连入。
+  3. **Stage 3**：Pure CSR Sync All & `arenaPreset` 同步校验（`spectate_mirror`、`followHostWorkspace: true`、`clientInputEnabled: false`）。
+  4. **Stage 4**：双端 Input 门控校验（`PredictionReconciler.sampleAndPredictInput` 归零，Host 开关切换 ON/OFF 实时同步）。
+  5. **Stage 5**：Telestrator（`0x05`）双向实时同步与权限门控（`host_only` / `everyone`、双 Store 联动、`isCameraSynced` 放行）。
+  6. **Stage 6**：Replay Watch Together 同步（`replay` 活动切换、Pure CSR 轻量壳、`playbackPaused` / `pausedAtTick` / `cameraSync` 同步）。
+  7. **Stage 7**：Custom Training Pack 同步（`multiplayer_training` 切换、无本地 `.RCDPack` 依赖、`Reset Shot` 同步）。
+  8. **Stage 8**：Room Match 自动拉入（`switchRoomActivity('match')` 自动分配已连入 P2P Client 槽位并开放 `clientInputEnabled: true`）。
 
-1. **Stage 1 — Host Dev UI 建房**：Host 打开 `dev-under-development` 页面点击 `Create Developer Sync Room`，生成房间号并打开 `DevRoomSyncFloatingWindow`。
-2. **Stage 2 — 普通无后缀 Client UI 加房**：Client 打开无后缀页面，导航至 `join-room` 输入房间号并提交 `Join`，通过 `BroadcastChannel` 完成建连（`connectedPeers >= 1`）。
-3. **Stage 3 — Pure CSR Sync All**：验证 Client 自动进入 `spectate_mirror`、`clientInputEnabled === false`、`followHostWorkspace === true`，以及通过 `DevRoomSyncFloatingWindow` 按钮切换 `arenaPreset`（`throwback` <-> `standard`）实时同步。
-4. **Stage 4 — Dual-End Input 门控**：验证 `clientInputEnabled === false` 时 `PredictionReconciler.sampleAndPredictInput` 将输入清零；Host 开启 `Allow Client Driving Input` 后保留输入；关闭后恢复清零。
-5. **Stage 5 — Telestrator (`0x05`) 实时同步**：Host 开启 `everyone` 权限后，通过真实 CDP `Input.dispatchMouseEvent`（`mousePressed` / `mouseMoved` / `mouseReleased`）在 Host 与 Client 3D 场地画布上双向绘制笔画并验证 `0x05` 同步计数，随后执行 Host 两步 Clear 验证双端同步清空。
-6. **Stage 6 — Replay Watch Together**：Host 切换活动至 `Replay`，验证 Client 保持轻量 CSR `freeplay` 壳且 `replayPlaybackMode === true`；Host 调用 `enterStateOnlyMode(snap, 420)` 并广播 `playbackPaused: true, pausedAtTick: 420, cameraSync`，验证 Client 同步到位。
-7. **Stage 7 — Custom Training Pack**：Host 切换活动至 `Training` 并点击 `Reset Shot`，验证 Client 无需本地 `.RCDPack` 文件即同步 `activeRoomActivity === 'multiplayer_training'` 与递增的 `shotResetSeq`。
-8. **Stage 8 — Room Match 自动拉入**：Host 点击 `Match`，验证已连接 P2P Peer 自动被拉入 Match 且 `clientInputEnabled === true`（无需二次建房/邀请）。
+## 3. 自动化验收结果
 
-## 3. 自动化验证结果
-
-全部命令均已执行并通过（退出码 0）：
-
-- `pnpm run check`：GREEN（`1415/1415` TS，`tsc --noEmit` 0 错误，0 循环依赖，0 越层引用）。
-- `pnpm run radar:audit`：GREEN（9 个审计目标结构耦合与 Ping-Pong 均在阈值内）。
-- `pnpm run test:multiplayer-suite`：ALL PASSED（Test 1 ~ Test 14 全通过）。
-- `pnpm run test:dev-room-sync-e2e`：ALL E2E CHECKS PASSED（耗时 `95335ms`）：
+- `pnpm run check`（`radar` + `tsc --noEmit`）：**GREEN**（1415/1415 TS，0 边界违规）
+- `pnpm run radar:audit`：**GREEN**
+- `pnpm run test:multiplayer-suite`：**ALL PASS**（14/14）
+- `pnpm run test:dev-room-sync-e2e`：**ALL E2E CHECKS PASSED**（90152ms）
   - `runtime_error === 0`
   - `poseAnomalies === 0`
   - `stuckInGoal === false`
-
-## 4. 提交记录
-
-- 分支：`z/agy/rc/multiplayer-recheck`
-- 已签名 Bot 提交：`745ab8e1ed27856cf6f4acdfa4a88f59abe43df2`（`verified: true`, `web-flow` 签名，含 `Co-authored-by: Mark <29165094+MaBoCoMark@users.noreply.github.com>`）。

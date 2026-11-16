@@ -1,38 +1,69 @@
-# RocketCompanion Multiplayer Step 1–5 Verification & Step 5 E2E Report
+# `?fastest=1` 进一步优化与检查报告
 
-- **Branch**: `z/agy/rc/multiplayer-recheck`
-- **Commits**:
-  - `745ab8e`: `feat(multiplayer): implement Step 5 Headless Chrome multi-tab E2E & fix BroadcastChannel control relay`
-  - `0719bf9`: `fix(multiplayer): buffer early GlobalWorkspaceBroadcast & preserve hideFooter on mirror` (`verified: true`, GPG signed as bot)
+**仓库 / 分支**：`Antigravi-ty/RocketCompanion` (`z/agy/rc/fastest-ultra-low-power`)  
+**已提交 Verified Bot Commit**：[`cd5292d1bca4ee9b862bd39a1ed80e2115fa087b`](https://github.com/Antigravi-ty/RocketCompanion/commit/cd5292d1bca4ee9b862bd39a1ed80e2115fa087b) (`signature.isValid: true`)
 
-## 1. 前序基础状态检查（Step 1–4）与补充修复
+---
 
-1. **Step 1–4 基线完备性**：
-   - `91ed3b5`（Step 1 Pure CSR Sync All & `DevRoomSyncFloatingWindow`）、`9af302d`（Step 2 Telestrator 0x05 全链路同步）、`2e76b7d`（Step 3 Replay Watch Together + 相机同步）、`938f846`（Step 4 Custom Training Pack & Room Match 自动拉入）均已在 `z/agy/rc/multiplayer-recheck` 就绪。
-2. **Headless Chrome 真实多标签页联调中发现并修复的遗漏点**：
-   - **CrossTab BroadcastChannel 控制帧路由缺失**（`src/network/transport/webrtc/webrtcHandshakePipeline.ts`）：`classifyCrossTabRoomMessage` 原先未识别 `global_workspace_broadcast`、`room_activity_switch`、`replication_mode_set`、`state_paused_ack`、`room_csr_state_broadcast`、`tunnel_endpoint_advertise`、`peer_kick`、`peer_leave`、`voice_signal`、`diagnostic_fleet_toggle` 等可靠控制帧对象，导致跨标签页通信时直接被忽略。已补全路由至 `raw_packet` 交由 `DataChannelTransport` 分发。
-   - **早到 `GlobalWorkspaceBroadcast` 竞态丢包**（`src/network/transport/P2PWebRTCChannel.ts`）：若 Host 在 `onConnected` 立即下发 `activeGlobalWorkspace`，而 Client 尚未挂载 `onGlobalWorkspaceBroadcast` 回调，首帧广播会被静默丢弃。已在 `P2PWebRTCChannel` 增加 `pendingGlobalWorkspaceBroadcast` 缓冲并在挂载回调时立即回放。
-   - **Client 镜像浮窗缺少 `hideFooter` 导致运行时 Console Error**（`src/ui-system/core/runtimeSpectateWorkspaceBridge.ts`）：`applyWorkspaceStateLocally` 调用 `floatingStore.spawnWindow` 时未透传 `preset` 元数据与显式 `hideFooter: preset?.hideFooter ?? false`，触发 `[FLOATING WINDOW SCHEMA ERROR]`。已补全透传与显式 `hideFooter` 默认值。
+## 一、已完成的代码改动
 
-## 2. Step 5：Linux Headless Chrome 真实双标签页 E2E 验收
+### 1. 恢复指定音效（`?fastest=1`）
+在保留原本精简原则（跳过引擎合成器 `turtle_modem`、球体循环音、普通碰撞/进球/超音速等）的基础上，加回以下 3 类音效及其资源加载：
+- **碰撞门柱 / 横梁音效**：
+  - `src/audio/audioAssetLoader.ts`：加载 `goalpost` 与 `crossbar_ping_*`（含 `crossbar_ping_small_*`）。
+  - `src/audio/IncidentAudioEngine.ts`：在 `isFastestModeEnabled()` 分支中放行 `BALL_GOALPOST_HIT`，以及 `surfaceTag` 为 `GOALPOST` / `CROSSBAR` 或 `isCrossbar` 的 `BALL_WORLD_HIT`，转发至 `worldImpactHandler.handleBallGoalpostHit`。
+- **倒计时音效**：
+  - `src/audio/audioAssetLoader.ts`：加载 `match_countdown`、`training_countdown`、`match_countdown_10s`、`match_start_go`。
+  - `src/audio/SignalAudioEngine.ts`：`handleSignal` 与 `play` 在 `?fastest=1` 下放行 `match_countdown_321`、`training_countdown`、`match_countdown_10s`、`match_start_go`（其余 60s/30s 播报、加时、结束等仍保持跳过）。
+- **Flip Reset 音效**：
+  - `src/audio/audioAssetLoader.ts`：加载 `reset`。
+  - `src/audio/VehicleAudioManager.ts`：移除 `FLIP_RESET_GAINED` 分支中的 `if (isFastestModeEnabled()) break;` 拦截。
 
-- **测试脚本**：`scripts/runDevRoomSyncE2E.mjs`（`pnpm run test:dev-room-sync-e2e`）
-- **覆盖流程（无 `?reproRole` 快捷后缀）**：
-  1. **Stage 1**：Host Dev UI 创建 Developer Sync Room（`1408`）并打开 `DevRoomSyncFloatingWindow`。
-  2. **Stage 2**：普通无后缀 Client UI（`/?skipShaderPrewarm=1`）通过 Play -> Join Room 输入房间码连入。
-  3. **Stage 3**：Pure CSR Sync All & `arenaPreset` 同步校验（`spectate_mirror`、`followHostWorkspace: true`、`clientInputEnabled: false`）。
-  4. **Stage 4**：双端 Input 门控校验（`PredictionReconciler.sampleAndPredictInput` 归零，Host 开关切换 ON/OFF 实时同步）。
-  5. **Stage 5**：Telestrator（`0x05`）双向实时同步与权限门控（`host_only` / `everyone`、双 Store 联动、`isCameraSynced` 放行）。
-  6. **Stage 6**：Replay Watch Together 同步（`replay` 活动切换、Pure CSR 轻量壳、`playbackPaused` / `pausedAtTick` / `cameraSync` 同步）。
-  7. **Stage 7**：Custom Training Pack 同步（`multiplayer_training` 切换、无本地 `.RCDPack` 依赖、`Reset Shot` 同步）。
-  8. **Stage 8**：Room Match 自动拉入（`switchRoomActivity('match')` 自动分配已连入 P2P Client 槽位并开放 `clientInputEnabled: true`）。
+### 2. 旁路 `AudioMixer` 后处理与分析节点
+- `src/audio/AudioMixer.ts`：在 `isFastestModeEnabled()` 下跳过 `MasterAcousticProcessor`（3 段 EQ + 压缩器）与 `AnalyserNode` 的创建及连接，直接 `this.input.connect(this.output)`；`getAcousticSnapshot()` 兼容返回 `null`。
 
-## 3. 自动化验收结果
+### 3. 精简 `WebGLRenderer` 上下文配置
+- `src/game/runtime/RuntimeSceneBootstrap.ts`：在 `?fastest=1` 下初始化 `THREE.WebGLRenderer` 时显式传入：
+  ```ts
+  {
+    antialias: false,
+    alpha: false,
+    stencil: false,
+    precision: 'mediump',
+    powerPreference: 'low-power',
+  }
+  ```
+  减少移动端 Tile GPU 的帧缓冲带宽与着色器精度开销。
 
-- `pnpm run check`（`radar` + `tsc --noEmit`）：**GREEN**（1415/1415 TS，0 边界违规）
-- `pnpm run radar:audit`：**GREEN**
-- `pnpm run test:multiplayer-suite`：**ALL PASS**（14/14）
-- `pnpm run test:dev-room-sync-e2e`：**ALL E2E CHECKS PASSED**（90152ms）
-  - `runtime_error === 0`
-  - `poseAnomalies === 0`
-  - `stuckInGoal === false`
+### 4. `ReachabilityVisualizer` 状态核查与彻底跳过
+- **核查结论**：`DEFAULT_REACHABILITY_CONFIG.enabled` 默认确实为 `false`（`src/ui-core/stores/reachabilityStore.ts`），且 `ReachabilityVisualizer.update()` 在 `!config || !config.enabled` 时会直接 `return`，**并未**在关闭状态下参与每帧计算。
+- **发现的冗余**：`src/game/runtime/RuntimePostprocessingAndSessionBootstrap.ts` 在 `?fastest=1` 下仍会实例化 `new ReachabilityVisualizer(...)`，导致创建 Three.js Group/Mesh/Material 并调用 `preloadGroundReachabilityLut()`。
+- **改动**：在 `RuntimePostprocessingAndSessionBootstrap.ts` 中将 `ReachabilityVisualizer` 移入 `if (!isFastestModeEnabled())` 块内，彻底零分配、零预加载。
+
+### 5. 裁剪 `BallSpeedTrail`（保留 `BallLocatorArrow` 与 `SupersonicWheelTrail`）
+- `src/entities/ArenaWorld.ts`：`?fastest=1` 下不将 `ballSpeedTrail.object` 加入场景，`prepareBallSpeedTrail` 仅调用 `supersonicWheelTrailSystem.prepare(camera, this)`，跳过 `ballSpeedTrail.prepare(camera)`。
+- `src/entities/arena/ArenaEnvironmentManager.ts` & `src/entities/vehicle/supersonic-trail/SupersonicWheelTrailReplaySync.ts`：`?fastest=1` 下跳过 `ballSpeedTrail.reset()` 与 `ballSpeedTrail.update()`。
+- `BallLocatorArrow` 与 `SupersonicWheelTrailSystem` 均完整保留。
+
+---
+
+## 二、额外检查与新发现的优化点
+
+### 1. Bloom 与单面片特效核查
+- **Bloom 确认未开启**：在 `RuntimeSceneBootstrap.ts` 与 `GameRenderSubsystem.ts` 中，`?fastest=1` 下 `r.composer` 与 `r.boostBloom` 均为 `null`，渲染直接走 `r.renderer.render(r.arena.scene, activeCamera)`，因此 **Boost 与 SupersonicWheelTrail 不会触发 Bloom 后处理**。
+- **新发现 1 — `SupersonicWheelRibbon` 双 Pass 绘制（已修复）**：
+  - `src/entities/vehicle/supersonic-trail/SupersonicWheelRibbon.ts` 原本为每条轮迹创建两个 Mesh：`preOcclusionMesh`（Pass A）和基于模板测试（`stencilRef = 2, mask = 0x02`）的 `foregroundMesh`（Pass B，用于穿透半透明球场边框）。
+  - 在 `?fastest=1` 下不仅已关闭 `stencil: false`，而且球场为线框模式、不存在半透明边框遮挡。本次已在 `rebuildGeometry()` 中设置 `this.foregroundMesh.visible = !isFastestModeEnabled()`，**直接将超音速轮迹的 Draw Call 减半**。
+- **新发现 2 — `VehicleBoostEmitter.preload()` 预加载（已修复）**：
+  - `src/entities/vehicle/boost/vehicleBoostEmitter.ts` 的 `preload()` 原先会无条件调用 `this.goldRush.preload()`。本次在 `isFastestModeEnabled()` 下直接提前返回，避免加载多余贴图资源。
+
+### 2. 其他可参考的底层观察（本次未大改，供后续按需推进）
+- **HUD / Zustand 同步**：核查 `src/ui-core/stores/hudStore.ts` 后发现，`setBoost` 已走 `globalHudTransientChannel` 直改 DOM 且做了数值去重，`setHasFlip` 也已做 20Hz 量化节流，因此当前 HUD 并非主要瓶颈。
+- **`VehicleBoostEmitter` 构造期内存**：即使当前主题为单面片 `light-wave`（`PerformanceBoost`），`VehicleBoostEmitter` 构造函数仍会预先创建 `ArcadeBoostParticleMesh`（`drive`/`trail`）、`cone`、`nozzleFlash` 与 `RealisticBoostEmitter`（`goldRush`）；若后续想进一步压低内存与场景树节点数，可改为按需懒初始化。
+- **`PerformanceBoostShader.ts` 片元循环**：其片元着色器中 `evalCubicBezier01` 含 5 次牛顿迭代，若在极低端移动 GPU 上仍觉像素填充率吃紧，可在 `?fastest=1` 下替换为线性插值渐变。
+
+---
+
+## 三、验证结果
+- `pnpm run check`（`radar` + `tsc --noEmit`）：**通过**
+- `pnpm run build`：**通过**

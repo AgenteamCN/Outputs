@@ -1,63 +1,193 @@
-# RocketCompanion Dev Sync Room 合并与诊断报告
+# RocketCompanion Developer Sync Room (Pure CSR) — Headless Bug Reproduction Report & Detailed Architecture Plan
 
-## 1. 分支合并与环境验证结论
-
-- **Tauri 更新合并情况**：`origin/z/agy/tauri`（`78d0e0239792da9c518a62b54bba3581434adbe9`）已通过合并提交 `a78fc05` 无冲突并入 `z/agy/rc/multiplayer-recheck`，随后仓库最新提交 `3918fae`（`fix(dev-sync): enforce spectating-based freeplay/replay sync and add menu broadcast + client notification`）已在此基础上落地核心修复。
-- **在最新 HEAD（`3918fae`）上的实际校验结果**：
-  1. 静态检查：`pnpm run check`（`radar` + `tsc --noEmit`）**PASS**（1415/1415 TS 文件，0 类型错误，0 架构边界违规）。
-  2. 单元测试：`pnpm run test:multiplayer-suite` **PASS**（15/15 项全绿）。
-  3. 无头浏览器双标签 E2E：`RC_VITE_ROLE=rc-http pnpm run test:dev-room-sync-e2e` **PASS**（9/9 阶段全绿，耗时 70832ms，`runtime_error=0`，`poseAnomalies=0`，`stuckInGoal=false`）。
-     > 注：在无头 Chrome 中若使用默认 HTTPS（`basicSsl` 自签证书），会因 `net::ERR_CERT_VERIFIER_CHANGED` 导致 Microkernel 资源加载失败；使用 `RC_VITE_ROLE=rc-http`（`127.0.0.1` HTTP Secure Context）可正常启动并完成全链路校验。
+**Repository:** `Antigravi-ty/RocketCompanion`  
+**Branch:** `z/agy/rc/multiplayer-recheck`  
+**Base HEAD:** `3918fae` -> **Updated HEAD:** `98efe40` (`test(dev-sync): add Linux headless repro suite for Dev Sync Room bugs & fix E2E HTTP default`)  
+**Replay Fixture Tested:** `rc-replay-3v3-0-1-2026-11-17T05-00-24.RCReplay` (12,653 frames, 3v3)
 
 ---
 
-## 2. 为什么之前的自动化测试显示通过，但实际使用完全不对？
+## 1. Executive Summary & Linux Headless Test Results
 
-### 2.1 `scripts/runMultiplayerSuiteTests.ts`（15 项测试）属于纯内存 Mock 单元测试
-- 测试中使用的是空壳 `mockSim`（`getStateSnapshot: () => new Float32Array(0)`）以及内存直连回调替代真实 `RTCDataChannel`。
-- 该套件**从未启动** `GameRuntime`、`core.wasm`、`EntityManager`、`OnlineLobbyDualWorldController`、`ReplayTimelineController` 或 `StaticTrainingPackMode`，因此无法暴露实体错乱、WASM 内存越界或回放/训练模式冲突。
+We set up the full Linux headless toolchain (`public` submodule initialized, `pnpm install`, `google-chrome --headless=new` with SwiftShader WebGL + CDP) and scanned both the existing test suites and real user flows.
 
-### 2.2 `scripts/runDevRoomSyncE2E.mjs` 在 `74fe936` 版本存在明显断言盲区
-在 `3918fae` 补强之前，`runDevRoomSyncE2E.mjs` 存在以下漏测：
-1. **Stage 3（Freeplay / Pure CSR）**：仅断言 Host 与 Client 的 `ballPos` 距离 `< 50`，**未检查**场上总车辆数（是否多生成了 1 号实体车）、未检查 Client 的 `playerCarIndex` 是否仍为 `1`、未检查相机是否聚焦在 0 号车。
-2. **Stage 6（Replay Watch Together）**：**未加载真实 3v3（6 车）回放**，仅点击 `Replay` 按钮后手动调用 `phys.setBallState` 与 `server.enterStateOnlyMode(snap, 420)`，且只断言了 `playbackPaused` 和 `ballPos`。
-3. **Stage 7（Custom Training Pack）**：仅直接调用 `broadcastRoomActivitySwitch({ activityId: 'multiplayer_training' })` 与 `training_shot_reset` 元数据同步，**未实际进入 `StaticTrainingPackMode` 并驱动物理帧**。
-4. 此外，在未合并 `3918fae` 的 `74fe936 + 78d0e02` 上实测 `test:dev-room-sync-e2e`，**Stage 9（Match -> Replay 反向切换）直接复现了客户端崩溃**：`EntityManager.hotSwapVehicle` -> `RocketSimPhysicsEngine.setCarHitbox` -> `core.wasm` `RocketSim::Arena::AddCar` 抛出 `RuntimeError: memory access out of bounds`，导致客户端卡在 `match` 状态超时失败。
+### 1.1 Existing Suites vs. Real-World Reproduction
+1. `pnpm run check` (`radar` + `tsc --noEmit`): **PASS** (1415/1415 TS files).
+2. `pnpm run test:multiplayer-suite`: **PASS** (15/15 unit/loopback tests).
+3. `pnpm run test:dev-room-sync-e2e`: **Previously FAILED** on Linux headless due to `net::ERR_CERT_VERIFIER_CHANGED` on the second Chrome tab under Vite's self-signed `rc-https` mode. **Fixed** in `scripts/runDevRoomSyncE2E.mjs` by defaulting `RC_VITE_ROLE` to `rc-http` when unset (`runtime_error=0`, all 9 stages PASS).
+4. **Why `test:dev-room-sync-e2e` missed the bugs you hit:**
+   - Stage 6 (`Replay Watch Together`) never loaded a real `.RCReplay` file via `StandaloneReplayViewerController.handleUploadFile`; it manually called `authoritativeServer.enterStateOnlyMode(snap6, 500)`.
+   - Exhibition (`onStartMatch` -> `exp-multi-bots`) was never tested in Dev Sync Room.
+   - Multi-client (`2+` clients) and live Client driving handover (`clientInputEnabled=true`) were never tested end-to-end.
 
----
+### 1.2 New Linux Headless Repro Suite (`pnpm run repro:dev-sync-bugs`)
+Added `scripts/runDevSyncReproSuite.mjs` (report written to `/tmp/dev-sync-repro-report.json`). Running `pnpm run repro:dev-sync-bugs -- --report-only` against `z/agy/rc/multiplayer-recheck` produces:
 
-## 3. 总体设计诊断与各模式问题根因
-
-核心设计矛盾在于：**Developer Sync Room 本质上是“单向状态广播 + 观战同步（Spectating-based）”，但早期实现直接复用了“多人对战大厅（Multiplayer-based）”的实体初始化与对账管线。**
-
-### 3.1 Freeplay：客户端多生成一辆车在场地中央、看不到 Host 动作且干扰 Host
-- **根因**：
-  1. 客户端调用 `OnlineSessionCoordinator.joinOnlineServer` 时，无条件执行 `OnlineLobbyDualWorldController.prepareClientJoinLobbyWorld`：强行将 `world.playerCarIndex` 设为 `1`、开启 `arena.isLobbyMode = true`、生成 1 号车、执行 `isolateNonLocalLobbyCars(1)` **把 Host 的 0 号车隐藏**，并把客户端镜头聚焦到 1 号车。
-  2. 客户端发出的 `join` 请求默认 `role: 'player'`，Host 侧 `MatchRosterPolicyState.assignPlayerSlot`（及 `matchControlPacketPipeline`）为其分配了物理车位（`entityId = 1`）并在 Host 的 `AuthoritativeServer` 物理世界中实体化，导致场中多出一辆车直接阻挡/干扰 Host。
-  3. 即使收到 `isDevSyncRoom: true` 的 `handshake_response`，后续状态同步仍保留了双车/双世界残留状态。
-- **当前状态（`3918fae`）**：已改为默认 `spectator` / 观战广播模式，Client 不再在 Host 侧或本地生成多余实体车，保持 1 车视角跟随 Host。
-
-### 3.2 Replay Viewing（3v3 六人回放：Host 车消失只剩轨迹/Boost、Client 只剩 2 辆车）
-- **根因**：
-  1. **Host 自回环覆写与强制减车**：Host 在 Dev Sync Room 中同时运行 `AuthoritativeServer` 和自身的 `networkReconciler`（见 `simulationNetworkReconcilePipeline.ts`）。进入 Replay 查看器后，Host 的 `networkReconciler.replayPlaybackMode` 未置为 `true`，每帧仍执行 `reconciler.reconcile(now)`，接收 `AuthoritativeServer` 发回的 2 车快照；`NetworkTelemetryCollector` 随即执行 `while (sim.numCars > serverCarCount) sim.removeCar(...)`，**把 Host 刚生成的 6 辆回放车强行删减回 2 辆并覆盖物理状态**。与此同时，JS 层的 `ReplayTimelineController` / `ReplayViewerCausalSyncController` 仍在渲染 6 辆车的尾迹和 Boost Collect 特效，从而出现“能看到轨迹和吃包特效，但看不到车”。
-  2. **服务端 `stateOnlyMode` 未按快照车辆数扩容**：`MatchSystemControlSubController.loadSimSnapshot` 在恢复快照时，`AuthoritativeServer` 内部 `sim` 仍停留在 2 车槽位，导致下发给 Client 的快照也只包含 2 辆车。
-- **当前状态（`3918fae`）**：已在 `simulationNetworkReconcilePipeline.ts` 中跳过 Host 在回放模式下的自回环对账，并在 `MatchSystemControlSubController` 中读取 `SIM_OFFSETS.NUM_CARS` 以支持 6 车（3v3）状态同步；`runDevRoomSyncE2E.mjs` Stage 6 也已补充 6 车断言并通过验证。
-
-### 3.3 菜单状态广播开关与 Client 常驻退出/暂停通知
-- **设计定位**：菜单路由（`menuRoute`）和浮窗列表（`openFloatingWindows`）属于 UI 工作区镜像，不属于世界状态（World State）。
-- **当前状态（`3918fae`）**：
-  - `GlobalWorkspaceProtocol`、`spectateWorkspaceStore`、`runtimeSpectateWorkspaceBridge` 与 `DevRoomSyncFloatingWindow` 已新增 `broadcastMenuState` / `menuStateIncluded` 选项（早期测试默认 `true`），保留了“仅广播世界状态、不同步菜单”的开关接口。
-  - `OnlineRosterSyncCoordinator` 已为 Dev Sync Room Client 接入基于 `QuickNotificationStore` 的常驻通知（`persistent`），提供 **Stop Syncing**（停止跟随同步）与 **Exit Room**（退出房间）按钮，并支持点击右上角铃铛图标收起以获得纯净画面。
+| # | Scenario | Status | Observed Output / Root Cause |
+|---|----------|--------|------------------------------|
+| 1 | Freeplay Live Driving Sync | **PASS** | Host `car0=[1435,1947,17]`, Client `car0=[1420,1932,17]`, `dist=21` |
+| 2 | Exhibition 3v3 Spectating (`onStartMatch`) | **REPRODUCED_BUG** | `hostCars=1`, `clientCars=1` (expected 6 on both) |
+| 3 | Real 3v3 `.RCReplay` Load & Playback + Pause ACK | **REPRODUCED_BUG** | `hostCars=1`, `clientCars=6`, `hasPauseAckProtocol=false` |
+| 4 | Static Training Pack Pose Sync | **PASS** (initial pose) | `hostCar0=[0,4608,17]`, `clientCar0=[0,4608,17]`, `carDist=0` |
+| 5 | Multi-Client (2+ Clients) Dev Sync Room | **REPRODUCED_BUG** | `hostConnectedPeers=1`, `client2Mode="freeplay"` while Host is in `"static-training-pack"` |
+| 6 | Client Input Handover (`clientInputEnabled=true`) | **REPRODUCED_BUG** | `clientInputEnabledOnClient=true`, but Client driving leaves Host `car0` unchanged at `[-256,3840,17]` |
 
 ---
 
-## 4. 仍需推进的下一步验证与收尾事项
+## 2. Root-Cause Scan of Every Reproduced Bug
 
-1. **Custom Training Pack（`StaticTrainingPackMode`）实机与 E2E 闭环**：
-   - 目前 E2E Stage 7 仍仅测试 `multiplayer_training` 活动切换与 `training_shot_reset` 元数据，尚未真正进入 `StaticTrainingPackMode` 并校验 Host 切球/重置时 Client 的实时画面同步。
-   - 需重点排查 `staticTrainingSessionPipeline.ts` 中的 `teardownRuntimeNetworkForStaticTraining`（确保在 `isDevSyncRoom` 下不会意外拆掉房间连接），并将 `StaticTrainingPackMode` 的物理状态接入 `authoritativeServer.enterStateOnlyMode` 广播。
-2. **Telestrator“一起画画”与“不广播菜单”的解耦**：
-   - 目前 `telestratorPermission === 'everyone'` 已允许 Client 绘图（`setAllowClientDrawing(true)`），但若关闭了菜单/浮窗广播（`broadcastMenuState = false`），Host 开始画画时 Client 不会自动激活 Telestrator 画板遮罩。
-   - 建议在 `GlobalWorkspaceBroadcastPayload` 中增加独立的 `telestratorOverlayActive`（仅当 `telestratorPermission === 'everyone'` 时同步），使 Client 无需依赖菜单广播即可直接一起画画。
-3. **真实回放文件与 Tauri 客户端人工回归**：
-   - 建议在 Tauri 桌面端加载真实 3v3 `.RCReplay` 文件复核 6 车网格、NameTag、镜头切换及窗口重开后的音频恢复（`a78fc05`）。
+### Bug A (Critical): Host Runs `PredictionReconciler` Against a Competing `AuthoritativeServerWorker`
+**Smoking-gun stack trace captured in headless Chrome on Host during BOTH Exhibition and Replay:**
+```
+syncClientCarTopology (src/network/client/NetworkTelemetryCollector.ts)
+  <- ReconcilerRollbackStepper.stepReconcilePacket (src/network/client/ReconcilerRollbackStepper.ts)
+  <- ReconcilerRollbackStepper.reconcileInboundBatch (src/network/client/ReconcilerRollbackStepper.ts)
+  <- OnlineMatchReconcilerBinder (src/game/runtime/OnlineMatchReconcilerBinder.ts)
+```
+- **What happens in Exhibition (`ExperimentalMultiBotsMode`):**
+  1. `ExperimentalMultiBotsRosterController.spawnRosterFromStore()` calls `physics.addCar(...)` 6 times (`spawnedCars=6`).
+  2. `AuthoritativeServerWorker` is still running its own separate 1-car Freeplay simulation (`activeCarMask=0x01`).
+  3. Host's own `PredictionReconciler` receives the 1-car `serverTick` packet from `AuthoritativeServerWorker`, calls `syncClientCarTopology`, and **deletes cars 1..5 from Host's `physics`**, dropping Host back to `numCars=1`!
+  4. `AuthoritativeServerWorker` never receives Exhibition's 6-car state, so Client also stays at `numCars=1` while `GlobalWorkspaceBroadcast` mirrors `matchMode: 'exp-multi-bots'` to Client's UI.
+- **What happens in Real `.RCReplay` (`StandaloneReplayViewerController.handleUploadFile`):**
+  1. Host loads `rc-replay-3v3-0-1-2026-11-17T05-00-24.RCReplay` -> `rosterSubController.resolveAndApplyToArena()` spawns 6 cars (`numCarsImmediate=6`).
+  2. `_emitStateTransition` sends `enterStateOnlyMode(frame0)` asynchronously to `AuthoritativeServerWorker`, so `AuthoritativeServerWorker` loads 6 cars and streams them to Client (`clientCars=6`).
+  3. **Before** `reconciler.replayPlaybackMode = true` takes effect on Host, an in-flight 1-car `serverTick` packet from `AuthoritativeServerWorker` hits Host's `PredictionReconciler` -> `syncClientCarTopology` **deletes cars 1..5 on Host** (`numCarsAfter500=1`, `activeMask=1`)!
+  4. This directly explains: *"replay 这边的一个问题是，两端还是会被设置为对方的一个状态"* — Host and Client are fighting over two independent physics worlds.
+
+### Bug B: No Pause ACK / Retry Loop (`pauseAck` missing)
+- `GlobalWorkspaceProtocol.ts` has `playbackPaused`, `pausedAtTick`, and `pauseHeartbeatHz`, and `ReplayOnlineHeartbeatTracker` periodically broadcasts workspace state.
+- However, there is **no `pause_ack` message** from Client to Host, no per-client ACK tracking, and no reliable retry loop until ACK.
+
+### Bug C: Multi-Client (`2+` Clients) Fails in Dev Sync Room
+- When `Client2` joins the same `roomId` after `Client1`, Host `connectedPeers` remains `1` and `Client2` never receives `GlobalWorkspaceBroadcast` or state snapshots (`client2Mode="freeplay"` while Host is `"static-training-pack"`).
+- Root cause: Cross-tab/signaling channel multiplexing in `P2PWebRTCChannel` / `HostSessionController` / `HostClientChannelRegistry` needs per-peer `peerId` isolation rather than single-room-broadcast assumptions.
+
+### Bug D: Client Input Handover (`clientInputEnabled=true`) Does Not Move the Car
+- In Dev Sync Room, Client joins as `role='spectator'` (`playerCarIndex=0`, `spectateMirrorMode=true`, `replayPlaybackMode` or `spectateMirrorMode` bypassing input send).
+- Even when Host sets `clientInputEnabled=true`, Client's inputs are not forwarded to Host's active car `0` (nor does Client take authority over car `0`), so Client driving has zero effect.
+
+---
+
+## 3. Architectural Answers & Design Decisions
+
+### 3.1 Spectating / Broadcasting vs. Match Gameplay (Do We Need Reverse Delay?)
+**Yes — your intuition is spot-on.** Gameplay and Spectating have opposite requirements:
+1. **Match Mode (Forward-Predicted Gameplay):**
+   - Needs forward prediction (`PredictionReconciler` + input buffer lead ticks) so local inputs feel instant and arrive at the server before the server steps that tick.
+2. **Developer Broadcasting Host / Spectating Mode (Pure CSR):**
+   - **Zero forward prediction, zero rollback, zero local physics stepping** on the Client.
+   - **Should Client render immediately on packet arrival or use a reverse-delayed interpolation buffer?**
+     - **Use a small reverse-delayed Jitter/Interpolation Buffer**, NOT raw immediate-apply.
+     - Why: Over real P2P/WebRTC, packets arrive with jitter (e.g. RTT=60ms, one-way=30ms ± 15ms jitter). If you apply every packet immediately on arrival, car/ball motion will micro-stutter whenever 2 packets arrive in one render frame and 0 in the next.
+     - **Formula:** Target `renderTick = latestReceivedHostTick - interpDelayTicks`, where:
+       - `interpDelayTicks = clamp(ceil((jitterMs * 2 + tickIntervalMs) / 8.333), 2, 12)` (at 60ms RTT with ~15ms jitter, `3..5` frames = `25..42ms` behind Host).
+       - Client keeps a ring buffer of received `HostBroadcastFrame` snapshots sorted by `hostTick` and **interpolates** (`lerp` pos/vel, `slerp` quat) between `snap[floor(renderTick)]` and `snap[ceil(renderTick)]`!
+       - **Important:** Do NOT use `RTT / 2` as extra delay on top of network transit — the packet already took `RTT / 2` to arrive; the buffer only needs to absorb **packet-interval + jitter** (`~2–5 frames` at 120Hz, i.e., `16–42ms`).
+
+### 3.2 Should We Rewrite From Scratch? -> Clean Two-Archetype Split
+You do **not** need to rewrite RocketSim, Three.js rendering, or WebRTC/Tunnel transport from scratch. You **do** need a clean architectural separation between the two core archetypes so every mode (Match, Spectate, Replay, Exhibition, Training) is a clean subset:
+
+1. **Archetype 1: `MatchModePipeline` (Forward-Predicted Gameplay)**
+   - Used for: Online 1v1/2v2/3v3 Match, Room Match Auto-Pull.
+   - `AuthoritativeServerWorker` owns physics; all players (including Host) run `PredictionReconciler`.
+2. **Archetype 2: `BroadcastSpectatePipeline` (Developer Broadcasting Host / Pure CSR)**
+   - Used for: Freeplay Watch, Exhibition Spectating, Replay Watch Together, Match Spectate Mode (carved out by disabling dev-only windows/telestrator/input handover).
+   - **Host side:**
+     - Host's main-thread `physics` (whether Freeplay, `ExperimentalMultiBotsMode`, `StandaloneReplayViewerController`, or `StaticTrainingPackMode`) is the **sole source of truth**.
+     - Host **MUST NOT** run `PredictionReconciler` or `syncClientCarTopology` against `AuthoritativeServerWorker`.
+     - Host runs a lightweight `HostBroadcastPublisher` at the end of `SimulationStage` (only when `isDevSyncRoom` and not in `match` mode):
+       - Captures `physics.saveCompactState()` + `cameraSync` + `modeId` + `tick` + `pauseState` (at 60Hz or 120Hz configurable) and fans it out to **all N connected peer channels** (`HostClientChannelRegistry`).
+   - **Client side:**
+     - Client runs `PureCsrInterpolationReceiver` (no `AuthoritativeServerWorker` rollback, no `syncClientCarTopology` fighting local modes):
+       - Ensures `physics` car count matches `frame[SIM_OFFSETS.NUM_CARS]`.
+       - Interpolates between buffered snapshots at `latestTick - interpDelayTicks` and calls `applyReplayFrameToEngine(physics, interpSnap, interpolator)`.
+       - Mirrors `cameraSync` (FreeCam eye/target or BallCam + `focusedCarIndex`) and `GlobalWorkspaceBroadcast` (optionally gated by `followHostWorkspace`).
+
+### 3.3 Replay Pause, Retry-Until-ACK, and Low-Frequency Heartbeat
+- **Protocol addition (`0x06` or `GlobalWorkspaceProtocol` control frame):**
+  - `PAUSE_STATE_SYNC`: `{ pauseSeq: number, paused: boolean, pausedAtTick: number, snapshotHash?: number }`
+  - `PAUSE_STATE_ACK`: `{ pauseSeq: number, paused: boolean, pausedAtTick: number, peerId: string }`
+- **Host state machine:**
+  1. Host clicks Pause -> increments `pauseSeq`, stops streaming physics snapshots, enters `awaitingPauseAck` for all connected `peerIds`.
+  2. While `unackedPeers.size > 0`, Host resends `PAUSE_STATE_SYNC` every `100ms` (with exponential cap or max 5s warning toast if a peer is dead).
+  3. Once all peers ACK (`PAUSE_STATE_ACK` with matching `pauseSeq`), Host transitions to `pausedIdle`:
+     - `0 Hz` physics state traffic.
+     - `1–2 Hz` lightweight keepalive heartbeat (`{ type: 'presence_ping', pauseSeq, paused: true, pausedAtTick }`).
+  4. On Resume -> increments `pauseSeq`, sets `paused: false`, resumes physics snapshot stream.
+
+### 3.4 Telestrator (Drawing)
+- **Already implemented and passing** (`Telestrator (0x05)` bidirectional stroke sync, 50-stroke stress test, `host_only` / `everyone` permission gating). **Keep as-is.**
+
+### 3.5 Training / Coaching Session (Static & Dynamic Packs) + Control Handover
+You compared two approaches for handing control from Coach (Host) to Student (Client):
+- **Option 1 (Input Forwarding):** Client sends `CarControls` to Host -> Host simulates -> Host broadcasts state back.
+  - *Pros:* Easy authority, Host never loses state.
+  - *Cons:* Student feels `RTT` (60–120ms) input lag on every turn/flip, ruining muscle-memory training.
+- **Option 2 (Authority Handover / FPV Master-Slave — Recommended):**
+  - **Normal (Coach Demo):** Host is `inputAuthority = 'host'`. Host simulates locally (0ms lag) and broadcasts state to Client(s).
+  - **Student Turn (`clientInputEnabled = true` / `inputAuthority = 'client'`):**
+    1. Host sends `CONTROL_AUTHORITY_GRANT` (`targetPeerId`, `shotStateSnapshot`, `tick`).
+    2. Student simulates **locally** at 120Hz (0ms input lag!) and streams `saveCompactState()` back to Host via the exact same `BroadcastFrame` format (`authorityEpoch`).
+    3. Host switches to `PureCsrInterpolationReceiver` for the duration of the attempt and watches the Student in real time.
+  - **FPV Master/Slave Override:**
+    - When `authorityMode === 'fpv_master_slave'`:
+      - If Host has **any non-neutral input** (`|throttle| > 0.05 || |steer| > 0.05 || jump || boost`), Host immediately increments `authorityEpoch`, sends `CONTROL_AUTHORITY_RECLAIM` (ignoring further Student frames with older `authorityEpoch`), and resumes local simulation from the latest received Student snapshot (or resets shot).
+      - When Host is idle for `> 300ms` (or explicitly hands over), Student can drive.
+
+### 3.6 "Looks Like You Are Playing" (100ms Idle Necto Takeover)
+- **Recommendation: Defer to Phase 5 (after Core Broadcast/Exhibition/Replay/Training Sync are solid).**
+- Keep it completely decoupled inside `RuntimeInputPoller.ts` / `TouchInputAgentController.ts` as an optional local input source (`idleBotTakeoverMs = 100`, default off) so it never entangles with network authority or `PredictionReconciler`.
+
+---
+
+## 4. Detailed Step-by-Step Implementation Plan (Executable by Any Engineer)
+
+### Phase 1: Fix Host Self-Reconciliation & Pure CSR Broadcast Path (Fixes Bugs #2 & #3)
+1. **Disable Host `PredictionReconciler` in Broadcasting Modes:**
+   - Target files: `src/game/pipeline/stages/SimulationStage.ts`, `src/game/runtime/OnlineMatchReconcilerBinder.ts`, `src/game/runtime/MatchModeTransitionBridge.ts`.
+   - When `onlineSession.isDevSyncRoom && activeRoomActivity !== 'match'`:
+     - Skip `reconciler.reconcile()` / `syncClientCarTopology()` on Host so `AuthoritativeServerWorker` can **never** overwrite Host's Exhibition (`6` cars), Replay (`6` cars), or Training (`1` car) physics.
+2. **Add `HostBroadcastPublisher` at the end of `SimulationStage`:**
+   - Target files: `src/game/pipeline/stages/SimulationStage.ts`, `src/network/server/AuthoritativeServerHost.ts`, `src/network/transport/HostSessionController.ts`.
+   - For Freeplay, `exp-multi-bots` (Exhibition), `static-training-pack`, `dynamic-training-pack`, and `replay-viewer`: Host pushes `physics.saveCompactState()` directly to `enterStateOnlyMode` / broadcast fan-out (throttled to 60Hz or 120Hz) so `AuthoritativeServerWorker` / Client always mirrors whatever Host's `physics` has, including all 6 cars in Exhibition and `.RCReplay`.
+3. **Synchronous `replayPlaybackMode` & Car-Count Sync:**
+   - Target files: `src/replay/StandaloneReplayViewerController.ts`, `src/replay/ReplayFrameInterpolator.ts`.
+   - Ensure `applyReplayFrameToEngine` / `StandaloneReplayViewerController` syncs `addCarAtSlot` / `removeCar` cleanly when loading a 3v3 `.RCReplay`, and Host does not get reset by `OnlineRosterSyncCoordinator`.
+
+### Phase 2: Client Pure CSR Interpolation Buffer (Reverse Delay)
+1. **Implement `SpectateInterpolationBuffer`:**
+   - Target files: `src/network/sync/ReplicationStateInterpolator.ts`, `src/game/pipeline/stages/simulationNetworkReconcilePipeline.ts`.
+   - Buffer incoming `BroadcastFrame`s by `hostTick`.
+   - Dynamically compute `interpDelayTicks = clamp(ceil((jitterMs * 2 + 8.33) / 8.33), 2, 10)` (~25–50ms at typical RTT).
+   - Interpolate car transforms (`pos`, `vel`, `quat`) and ball transform between bracketing frames instead of immediate-snapping.
+
+### Phase 3: Reliable Pause/Resume ACK + Low-Frequency Heartbeat
+1. **Extend `GlobalWorkspaceProtocol.ts` & `HostSessionController.ts`:**
+   - Add `pauseSeq`, `PAUSE_STATE_SYNC`, `PAUSE_STATE_ACK`.
+   - Host retries `PAUSE_STATE_SYNC` every `100ms` per un-ACKed `peerId` until all peers ACK; then drops physics stream to `0Hz` and keeps `1–2Hz` presence heartbeat.
+
+### Phase 4: Multi-Client Fan-Out & Control Handover (Fixes Bugs #5 & #6)
+1. **Fix Multi-Client Room Fan-Out (`HostClientChannelRegistry` / `P2PWebRTCChannel`):**
+   - Ensure `HostSessionController` maintains independent `PeerSession` / `DataChannel` / `BroadcastChannel` routes per `peerId` so 2+ clients all receive `GlobalWorkspaceBroadcast` and `BroadcastFrame` simultaneously.
+2. **Implement Authority Handover + FPV Master/Slave:**
+   - Add `authorityEpoch` and `activeInputPeerId` to room state.
+   - When `clientInputEnabled` is granted to a peer, Client runs local physics and streams `BroadcastFrame` back to Host; if Host moves (FPV override), Host increments `authorityEpoch` and immediately reclaims simulation authority.
+
+### Phase 5: Carve Out Production "Match Spectating Mode" & Optional Necto Idle Takeover
+1. **Match Spectating Mode:**
+   - Reuse `BroadcastSpectatePipeline` with `devFloatingWindows = disabled`, `clientInputEnabled = false`, `followHostWorkspace = false` (Spectator keeps local camera/scoreboard control).
+2. **Optional "Looks Like You Are Playing" (100ms Idle Necto):**
+   - Implement in `RuntimeInputPoller.ts` behind an explicit toggle (`autoTakeoverIdleMs = 100`), completely isolated from network state.
+
+---
+
+## 5. Verification Gate
+Once Phases 1–4 are implemented, the acceptance gate on Linux headless is:
+```bash
+pnpm run check
+pnpm run test:multiplayer-suite
+pnpm run test:dev-room-sync-e2e
+pnpm run repro:dev-sync-bugs
+```
+All 6 scenarios in `repro:dev-sync-bugs` must transition from `REPRODUCED_BUG` to `PASS` (`reproducedBugs === 0`).

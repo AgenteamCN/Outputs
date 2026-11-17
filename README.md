@@ -1,64 +1,63 @@
-# RocketCompanion Developer Sync Room 诊断、Tauri 合并与修复报告
+# RocketCompanion Dev Sync Room 合并与诊断报告
 
-## 1. 仓库与分支操作结果
-- **Tauri 更新合并**：已将 `origin/z/agy/tauri`（`78d0e0239792da9c518a62b54bba3581434adbe9`）无冲突合并至 `z/agy/rc/multiplayer-recheck`（原基线 `74fe936e5eb11b5c3ffa2382b18460f6a8df029c`）。
-- **Verified Bot Commits**（均已通过 GitHub App 自动 GPG 签名，`verified: true`）：
-  - Merge Commit: `a78fc05c0a28c92ee3ac0a542117e0efae90b663`（合并 `origin/z/agy/tauri`）
-  - Fix Commit: `3918fae6ca21e21c2ed3af0f91617b287073a9cd`（架构与同步修复 + 接口增强 + E2E 断言加固）
+## 1. 分支合并与环境验证结论
 
----
-
-## 2. 总体架构诊断：为什么会出现这些“离谱”现象？
-
-你判断得非常准确——**核心问题是设计思路错位，而非底层传输（WebRTC / BroadcastChannel / Tunnel）连接故障**。
-
-早期实现把 `Developer Sync Room` 当成了 **Multiplayer-based（多人实体化对抗房间）**，再在其上打“禁输入 / 观战”的补丁；而实际使用场景是 **Spectating-based（主机状态广播 / 导演观战模式，仅在显式切入 Match / 允许画画等场景下才临时拉起交互）**：
-
-1. **Freeplay 中 Client 强行生成第二辆车并挡路、视角锁死在自己车上**：
-   - **原因 A（服务端误判为非训练/自动开赛房间）**：`MatchRosterPolicyState` 在 `isDevSyncRoom: true` 且 `lobbyMode: false` 时，将 `isTrainingMode` 默认设为 `false`、`autoStartWhenFull` 默认设为 `true`；同时 `MatchRosterSubController.assignPlayerSlot` 把 `state === 'playing'` 视为正式比赛，导致 Client 加入时被分配了一个实体车位（`car 1`）并插进场地中央/开球位，直接阻挡 Host（`car 0`）。
-   - **原因 B（Client 根本没收到/没处理 `handshake_response`）**：`MatchRosterPolicyState.buildHandshakeJson` 在 `handshake_response` JSON 中附带了 `serverTick: this.matchTick`，而客户端 `reconcilerInboundPacketParser.ts` 先判断 `if (typeof obj.serverTick === 'number')`，后判断 `else if (obj.type === 'handshake_response')`！导致所有 `handshake_response` 均被当成普通物理帧吞掉，Client 一直停留在 `joinOnlineServer` 预创建的双车默认状态（`numCars: 2, playerCarIndex: 1, focusedCarIndex: 1, isDevSyncRoom: false`）。
-   - **原因 C（`applyRosterSnapshot` 时序反转）**：`OnlineMatchReconcilerBinder.handleClientHandshakeResponse` 先调 `applyRosterSnapshot` 后调 `setOnlineSession`，导致首次同步名册时 `isDevSyncRoom` 仍为 `false`，Client 名册与视角目标错乱。
-
-2. **3v3（6 车）Replay 回放中“有轨迹/Eat Boost，但车消失 / 只剩 2 辆车”**：
-   - **原因 A（Snapshot 车数偏移量读错）**：`SIM_OFFSETS.NUM_CARS` 在协议中是索引 **`2`**（索引 `0` 是 `TICK`，索引 `1` 是 `GOAL`），但 `MatchSystemControlSubController` 的 `loadSimSnapshot` 和 `stepStateOnlyFrameIfActive` 读取了 `snap[1]`（`GOAL`），导致 `headerCars / snapCarCount` 经常读成 `0`，`stateOnlyCarMask` 回退为 `physicsManager.getActiveCarMask()`（仅 `1` 或 `3`，即 1~2 辆车），Client 只收到前 1~2 辆车的状态，6 车轨迹与吃球/吃包事件却照常渲染。
-   - **原因 B（Host 回放自回声覆盖）**：Host 开启 `replayPlaybackMode` 后，`simulationNetworkReconcilePipeline.ts` 仍对非 Goal Replay 的 `drainedReplayPackets` 执行 `applyReplayFrameToEngine`，用 Worker 回传的 2 车包覆盖了 Host 本地正在播放的 6 车回放物理状态。
-
-3. **为什么之前的自动化测试显示“全部通过”？**
-   - `scripts/runMultiplayerSuiteTests.ts`（15 项）全部基于内存 Mock（`mockSim`、`mockPhysicsManager` 等），没有接入真实的 `RocketSim` WASM、`AuthoritativeServerWorker`、`PredictionReconciler` 报文解析器和 `AppStore` 状态。
-   - `scripts/runDevRoomSyncE2E.mjs` 虽然跑了真实双标签页 Headless Chrome，但存在**断言盲区**：
-     - Stage 2/3 只检查了 `connectedPeers >= 1` 和球坐标距离 `< 50`，**从未检查** `physics.numCars`、`playerCarIndex`、`focusedCarIndex`、`isDevSyncRoom` 是否真为 `1` 车观战状态；
-     - Stage 6（Replay）只注入了单车状态下移动的球位置，**从未测试** 3v3（6 车）回放时的双端 `numCars === 6`。
-
-4. **Telestrator（一起画画）与 Training Pack 状态确认**：
-   - **Telestrator**：底层与 UI 均已实现。`TelestratorWireCodec`（`0x05`）+ `hostTelestratorRelay` + `telestratorStore.allowClientDrawing` + `activeGlobalWorkspace.telestratorPermission === 'everyone'` 已打通；当 Host 开启 `All Clients: ON`（或 `telestratorPermission: 'everyone'`）时，Client 可直接同步绘制并双向广播笔画。
-   - **Training Pack**：通过 `ROOM_ACTIVITY_SWITCH`（`multiplayer_training`）与 `training_shot_reset` 同步元数据与重置动作；Client 默认作为旁观视角跟随 Host 的 `car 0` 演练。
+- **Tauri 更新合并情况**：`origin/z/agy/tauri`（`78d0e0239792da9c518a62b54bba3581434adbe9`）已通过合并提交 `a78fc05` 无冲突并入 `z/agy/rc/multiplayer-recheck`，随后仓库最新提交 `3918fae`（`fix(dev-sync): enforce spectating-based freeplay/replay sync and add menu broadcast + client notification`）已在此基础上落地核心修复。
+- **在最新 HEAD（`3918fae`）上的实际校验结果**：
+  1. 静态检查：`pnpm run check`（`radar` + `tsc --noEmit`）**PASS**（1415/1415 TS 文件，0 类型错误，0 架构边界违规）。
+  2. 单元测试：`pnpm run test:multiplayer-suite` **PASS**（15/15 项全绿）。
+  3. 无头浏览器双标签 E2E：`RC_VITE_ROLE=rc-http pnpm run test:dev-room-sync-e2e` **PASS**（9/9 阶段全绿，耗时 70832ms，`runtime_error=0`，`poseAnomalies=0`，`stuckInGoal=false`）。
+     > 注：在无头 Chrome 中若使用默认 HTTPS（`basicSsl` 自签证书），会因 `net::ERR_CERT_VERIFIER_CHANGED` 导致 Microkernel 资源加载失败；使用 `RC_VITE_ROLE=rc-http`（`127.0.0.1` HTTP Secure Context）可正常启动并完成全链路校验。
 
 ---
 
-## 3. 本次已完成的核心修复与新增能力
+## 2. 为什么之前的自动化测试显示通过，但实际使用完全不对？
 
-1. **Spectating-based 默认模型固化（消除 Freeplay 幽灵车 & 修复握手）**：
-   - `src/network/client/reconcilerInboundPacketParser.ts`：调整分支顺序，优先处理 `roster_update` 与 `handshake_response`，修复 `handshake_response` 因携带 `serverTick` 被误判吞掉的根本 Bug。
-   - `src/network/server/match/MatchRosterPolicyState.ts` & `HostWorkerMessageRouter.ts`：`isDevSyncRoom && !lobbyMode` 时强制 `isTrainingMode = true`、`state = MATCH_STATES.PLAYING`、`autoStartWhenFull = false`，并在旁观握手包中携带 `initialSnapshot`。
-   - `src/network/server/match/MatchRosterSubController.ts`、`matchRosterSlotAssignmentPipeline.ts`、`matchControlPacketPipeline.ts`、`ActivityKernel.ts`：非比赛态加入 Dev Sync Room 的非 Host 客户端统一分配为 `'spectator'`；从 Match 退出回到 Freeplay/Replay/Training 时自动降级回 `'spectator'`。
-   - `src/game/runtime/OnlineMatchReconcilerBinder.ts`、`OnlineRosterSyncCoordinator.ts`、`onlineLobbyTransitionPipeline.ts`、`GameCameraSubsystem.ts`：先写入 `onlineSession.isDevSyncRoom` 再应用名册；Client 旁观态保持 `numCars = 1`、`playerCarIndex = 0`、`focusedCarIndex = 0`，彻底消除场地中央的幽灵车并锁定 Host 视角。
+### 2.1 `scripts/runMultiplayerSuiteTests.ts`（15 项测试）属于纯内存 Mock 单元测试
+- 测试中使用的是空壳 `mockSim`（`getStateSnapshot: () => new Float32Array(0)`）以及内存直连回调替代真实 `RTCDataChannel`。
+- 该套件**从未启动** `GameRuntime`、`core.wasm`、`EntityManager`、`OnlineLobbyDualWorldController`、`ReplayTimelineController` 或 `StaticTrainingPackMode`，因此无法暴露实体错乱、WASM 内存越界或回放/训练模式冲突。
 
-2. **6 车（3v3）Replay 同步修复**：
-   - `src/network/server/match/MatchSystemControlSubController.ts`：改用 `SIM_OFFSETS.NUM_CARS`（索引 `2`）读取快照车数，在 `loadSimSnapshot` 中提前扩容 `pm.sim` 槽位，在 `stepStateOnlyFrameIfActive` 中生成正确的 `stateOnlyCarMask`（6 车时为 `0x3f`）。
-   - `src/game/pipeline/stages/simulationNetworkReconcilePipeline.ts`：当 `server && !flags.isGoalReplay` 时跳过 `applyReplayFrameToEngine`，防止 Host 自我回声覆盖本地回放。
-
-3. **仅广播 State 接口（菜单状态可选剥离）**：
-   - 在 `GlobalWorkspaceProtocol.ts`、`spectateWorkspaceStore.ts`、`runtimeSpectateWorkspaceBridge.ts` 及 `DevRoomSyncFloatingWindow.tsx` 新增 `menuStateIncluded` / `broadcastMenuState` 开关（默认保持 `true` 以便早期联调，关闭后仅广播相机/播放/活动状态，不再同步菜单与浮窗）。
-
-4. **Client 常驻状态通知与快捷退出**：
-   - 在 `runtimeSpectateWorkspaceBridge.ts` 中通过 `QuickNotificationSystem` 推送常驻通知（`id: 'dev-sync-room-client'`, `type: 'ongoing'`），提供 **Stop Syncing / Resume Sync** 与 **Exit Room** 操作按钮，支持通过右上角小铃铛图标收起为纯净画面，离开房间时自动销毁。
-
-5. **自动化测试加固**：
-   - 在 `scripts/runDevRoomSyncE2E.mjs` 的 Stage 2 增加了 Freeplay 双端 `numCars === 1`、`client.playerCarIndex === 0`、`client.camera.focusedCarIndex === 0`、`isDevSyncRoom === true` 硬断言；在 Stage 6 增加了 6 车（3v3）Replay 快照双端 `numCars === 6` 硬断言。
+### 2.2 `scripts/runDevRoomSyncE2E.mjs` 在 `74fe936` 版本存在明显断言盲区
+在 `3918fae` 补强之前，`runDevRoomSyncE2E.mjs` 存在以下漏测：
+1. **Stage 3（Freeplay / Pure CSR）**：仅断言 Host 与 Client 的 `ballPos` 距离 `< 50`，**未检查**场上总车辆数（是否多生成了 1 号实体车）、未检查 Client 的 `playerCarIndex` 是否仍为 `1`、未检查相机是否聚焦在 0 号车。
+2. **Stage 6（Replay Watch Together）**：**未加载真实 3v3（6 车）回放**，仅点击 `Replay` 按钮后手动调用 `phys.setBallState` 与 `server.enterStateOnlyMode(snap, 420)`，且只断言了 `playbackPaused` 和 `ballPos`。
+3. **Stage 7（Custom Training Pack）**：仅直接调用 `broadcastRoomActivitySwitch({ activityId: 'multiplayer_training' })` 与 `training_shot_reset` 元数据同步，**未实际进入 `StaticTrainingPackMode` 并驱动物理帧**。
+4. 此外，在未合并 `3918fae` 的 `74fe936 + 78d0e02` 上实测 `test:dev-room-sync-e2e`，**Stage 9（Match -> Replay 反向切换）直接复现了客户端崩溃**：`EntityManager.hotSwapVehicle` -> `RocketSimPhysicsEngine.setCarHitbox` -> `core.wasm` `RocketSim::Arena::AddCar` 抛出 `RuntimeError: memory access out of bounds`，导致客户端卡在 `match` 状态超时失败。
 
 ---
 
-## 4. 最终验证结果
-- `pnpm run check`（Radar 架构边界 + TypeScript `tsc --noEmit`）：**PASS（0 错误）**
-- `pnpm run test:multiplayer-suite`（15 项联机协议与状态机测试）：**PASS（15/15）**
-- `pnpm run test:dev-room-sync-e2e`（双标签页真实 Headless Chrome E2E，含 Freeplay 1 车观战与 6 车 Replay 断言）：**PASS（9/9 阶段全部通过，`runtime_error=0`, `poseAnomalies=0`, `stuckInGoal=false`）**
+## 3. 总体设计诊断与各模式问题根因
+
+核心设计矛盾在于：**Developer Sync Room 本质上是“单向状态广播 + 观战同步（Spectating-based）”，但早期实现直接复用了“多人对战大厅（Multiplayer-based）”的实体初始化与对账管线。**
+
+### 3.1 Freeplay：客户端多生成一辆车在场地中央、看不到 Host 动作且干扰 Host
+- **根因**：
+  1. 客户端调用 `OnlineSessionCoordinator.joinOnlineServer` 时，无条件执行 `OnlineLobbyDualWorldController.prepareClientJoinLobbyWorld`：强行将 `world.playerCarIndex` 设为 `1`、开启 `arena.isLobbyMode = true`、生成 1 号车、执行 `isolateNonLocalLobbyCars(1)` **把 Host 的 0 号车隐藏**，并把客户端镜头聚焦到 1 号车。
+  2. 客户端发出的 `join` 请求默认 `role: 'player'`，Host 侧 `MatchRosterPolicyState.assignPlayerSlot`（及 `matchControlPacketPipeline`）为其分配了物理车位（`entityId = 1`）并在 Host 的 `AuthoritativeServer` 物理世界中实体化，导致场中多出一辆车直接阻挡/干扰 Host。
+  3. 即使收到 `isDevSyncRoom: true` 的 `handshake_response`，后续状态同步仍保留了双车/双世界残留状态。
+- **当前状态（`3918fae`）**：已改为默认 `spectator` / 观战广播模式，Client 不再在 Host 侧或本地生成多余实体车，保持 1 车视角跟随 Host。
+
+### 3.2 Replay Viewing（3v3 六人回放：Host 车消失只剩轨迹/Boost、Client 只剩 2 辆车）
+- **根因**：
+  1. **Host 自回环覆写与强制减车**：Host 在 Dev Sync Room 中同时运行 `AuthoritativeServer` 和自身的 `networkReconciler`（见 `simulationNetworkReconcilePipeline.ts`）。进入 Replay 查看器后，Host 的 `networkReconciler.replayPlaybackMode` 未置为 `true`，每帧仍执行 `reconciler.reconcile(now)`，接收 `AuthoritativeServer` 发回的 2 车快照；`NetworkTelemetryCollector` 随即执行 `while (sim.numCars > serverCarCount) sim.removeCar(...)`，**把 Host 刚生成的 6 辆回放车强行删减回 2 辆并覆盖物理状态**。与此同时，JS 层的 `ReplayTimelineController` / `ReplayViewerCausalSyncController` 仍在渲染 6 辆车的尾迹和 Boost Collect 特效，从而出现“能看到轨迹和吃包特效，但看不到车”。
+  2. **服务端 `stateOnlyMode` 未按快照车辆数扩容**：`MatchSystemControlSubController.loadSimSnapshot` 在恢复快照时，`AuthoritativeServer` 内部 `sim` 仍停留在 2 车槽位，导致下发给 Client 的快照也只包含 2 辆车。
+- **当前状态（`3918fae`）**：已在 `simulationNetworkReconcilePipeline.ts` 中跳过 Host 在回放模式下的自回环对账，并在 `MatchSystemControlSubController` 中读取 `SIM_OFFSETS.NUM_CARS` 以支持 6 车（3v3）状态同步；`runDevRoomSyncE2E.mjs` Stage 6 也已补充 6 车断言并通过验证。
+
+### 3.3 菜单状态广播开关与 Client 常驻退出/暂停通知
+- **设计定位**：菜单路由（`menuRoute`）和浮窗列表（`openFloatingWindows`）属于 UI 工作区镜像，不属于世界状态（World State）。
+- **当前状态（`3918fae`）**：
+  - `GlobalWorkspaceProtocol`、`spectateWorkspaceStore`、`runtimeSpectateWorkspaceBridge` 与 `DevRoomSyncFloatingWindow` 已新增 `broadcastMenuState` / `menuStateIncluded` 选项（早期测试默认 `true`），保留了“仅广播世界状态、不同步菜单”的开关接口。
+  - `OnlineRosterSyncCoordinator` 已为 Dev Sync Room Client 接入基于 `QuickNotificationStore` 的常驻通知（`persistent`），提供 **Stop Syncing**（停止跟随同步）与 **Exit Room**（退出房间）按钮，并支持点击右上角铃铛图标收起以获得纯净画面。
+
+---
+
+## 4. 仍需推进的下一步验证与收尾事项
+
+1. **Custom Training Pack（`StaticTrainingPackMode`）实机与 E2E 闭环**：
+   - 目前 E2E Stage 7 仍仅测试 `multiplayer_training` 活动切换与 `training_shot_reset` 元数据，尚未真正进入 `StaticTrainingPackMode` 并校验 Host 切球/重置时 Client 的实时画面同步。
+   - 需重点排查 `staticTrainingSessionPipeline.ts` 中的 `teardownRuntimeNetworkForStaticTraining`（确保在 `isDevSyncRoom` 下不会意外拆掉房间连接），并将 `StaticTrainingPackMode` 的物理状态接入 `authoritativeServer.enterStateOnlyMode` 广播。
+2. **Telestrator“一起画画”与“不广播菜单”的解耦**：
+   - 目前 `telestratorPermission === 'everyone'` 已允许 Client 绘图（`setAllowClientDrawing(true)`），但若关闭了菜单/浮窗广播（`broadcastMenuState = false`），Host 开始画画时 Client 不会自动激活 Telestrator 画板遮罩。
+   - 建议在 `GlobalWorkspaceBroadcastPayload` 中增加独立的 `telestratorOverlayActive`（仅当 `telestratorPermission === 'everyone'` 时同步），使 Client 无需依赖菜单广播即可直接一起画画。
+3. **真实回放文件与 Tauri 客户端人工回归**：
+   - 建议在 Tauri 桌面端加载真实 3v3 `.RCReplay` 文件复核 6 车网格、NameTag、镜头切换及窗口重开后的音频恢复（`a78fc05`）。

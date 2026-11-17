@@ -1,51 +1,64 @@
-# Tauri 音频丢失与首次加载卡顿排查及修复报告
+# RocketCompanion Developer Sync Room 诊断、Tauri 合并与修复报告
 
-## 1. 分支与提交信息
-- **基线提交**: `df4a3c80c569c21c1670d6027fed2fe3b2a3f570` (`z/agy/rc/multiplayer-recheck`)
-- **新建分支**: `z/agy/tauri`
-- **已验证签名提交**: [`78d0e0239792da9c518a62b54bba3581434adbe9`](https://github.com/Antigravi-ty/RocketCompanion/commit/78d0e0239792da9c518a62b54bba3581434adbe9) (`signature.isValid = true`, `state = VALID`)
-
----
-
-## 2. 根因分析
-
-### (1) 为什么「打开第二遍会丢失音频」？
-在 Tauri 托盘模式（`RC_TRAY_ONLY=1` / `src-tauri/src/lib.rs`）中，关闭主窗口不会销毁进程，而是 `api.prevent_close()` + `window.hide()`，同时切换 macOS `ActivationPolicy::Accessory`。这会导致两层问题：
-1. **隐藏时静音、二次 `show()` 时未完整恢复**：
-   - `window.hide()` 触发 `handleFocus(false)`，将 `master.setActive(false)`、`slotPool.isMuted = true`、`audioEngine.silenceAll()`、并使 `stadiumSpatialEngine` 进入失焦静音状态；同时 macOS WKWebView 可能会将 `AudioContext` 切到 `suspended` / `interrupted`。
-   - 二次打开窗口（`launch_main_window_with_config` 调用 `main_win.show(); main_win.set_focus();`）时，若 URL 参数未变则不会刷新页面。WKWebView 中 `window.focus` 可能早于 `document.hidden === false` 触发，导致 `handleFocus(true)` 误判为仍处于隐藏状态；此外非用户手势下的 `ctx.resume()` 在 WebKit 中可能挂起。
-   - **关键漏洞**：`src/audio/audioContext.ts` 中的 `onAudioReady()` 仅恢复了 `master.setActive(true)` 和 `ballEngine._startLoops()`，**未解除 `slotPool.isMuted = false`，也未通知 `stadiumSpatialEngine.handleWindowFocusChange(true, ...)`**；且 `unlock()` 在 `ctx.state === 'running'` 时只检查 `!master.active || !master.connected`，**忽略了 `slotPool.isMuted === true`**，导致后续按键/点击也无法恢复音效。
-
-### (2) 为什么「第一次加载会卡在音频 notification 上很久」以及频繁 `checkout` 后的现象？
-1. **频繁 `git checkout` 导致 Vite/esbuild 崩溃**：
-   - 从日志可见 `[vite] Pre-transform error: The service was stopped: write EPIPE` 与 `esbuild` `TypeError: callback is not a function`。在频繁 `checkout` 切换分支时，`devLauncher.ts` 重启 `devWorker.ts` 期间若旧 `esbuild` 服务中断，会导致前端静态/音频请求挂起或失败；且 `devLauncher.ts` 在 `devWorker` 非零退出后仅打印提示并停止自动拉起，必须手动重启 server 才能恢复（这正是「重启一下 server 就好了」的直接原因）。
-2. **音频加载无超时保护与进度空窗**：
-   - `src/audio/audioAssetLoader.ts` (`fetchAudioBuffer`) 与 `src/audio/EngineAudioLoopConditioner.ts` (`fetchAndDecodeBuffer`) 均未对 `fetch` 和 `ctx.decodeAudioData` 设置超时；一旦单个请求在 Vite 重启或 WKWebView 连接波动时挂起，后台 `Background Assets` 通知就会无限卡住。
-   - `src/game/subsystems/GameAudioSubsystem.ts` (`setupAudio`) 中，`loadEngineAudioPackAssets` 在 `gameAudio.preload` 之前执行且未上报进度，`arena.prepareAssets` 在之后执行也未上报进度，导致通知长时间停留在初始百分比或 `65/65`。
+## 1. 仓库与分支操作结果
+- **Tauri 更新合并**：已将 `origin/z/agy/tauri`（`78d0e0239792da9c518a62b54bba3581434adbe9`）无冲突合并至 `z/agy/rc/multiplayer-recheck`（原基线 `74fe936e5eb11b5c3ffa2382b18460f6a8df029c`）。
+- **Verified Bot Commits**（均已通过 GitHub App 自动 GPG 签名，`verified: true`）：
+  - Merge Commit: `a78fc05c0a28c92ee3ac0a542117e0efae90b663`（合并 `origin/z/agy/tauri`）
+  - Fix Commit: `3918fae6ca21e21c2ed3af0f91617b287073a9cd`（架构与同步修复 + 接口增强 + E2E 断言加固）
 
 ---
 
-## 3. 修复内容
+## 2. 总体架构诊断：为什么会出现这些“离谱”现象？
 
-1. **`src/audio/audioContext.ts`**：
-   - `onAudioReady()` 在页面可见或允许后台音频时，同步恢复 `slotPool.isMuted = false` 与 `stadiumSpatialEngine.handleWindowFocusChange(true, ...)`。
-   - `unlock()` 在 `ctx.state === 'running'` 时增加 `subsystemState.slotPool?.isMuted` 检查。
-   - `handleFocus(true)` 遇到 `document.hidden === true`（WKWebView 时序竞态）时增加 80ms 延迟复检。
-   - 监听 `rc-tauri-window-shown` 自定义事件，主动触发 `handleFocus(true, 'tauri.window_shown')`。
-2. **`src-tauri/src/window_manager.rs`**：
-   - 在 `launch_main_window_with_config` 执行 `main_win.show()` 与 `main_win.set_focus()` 后，向主窗口派发 `rc-tauri-window-shown` 事件。
-3. **`src/audio/audioAssetLoader.ts` & `src/audio/EngineAudioLoopConditioner.ts`**：
-   - 为 `fetch`（15s `AbortController`）与 `ctx.decodeAudioData`（10s）增加超时保护。
-   - 为 `loadEngineAudioPackAssets` 增加 `onProgress` 回调，并在失败时清理 `packAssetCache` 避免缓存坏 Promise。
-4. **`src/game/subsystems/GameAudioSubsystem.ts`**：
-   - 将 `onProgress` 透传给 `loadEngineAudioPackAssets` 和 `arena.prepareAssets`，消除加载通知进度条长时间静止的假卡死现象。
-5. **`scripts/devLauncher.ts`**：
-   - 当 4 端口 `devWorker` 因意外错误（如频繁 `checkout` 触发 `esbuild` `EPIPE`）非正常退出时，增加 1000ms 自动重启恢复，避免端口假死需要手动重启。
+你判断得非常准确——**核心问题是设计思路错位，而非底层传输（WebRTC / BroadcastChannel / Tunnel）连接故障**。
+
+早期实现把 `Developer Sync Room` 当成了 **Multiplayer-based（多人实体化对抗房间）**，再在其上打“禁输入 / 观战”的补丁；而实际使用场景是 **Spectating-based（主机状态广播 / 导演观战模式，仅在显式切入 Match / 允许画画等场景下才临时拉起交互）**：
+
+1. **Freeplay 中 Client 强行生成第二辆车并挡路、视角锁死在自己车上**：
+   - **原因 A（服务端误判为非训练/自动开赛房间）**：`MatchRosterPolicyState` 在 `isDevSyncRoom: true` 且 `lobbyMode: false` 时，将 `isTrainingMode` 默认设为 `false`、`autoStartWhenFull` 默认设为 `true`；同时 `MatchRosterSubController.assignPlayerSlot` 把 `state === 'playing'` 视为正式比赛，导致 Client 加入时被分配了一个实体车位（`car 1`）并插进场地中央/开球位，直接阻挡 Host（`car 0`）。
+   - **原因 B（Client 根本没收到/没处理 `handshake_response`）**：`MatchRosterPolicyState.buildHandshakeJson` 在 `handshake_response` JSON 中附带了 `serverTick: this.matchTick`，而客户端 `reconcilerInboundPacketParser.ts` 先判断 `if (typeof obj.serverTick === 'number')`，后判断 `else if (obj.type === 'handshake_response')`！导致所有 `handshake_response` 均被当成普通物理帧吞掉，Client 一直停留在 `joinOnlineServer` 预创建的双车默认状态（`numCars: 2, playerCarIndex: 1, focusedCarIndex: 1, isDevSyncRoom: false`）。
+   - **原因 C（`applyRosterSnapshot` 时序反转）**：`OnlineMatchReconcilerBinder.handleClientHandshakeResponse` 先调 `applyRosterSnapshot` 后调 `setOnlineSession`，导致首次同步名册时 `isDevSyncRoom` 仍为 `false`，Client 名册与视角目标错乱。
+
+2. **3v3（6 车）Replay 回放中“有轨迹/Eat Boost，但车消失 / 只剩 2 辆车”**：
+   - **原因 A（Snapshot 车数偏移量读错）**：`SIM_OFFSETS.NUM_CARS` 在协议中是索引 **`2`**（索引 `0` 是 `TICK`，索引 `1` 是 `GOAL`），但 `MatchSystemControlSubController` 的 `loadSimSnapshot` 和 `stepStateOnlyFrameIfActive` 读取了 `snap[1]`（`GOAL`），导致 `headerCars / snapCarCount` 经常读成 `0`，`stateOnlyCarMask` 回退为 `physicsManager.getActiveCarMask()`（仅 `1` 或 `3`，即 1~2 辆车），Client 只收到前 1~2 辆车的状态，6 车轨迹与吃球/吃包事件却照常渲染。
+   - **原因 B（Host 回放自回声覆盖）**：Host 开启 `replayPlaybackMode` 后，`simulationNetworkReconcilePipeline.ts` 仍对非 Goal Replay 的 `drainedReplayPackets` 执行 `applyReplayFrameToEngine`，用 Worker 回传的 2 车包覆盖了 Host 本地正在播放的 6 车回放物理状态。
+
+3. **为什么之前的自动化测试显示“全部通过”？**
+   - `scripts/runMultiplayerSuiteTests.ts`（15 项）全部基于内存 Mock（`mockSim`、`mockPhysicsManager` 等），没有接入真实的 `RocketSim` WASM、`AuthoritativeServerWorker`、`PredictionReconciler` 报文解析器和 `AppStore` 状态。
+   - `scripts/runDevRoomSyncE2E.mjs` 虽然跑了真实双标签页 Headless Chrome，但存在**断言盲区**：
+     - Stage 2/3 只检查了 `connectedPeers >= 1` 和球坐标距离 `< 50`，**从未检查** `physics.numCars`、`playerCarIndex`、`focusedCarIndex`、`isDevSyncRoom` 是否真为 `1` 车观战状态；
+     - Stage 6（Replay）只注入了单车状态下移动的球位置，**从未测试** 3v3（6 车）回放时的双端 `numCars === 6`。
+
+4. **Telestrator（一起画画）与 Training Pack 状态确认**：
+   - **Telestrator**：底层与 UI 均已实现。`TelestratorWireCodec`（`0x05`）+ `hostTelestratorRelay` + `telestratorStore.allowClientDrawing` + `activeGlobalWorkspace.telestratorPermission === 'everyone'` 已打通；当 Host 开启 `All Clients: ON`（或 `telestratorPermission: 'everyone'`）时，Client 可直接同步绘制并双向广播笔画。
+   - **Training Pack**：通过 `ROOM_ACTIVITY_SWITCH`（`multiplayer_training`）与 `training_shot_reset` 同步元数据与重置动作；Client 默认作为旁观视角跟随 Host 的 `car 0` 演练。
 
 ---
 
-## 4. 验证情况
-- `pnpm run check`（`radar` 1415/1415 TS + `tsc --noEmit`）：**PASS (GREEN)**
-- `npx prettier --check`（修改文件）：**PASS**
-- Headless Chrome (`http://localhost:3003/?touch=2`) 启服与 `blur` / `rc-tauri-window-shown` 事件调度验证：**PASS**
-- 说明：当前 Linux 沙盒无 macOS / Rust `cargo` 环境，无法直接编译运行 macOS Tauri 原生壳，Rust 侧改动（`src-tauri/src/window_manager.rs` 为单行 `main_win.eval` 调用）请在本地 macOS 上执行 `pnpm tauri:dev:tray` 验证二次打开音频与编译通过。
+## 3. 本次已完成的核心修复与新增能力
+
+1. **Spectating-based 默认模型固化（消除 Freeplay 幽灵车 & 修复握手）**：
+   - `src/network/client/reconcilerInboundPacketParser.ts`：调整分支顺序，优先处理 `roster_update` 与 `handshake_response`，修复 `handshake_response` 因携带 `serverTick` 被误判吞掉的根本 Bug。
+   - `src/network/server/match/MatchRosterPolicyState.ts` & `HostWorkerMessageRouter.ts`：`isDevSyncRoom && !lobbyMode` 时强制 `isTrainingMode = true`、`state = MATCH_STATES.PLAYING`、`autoStartWhenFull = false`，并在旁观握手包中携带 `initialSnapshot`。
+   - `src/network/server/match/MatchRosterSubController.ts`、`matchRosterSlotAssignmentPipeline.ts`、`matchControlPacketPipeline.ts`、`ActivityKernel.ts`：非比赛态加入 Dev Sync Room 的非 Host 客户端统一分配为 `'spectator'`；从 Match 退出回到 Freeplay/Replay/Training 时自动降级回 `'spectator'`。
+   - `src/game/runtime/OnlineMatchReconcilerBinder.ts`、`OnlineRosterSyncCoordinator.ts`、`onlineLobbyTransitionPipeline.ts`、`GameCameraSubsystem.ts`：先写入 `onlineSession.isDevSyncRoom` 再应用名册；Client 旁观态保持 `numCars = 1`、`playerCarIndex = 0`、`focusedCarIndex = 0`，彻底消除场地中央的幽灵车并锁定 Host 视角。
+
+2. **6 车（3v3）Replay 同步修复**：
+   - `src/network/server/match/MatchSystemControlSubController.ts`：改用 `SIM_OFFSETS.NUM_CARS`（索引 `2`）读取快照车数，在 `loadSimSnapshot` 中提前扩容 `pm.sim` 槽位，在 `stepStateOnlyFrameIfActive` 中生成正确的 `stateOnlyCarMask`（6 车时为 `0x3f`）。
+   - `src/game/pipeline/stages/simulationNetworkReconcilePipeline.ts`：当 `server && !flags.isGoalReplay` 时跳过 `applyReplayFrameToEngine`，防止 Host 自我回声覆盖本地回放。
+
+3. **仅广播 State 接口（菜单状态可选剥离）**：
+   - 在 `GlobalWorkspaceProtocol.ts`、`spectateWorkspaceStore.ts`、`runtimeSpectateWorkspaceBridge.ts` 及 `DevRoomSyncFloatingWindow.tsx` 新增 `menuStateIncluded` / `broadcastMenuState` 开关（默认保持 `true` 以便早期联调，关闭后仅广播相机/播放/活动状态，不再同步菜单与浮窗）。
+
+4. **Client 常驻状态通知与快捷退出**：
+   - 在 `runtimeSpectateWorkspaceBridge.ts` 中通过 `QuickNotificationSystem` 推送常驻通知（`id: 'dev-sync-room-client'`, `type: 'ongoing'`），提供 **Stop Syncing / Resume Sync** 与 **Exit Room** 操作按钮，支持通过右上角小铃铛图标收起为纯净画面，离开房间时自动销毁。
+
+5. **自动化测试加固**：
+   - 在 `scripts/runDevRoomSyncE2E.mjs` 的 Stage 2 增加了 Freeplay 双端 `numCars === 1`、`client.playerCarIndex === 0`、`client.camera.focusedCarIndex === 0`、`isDevSyncRoom === true` 硬断言；在 Stage 6 增加了 6 车（3v3）Replay 快照双端 `numCars === 6` 硬断言。
+
+---
+
+## 4. 最终验证结果
+- `pnpm run check`（Radar 架构边界 + TypeScript `tsc --noEmit`）：**PASS（0 错误）**
+- `pnpm run test:multiplayer-suite`（15 项联机协议与状态机测试）：**PASS（15/15）**
+- `pnpm run test:dev-room-sync-e2e`（双标签页真实 Headless Chrome E2E，含 Freeplay 1 车观战与 6 车 Replay 断言）：**PASS（9/9 阶段全部通过，`runtime_error=0`, `poseAnomalies=0`, `stuckInGoal=false`）**

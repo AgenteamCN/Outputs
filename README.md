@@ -1,57 +1,50 @@
-# Safari Automation TCC (`-1743` / 空列表) 根因分析与修复报告
+# Safari Automation TCC (`-1743`) 瞬时拒绝与 Automation 设置为空的原因及修复
 
-## 1. 现象与根因分析
+## 问题原因（为什么点击 Grant Safari Automation 瞬间返回 `-1743`，且 System Settings → Automation 为空）
 
-从你提供的日志和诊断 JSON 可以 100% 定位到问题所在：
+并不是 macOS Sequoia 取消了 Automation 弹窗，而是 **macOS TCC (`tccd`) 在弹窗前直接拦截了请求**：
 
-1. **为什么点击 `Grant Safari Automation` 后瞬间返回 `-1743 (denied)`（`durationMs=0`），且 `Automation` 设置里是空的（0 条）？**
-   - 关键日志：
-     - `prompt=false` → `status=-1744 (prompt_required) bundleId=nil`（耗时 ~15ms，走了 TCC 查询）
-     - `prompt=true` → `status=-1743 (denied) bundleId=nil`（耗时 **0ms**）
-     - 之后再次 `prompt=false` → 依然是 `-1744 (prompt_required)`！
-   - 这说明 **macOS 根本没有弹窗，也没有把拒绝记录写入 TCC 数据库**，而是在 `AEDeterminePermissionToAutomateTarget(..., prompt=true)` 入口处**直接预检失败并拦截了**。
-   - 根本原因：真正调用 `AEDeterminePermissionToAutomateTarget` 的子进程是 Swift CLI `macos-ax-helper`（`apps/p2p-remote-controller/src-tauri/target/debug/macos-ax-helper`）。此前只给 Rust 主程序 `p2p-remote-controller` 嵌入了 `Info.plist`，而 **`macos-ax-helper` 自身没有任何 `Info.plist`（`bundleId=nil`，也缺少 `NSAppleEventsUsageDescription`）**。
-   - 在 macOS（包括 Sequoia 15+）中，如果调用 `AEDeterminePermissionToAutomateTarget(..., true)` 的进程自身 `Info.plist` 里没有 `NSAppleEventsUsageDescription`，系统会**直接返回 `-1743` 而不弹窗**；因为从未真正向 `tccd` 发起授权弹窗，所以 **系统设置 -> 隐私与安全性 -> 自动化 (Automation)** 里不会出现任何条目（不像 Accessibility 可以手动点 `+` 添加，Automation 只有成功触发过 TCC 请求才会出现条目）。
+1. **开发模式 (`pnpm dev:all`) 下的 Responsible Process 归因机制**  
+   在 `tauri dev` 模式下，`p2p-remote-controller` 和子进程 `macos-ax-helper` 都是由终端 / IDE（如 RustRover / Cursor / 第三方终端）拉起的子进程，而不是通过 LaunchServices 启动的独立 `.app`。  
+   macOS TCC 会沿着进程树向上查找 **Responsible Process（宿主终端/IDE）** 来评估 `kTCCServiceAppleEvents`（Automation）权限：
+   - 如果宿主终端/IDE 的 `Info.plist` 缺少 `NSAppleEventsUsageDescription`，或者开启了 Hardened Runtime 但缺少 `com.apple.security.automation.apple-events` entitlement，**`tccd` 会直接拒绝弹窗**。
+   - 表现就是：`prompt=false` 返回 `-1744 (prompt_required)`，但点击申请 (`prompt=true`) 会在 `0~2ms` 内立刻返回 `-1743 (errAEEventNotPermitted)`，**不会弹出系统授权框，也不会在 `System Settings -> Privacy & Security -> Automation` 中添加任何记录**（与 Accessibility 不同，Accessibility 不要求 `NSAppleEventsUsageDescription`）。
 
-2. **为什么 UI 上也没有看到具体的拒绝提示？**
-   - 在 `apps/p2p-remote-controller/src/App.tsx` 的 `handleRequestAutomation` 中：先 `setErrorMessage(auto.message)`，紧接着调用 `await refreshStatus()`，而 `refreshStatus()` 开头会执行 `setErrorMessage(null)`，把刚刚设置的错误提示瞬间清掉了。
+2. **`macos-ax-helper` 与 `p2p-remote-controller` 缺少 Apple Events Entitlement**  
+   - 此前 `macos-ax-helper` 没有嵌入 `Info.plist`（日志中 `bundleId=nil`），也没有签署 `com.apple.security.automation.apple-events` entitlement。
+   - `apps/p2p-remote-controller/src-tauri/tauri.conf.json` 未配置 `bundle.macOS.entitlements`。
 
-3. **开发模式 (`pnpm dev:all`) 下的 Responsible Process 注意事项（macOS Sequoia）：**
-   - 即使 `macos-ax-helper` 嵌入了 `Info.plist`，在 `tauri dev`（`cargo run` 未打包成 `.app`）下，macOS TCC 的 Responsible Process 会向上追溯到**启动 `pnpm dev:all` 的终端/IDE**（例如 `Terminal.app`、`iTerm2`、或者 `Cursor`/`VS Code`/其他终端）。
-   - 如果你的终端或 IDE 本身带有 `NSAppleEventsUsageDescription`（如 `Terminal.app`、`iTerm2`），弹窗会以该终端名义弹出并出现在 Automation 列表中；如果某些第三方 IDE/终端开启了 Hardened Runtime 且没有 `com.apple.security.automation.apple-events` 权限或缺少 `NSAppleEventsUsageDescription`，`tccd` 仍可能拒绝弹窗——此时用 `Terminal.app` 运行或构建 `.app` 包（`pnpm p2p:build:app`）即可让 `P2P Remote Controller.app` 自身作为 Responsible Process 正常弹窗。
+3. **前端状态被 `refreshStatus()` 立即覆盖**  
+   在 `apps/p2p-remote-controller/src/App.tsx` 的 `handleRequestAutomation` 中，当 `checkAutomationPermission(true)` 返回 `denied (-1743)` 后，紧接着调用了 `refreshStatus()`，后者又调用 `checkAutomationPermission(false)` 返回 `-1744 (prompt_required)`，把界面上的 `denied` 状态瞬间覆盖回 `Automation Prompt Needed`。
 
 ---
 
-## 2. 已完成的修复
+## 已提交的修复
 
-已提交 Verified Bot Commit 至分支 `z/p2p-remote-controller-monorepo`：
-- **Commit**: `6a79c1a4a988a6090419b75648dadba06980a0da` (`verified: true`)
-- **链接**: https://github.com/Antigravi-ty/agyPreviewInstant/commit/6a79c1a4a988a6090419b75648dadba06980a0da
+已向分支 `z/p2p-remote-controller-monorepo` 提交 Verified Bot Commit [`3fe0901`](https://github.com/Antigravi-ty/agyPreviewInstant/commit/3fe0901385abe1c06ffced88342b54234035e0d7)：
 
-具体改动：
-1. **`packages/macos-ax-helper/Info.plist`**（新增）
-   - 添加 `CFBundleIdentifier` (`com.antigravity.p2premotecontroller.ax-helper`)、`CFBundleName`、`CFBundleExecutable`、`CFBundleShortVersionString`、`CFBundleVersion` 以及 `NSAppleEventsUsageDescription`。
-2. **`packages/macos-ax-helper/Package.swift`**
-   - 通过 `linkerSettings` 的 `-Xlinker -sectcreate -Xlinker __TEXT -Xlinker __info_plist` 将 `Info.plist` 直接内嵌进 `macos-ax-helper` Mach-O 二进制。
-3. **`scripts/buildAxHelper.sh`**
-   - 复制构建产物后默认执行 `codesign --force --sign "${AGY_CODESIGN_IDENTITY:--}"`（未配置签名证书时自动使用 ad-hoc `-` 签名），确保内嵌 `Info.plist` 后具备有效签名与 `cdhash`。
-4. **`apps/p2p-remote-controller/src-tauri/Info.plist`**
-   - 补全 `CFBundleIdentifier` (`com.antigravity.p2premotecontroller`)、`CFBundleName`、`CFBundleDisplayName` 等基础 Bundle 元数据，避免 `tauri dev` 裸二进制运行时 `Bundle.main.bundleIdentifier` 为 `nil`。
-5. **`packages/macos-ax-helper/Sources/MacosAxHelper/SafariController.swift`**
-   - 在 `[safari:automation]` 日志中增加 `hasUsageDesc=<true|false>` 诊断输出；当 `prompt=true` 仍返回 `-1743` 时给出明确的 dev 模式父进程/打包 `.app` 排查指引。
-6. **`apps/p2p-remote-controller/src/App.tsx`**
-   - 调整 `handleRequestAutomation` 执行顺序，在 `await refreshStatus()` 之后再设置 `errorMessage`，避免错误提示被 `refreshStatus()` 清空。
+1. **添加 Apple Events Entitlements**：
+   - 新增 `packages/macos-ax-helper/Entitlements.plist` 与 `apps/p2p-remote-controller/src-tauri/Entitlements.plist`，声明 `com.apple.security.automation.apple-events = true`。
+   - 在 `apps/p2p-remote-controller/src-tauri/tauri.conf.json` 的 `bundle.macOS` 下配置 `"entitlements": "Entitlements.plist"`。
+   - 更新 `scripts/buildAxHelper.sh`，使用 `--entitlements` 对 `macos-ax-helper` 进行签名。
+   - 更新 `packages/macos-ax-helper/Package.swift`，将 `-sectcreate __TEXT __info_plist` 链接参数限定在 `.when(platforms: [.macOS])`。
+
+2. **精准识别 TCC 静默拦截 (`-1743` vs `-1744`)**：
+   - 更新 `packages/macos-ax-helper/Sources/MacosAxHelper/SafariController.swift` 的 `checkAutomationPermission(prompt:)`：当 `prompt=true` 返回 `-1743` 时，立即用 `prompt=false` 探测；若仍返回 `-1744`，说明是 macOS TCC 因宿主终端/IDE 缺少 `NSAppleEventsUsageDescription` 或 `com.apple.security.automation.apple-events` 而静默拦截了弹窗，并在日志中记录 `elapsedMs` 与明确提示。
+
+3. **保留 UI 中的 `denied` 状态**：
+   - 更新 `apps/p2p-remote-controller/src/App.tsx` 的 `handleRequestAutomation`：当 `checkAutomationPermission(true)` 返回 `denied` 时不再调用 `refreshStatus()` 覆盖状态，而是保留 `Automation Denied (-1743)`、显示具体原因并提供 `Open Automation Settings` 按钮。
 
 ---
 
-## 3. 本地验证步骤
+## 本机验证建议（macOS）
 
-请在 macOS 本地拉取最新提交后重新启动：
-```bash
-git pull origin z/p2p-remote-controller-monorepo
-pnpm dev:all
-```
-然后点击 **Grant Safari Automation**：
-- 在诊断 JSON / 控制台中应能看到 `bundleIdentifier: "com.antigravity.p2premotecontroller.ax-helper"` 及 `hasUsageDesc=true`。
-- 若你是从 `Terminal.app` / `iTerm2` 启动 `pnpm dev:all`，macOS 将弹出 Automation 授权确认框，授权后 **System Settings -> Privacy & Security -> Automation** 中会出现对应条目。
-- 若当前 IDE 终端自身限制了 Apple Events，可改用 `Terminal.app` 启动或运行 `pnpm p2p:build:app` 打开打包后的 `P2P Remote Controller.app` 进行授权。
+1. **在 macOS 自带 `Terminal.app` 中运行**（`Terminal.app` 自带 `NSAppleEventsUsageDescription`），或直接打包运行独立的 `.app`（LaunchServices 会将 `P2P Remote Controller.app` 本身作为 Responsible Process）：
+   ```bash
+   pnpm p2p:build:app
+   open apps/p2p-remote-controller/src-tauri/target/release/bundle/macos/P2P\ Remote\ Controller.app
+   ```
+2. 若需确认是宿主终端/IDE 被 `tccd` 拦截，可在触发授权后运行：
+   ```bash
+   log show --last 2m --predicate 'subsystem == "com.apple.TCC" AND eventMessage CONTAINS "AppleEvents"' --style compact
+   ```

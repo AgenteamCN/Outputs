@@ -1,135 +1,160 @@
-# P2P Remote Controller 架构调研与可行性评估报告
+# P2P Remote Controller 架构设计与技术可行性评估报告
 
-> 基于现有仓库 `Antigravi-ty/agyPreviewInstant`（Tauri v2 + React 18 + Vite + TypeScript + pnpm）的代码结构，以及目标运行环境 **Apple Silicon Mac / macOS Sequoia 15.7.5+** 进行评估。
-
----
-
-## 一、 核心结论速览（TL;DR）
-
-1. **技术栈取舍：强烈推荐「Tauri v2 Monorepo + Swift Sidecar CLI (`ax-bridge`)」混合架构**，而不是纯 Rust 调 AXUIElement，也不建议放弃 Tauri 转纯 SwiftUI/Xcode。
-   - **原因**：Rust 生态的 macOS `AXUIElement` 绑定简陋且与 `CFRunLoop` 冲突；而纯 SwiftUI 会丢失 `agyPreviewInstant` 的 React UI 复用、Web DevTools 调试体验，以及未来与 PWA/WebRTC 共享编解码逻辑的便利性。
-   - **是否需要用 Xcode IDE**：**不需要**。只需安装 Xcode Command Line Tools 提供 `swift build` 编译器，即可在现有 Git + `pnpm` 工作流中自动编译 Swift Sidecar 二进制，无需切换至 Xcode 工程管理。
-2. **「完全不干扰鼠标且后台无感操作任意网页」的可行性：部分可行，但有明确边界，不能 100% 保证。**
-   - **读取页面内容与元素树**：`AXUIElement` 可以完全在后台读取，不抢焦点、不动鼠标。
-   - **触发点击/输入**：标准 HTML 按钮/链接可通过 `AXPress` 触发且不移动鼠标；但现代 SPA 网页（自定义 `div` 点击、React 受控输入框、`hover` 菜单、Canvas）经常不响应 `AXPress` 或 `AXSetValue`，若回退到 `CGEvent` 模拟键鼠，则会抢占鼠标或窗口焦点。
-3. **「独立虚拟桌面（Space）后台激活窗口保活」：不可行。**
-   - macOS 只有一个全局键盘/焦点窗口，跨 Space 激活 Safari 窗口会导致桌面切换或打断你当前的工作输入。
-   - **正确解法**：由应用主动创建一个**独立的 Safari 专用窗口**（而非混用你的日常标签页），结合 `window_id` 精确追踪与隔离。
+> **基准环境**：Apple Silicon Mac（`arm64` only），最低系统要求 `macOS Sequoia 15.7.5`  
+> **基准仓库**：`Antigravi-ty/agyPreviewInstant`（当前为 Tauri v2 + React 18 + TypeScript + Vite + Rust `hyper` LAN Server）
 
 ---
 
-## 二、 关键技术问题逐项解答
+## 一、核心结论速览（TL;DR）
 
-### 1. AXUIElement 权限与「不干扰鼠标/键盘」的真实能力边界
-
-| 能力 | 是否可行 | 技术细节与限制 |
+| 问题 | 结论 | 说明 |
 | :--- | :--- | :--- |
-| **读取全系统/Safari 页面结构** | ✅ 可行（不抢焦点） | 申请一次 macOS「辅助功能（Accessibility）」权限后，即可通过 `AXUIElementCopyAttributeValue` 遍历 Safari 窗口内的 `AXWebArea` 树，获取角色（Role）、标题、链接、按钮、文本等。 |
-| **开启 Safari 网页无障碍树** | ⚠️ 需显式激活属性 | Safari 默认会懒加载网页的无障碍树，必须在代码里对 Safari 的 `AXUIElement` 设置 `AXEnhancedUserInterface = true`，否则 `AXWebArea` 内部经常是空的。 |
-| **不移动鼠标点击网页元素** | ⚠️ 部分可行 | 调用 `AXUIElementPerformAction(el, kAXPressAction)` 可以在不移动光标的情况下触发原生/语义化 `<button>`、`<a>`。但对于非语义化 `div` 绑定 `pointerdown` 或复杂 SPA 组件，经常无效。 |
-| **不抢焦点向网页输入框打字** | ⚠️ 容易失效 | `AXUIElementSetAttributeValue(el, kAXValueAttribute, ...)` 可直接改值，但 React/Vue 等框架依赖 `input`/`change` 事件，直接改 AXValue 往往无法触发前端状态更新。 |
-| **完全后台无感操作** | ❌ 无法 100% 保证 | 一旦遇到 `AXPress` 失效的控件，若要兜底就必须用 `CGEvent` 模拟真实点击/按键，这必然需要窗口可见/聚焦并移动光标。 |
+| **是否需要放弃 Tauri 全面转向原生 Swift / Xcode？** | **不需要，强烈推荐「Tauri 主体 + SwiftPM Sidecar」复合架构** | 既能保留当前仓库的 React/Vite/DevTools、LAN Server、WebRTC/PWA 调试能力与 Preset 共享，又能用原生 Swift 优雅调用 `AXUIElement` 与 Safari AppleScript。 |
+| **是否需要学习复杂的 Xcode GUI / `.xcodeproj` 工作流？** | **不需要** | 使用 **Swift Package Manager (`Package.swift`)** 编译为独立 `arm64` CLI/Daemon 作为 Tauri `externalBin` Sidecar，直接通过 `pnpm` 脚本与 Git 管理，无需维护 `.xcodeproj`。 |
+| **`AXUIElement` 能否在完全不干扰鼠标/焦点的情况下操作任意网页？** | **不完全可行（需明确边界）** | **读取**页面树完全无干扰；**点击**标准控件可通过 `kAXPressAction` 不动鼠标，但复杂 SPA 的键盘输入、Hover、部分自定义组件仍可能依赖窗口焦点或 `CGEvent`，无法保证 100% 后台无感操作任意网站。 |
+| **能否把 Safari 放到独立桌面（Space）并在后台自动激活/保活，同时电脑前台正常干别的？** | **不行** | macOS 全局同一时刻只有一个活跃 Space 与焦点窗口。后台强制激活另一个 Space 的 Safari 窗口会导致**屏幕自动切过去**，直接打断你当前的工作。 |
+| **如何精准追踪我们自己打开的页面（应对标题变化、Redirect、SPA 路由变化、Popup 弹窗）？** | **可行，通过「独立 Safari 窗口 + `window id` (`CGWindowID`)」追踪** | 不要在用户现有窗口开标签页，而是由程序新建一个**专属 Safari 窗口**。窗口 ID 在 Redirect、标题变化、SPA 跳转时均保持不变；Popup 可通过监听新增 Tab 或新增 `window id` 自动接管。 |
 
 ---
 
-### 2. Safari 页面保活机制、标签页拽出与「独立 Space 后台激活」
+## 二、仓库现状与 Monorepo 演进方案
 
-- **Safari 后台保活与节流机制**：
-  - **后台标签页（非当前 Tab）**：WebKit 会严格限制 `setTimeout`/`setInterval` 频率（降频至 1s 甚至休眠），暂停 `requestAnimationFrame`，并触发 `document.hidden = true`。
-  - **窗口遮挡 / 最小化（Window Occlusion & App Nap）**：当 Safari 窗口被最小化、或处于另一个不可见的 Space（虚拟桌面）时，macOS WindowServer 会将其标记为不可见，进一步触发渲染暂停与 App Nap。
-- **把标签页拽出来（独立窗口）**：
-  - **完全可行，且不需要鼠标拖拽**。通过 AppleScript（`NSAppleScript` / `osascript`）可以直接命令 Safari 新建独立窗口打开目标 URL（`make new document with properties {URL: "..."}`），每个独立窗口中只有一个当前 Tab，就能避开多 Tab 切换带来的后台标签页节流。
-- **能否单独划一个 Space（桌面），让程序在后台轮流 Focus 窗口保活，同时不影响你正常干活？**
-  - **结论：不行。** macOS 的窗口系统不支持“多焦点”。只要后台程序为了唤醒页面而执行 `activate` 或 `AXRaise` 抢占焦点，你的系统焦点就会被夺走（正在打字的窗口失焦，甚至触发 Space 切换动画）。
-  - **推荐替代方案**：让自动化专用 Safari 窗口留在当前桌面角落或副屏（哪怕尺寸缩小，只要不最小化、不被完全遮挡），即可维持页面活跃。
+通过检查 `Antigravi-ty/agyPreviewInstant` 现有结构：
+- 根目录已有 `pnpm-workspace.yaml`，技术栈为 **Tauri v2 (`2.2.0`) + React 18 + Zustand + `lucide-react` (`1.64.0`) + `hyper` HTTP/WS LAN Server**。
+- 配置与预设（如 `agy_private_profile.json`、`agy_lan_config.json`、`agy_credentials.json`）通过 `src-tauri/src/storage/paths.rs` 持久化在系统 `app_config_dir` 中，`src-tauri/Cargo.toml` 已默认开启 `devtools` feature。
 
----
-
-### 3. 页面追踪与隔离机制：标题和 URL 都会变，到底靠什么追踪？
-
-你提到的痛点非常准确：SPA 路由会让 URL 变，页面加载会让 Title 变，如果全量扫描所有 Safari 窗口会非常混乱。
-
-1. **物理隔离优于事后过滤**：
-   - 不建议扫描用户自己打开的所有 Safari 窗口。
-   - **推荐流程**：点击「启动/连接目标页」时，检测 Safari 是否运行（`NSRunningApplication`）-> 弹出确认框询问是否启动 Safari 或新建一个**专用独立窗口** -> 仅对该窗口的 ID 进行追踪。
-2. **Safari 窗口与标签页的稳定标识**：
-   - **窗口级稳定 ID**：通过 AppleScript 可以拿到 Safari 窗口的整数 `id`（或者通过私有/底层函数 `_AXUIElementGetWindow` 将 `AXWindow` 映射到稳定的 `CGWindowID`）。只要这个专用窗口不关闭，**无论内部怎么 redirect、SPA 怎么跳转、Title 怎么改，它的 `window_id` 永远不变**。
-   - **弹窗（Popup）与新标签页跟随**：在轮询或 `AXObserver` 监听中，记录该 `window_id` 下已知的 Tab 列表与全局 Safari 窗口 ID 集合；当页面触发 `target="_blank"` 或 `window.open()` 产生新 Tab 或新窗口时，能立刻捕捉到增量 ID，由程序自动跟随或弹窗询问是否纳入接管。
-
----
-
-## 三、 架构对比与推荐方案：Monorepo + Tauri v2 + Swift Sidecar
-
-### 现有代码基础评估（`agyPreviewInstant`）
-目前仓库已经具备非常扎实的基础：
-- 前端：React 18 + TypeScript + Vite + `lucide-react`（已内置 `monitor-cloud` 图标）。
-- 后端（`src-tauri/src/`）：已实现 `lan_commands.rs`、`lan_http_io.rs`、`lan_ws_codec.rs`、`lan_store.rs` 以及 `load_synced_presets_cmd` / `save_synced_presets_cmd`，并且 `Cargo.toml` 默认开启了 `devtools`。
-- 本地存储（`src-tauri/src/storage/paths.rs`）：配置持久化在系统的 `app_config_dir()` 中。
-
-### 为什么推荐「Tauri v2 + Swift Sidecar (`ax-bridge`)」？
-
-| 方案 | 优点 | 缺点 | 推荐度 |
-| :--- | :--- | :--- | :---: |
-| **纯 Rust 调 AXUIElement** | 单一二进制，无跨语言通信 | Rust 绑定极不成熟，`CFRunLoop` 与 Tokio 难兼容，踩坑极多 | ⭐ |
-| **纯原生 SwiftUI / Xcode** | 调 AXUIElement 最顺手 | 无法复用 `agyPreviewInstant` 前端生态；调试网页 UI 麻烦；难与 PWA 共享编解码；需重学 Xcode 工程配置 | ⭐⭐ |
-| **Tauri v2 + Swift Sidecar CLI** | **Swift 原生写 AX 逻辑（零桥接坑）+ Rust 管 WebRTC/信令/HTTP 服务 + React 做 Debug 与移动端预览 UI + Monorepo 共享 Presets** | 需多维护一个极轻量的 `Package.swift` 命令行工具（约几百行 Swift） | ⭐⭐⭐⭐⭐ |
-
-### Monorepo 目录规划建议
-
-利用现有的 `pnpm-workspace.yaml`，将仓库演进为多应用 Monorepo：
+### 推荐 Monorepo 目录结构
 
 ```text
 agyPreviewInstant/
+├── pnpm-workspace.yaml
+├── Cargo.toml                        # Rust Cargo Workspace（共享核心 crate）
 ├── apps/
-│   ├── preview-instant/          # 原有的 AGY Preview Instant (独立 Tauri 应用 & 图标)
-│   └── p2p-remote-controller/    # 新增的 P2P Remote Controller (独立 Tauri 应用 & 图标)
-│       ├── src/                  # React Debug UI：AX 树查看、Quick Copy、移动端画面模拟器
-│       └── src-tauri/            # Rust 后端：Tray(monitor-cloud)、DevTools、LAN/WebRTC/Signaling
-├── native/
-│   └── ax-bridge-swift/          # 纯 Swift Package (无 Xcode 工程)，编译为 Tauri Sidecar
-│       ├── Package.swift
-│       └── Sources/              # AXUIElement 扫描、AXPress 执行、Safari 独立窗口追踪
-└── packages/
-    └── shared-presets/           # 共享 TypeScript 类型、System Instruction Preset 协议等
+│   ├── agy-preview-instant/          # 原应用（独立启动命令，独立图标）
+│   └── p2p-remote-controller/        # 新 Tauri 应用（独立启动命令，monitor-cloud 图标）
+│       ├── src/                      # React Debug UI + 移动端画面模拟器 + Quick Copy
+│       └── src-tauri/                # Tauri v2 主进程 + WebRTC/Signaling + Sidecar 调度
+├── packages/
+│   ├── shared-config/                # 共享 Preset、Tag、Title、类型定义（TS）
+│   ├── shared-rust/                  # 共享存储路径解析、Preset 读写（Rust）
+│   └── macos-ax-helper/              # 纯 SwiftPM 原生辅助进程（AXUIElement + Safari 控制）
 ```
 
-- **双应用独立启动与共存**：通过不同的 `pnpm` 命令分别启动（例如 `pnpm dev:instant` 与 `pnpm dev:controller`），各自拥有独立的 `tauri.conf.json`、`identifier` 和应用图标。
-- **预设（Presets / Tag / Title）共享**：除了在 `packages/shared-presets` 共享 Schema，运行时的个人预设可约定存储在公共目录（如 `~/Library/Application Support/com.antigravity.shared/presets.json`），两个 Tauri 应用均可直接读写互通。
-- **Debug 与控制台需求实现**：
-  - **Tray 图标**：将 Lucide 的 `monitor-cloud` 导出为单色模板 PNG（macOS Menu Bar 规范），配合 Tauri `TrayIconBuilder` 实现。
-  - **控制台与终端**：托盘右键菜单增加 `Open DevTools`（调用 `window.open_devtools()`）；页面内支持右键打开检查器（`devtools` feature 已开启）；在 `tauri dev` 启动时终端可直接交互或接收 Rust 标准输入指令。
-  - **Quick Copy**：前端界面提供一键复制按钮，将当前抓取的 AX 树 JSON / 精简 DOM 快照写入剪贴板，方便直接粘贴给 AI 分析下一步操作。
+### 双应用共存与独立启动
+- 两个 Tauri 应用拥有各自独立的 `productName`、`identifier`（如 `com.antigravity.p2premotecontroller`）和打包图标，可以单独启动，也可以同时运行。
+- **托盘图标**：使用 `lucide-react` 的 `monitor-cloud`（`MonitorCloud`）SVG 导出为 macOS 菜单栏专用的黑白 Template PNG（启用 `icon_as_template(true)`，自动适配深色/浅色菜单栏）。
+- **控制台与 Debug 能力**：
+  1. **托盘右键菜单**：提供 `Show/Hide Window`、`Open DevTools (Console)`、`Restart AX Helper`、`Quit`。
+  2. **页面内控制**：由于 `Cargo.toml` 已开启 `tauri/devtools`，页面可直接通过快捷键或按钮调用 `openDevTools()`；提供 **Quick Copy** 按钮，一键将抓取到的 `AXUIElement` 树结构、Safari 窗口/Tab 元数据、错误日志格式化为 JSON/Markdown 复制到剪贴板。
+  3. **Rust 后端终端选择**：保留 CLI 参数或交互式启动菜单，支持指定监听端口、Signaling Server 地址或目标浏览器模式。
 
 ---
 
-## 四、 后续演进路径：WebRTC + 私有协议 + PWA + Signaling
+## 三、macOS `AXUIElement` 机制与真实边界评估
 
-1. **常驻 Signaling 与 WebRTC P2P**：
-   - 将 Signaling Server（公网长连接）和 WebRTC DataChannel 放在 **P2P Remote Controller 的 Rust 后端**（如 `webrtc` crate 或 Rust 信令客户端）常驻运行，即使关闭调试主窗口只留 `monitor-cloud` 托盘图标，远程通道依然在线。
-2. **PWA + Service Worker 移动端**：
-   - 手机端通过 PWA（由 Service Worker 提前离线缓存整套 React 渲染壳子），连上 WebRTC DataChannel 后，Mac 端通过私有紧凑协议发送「精简后的页面可交互元素树」；手机端将其**重绘（Recreate）为适合触屏操作的原生感 UI**，点击后发回指令 ID 给 Mac 执行。
+### 1. 权限申请与开发者签名坑
+- **申请方式**：调用 `AXIsProcessTrustedWithOptions([kAXTrustedCheckOptionPrompt: true])`，系统会弹窗引导在 **系统设置 -> 隐私与安全性 -> 辅助功能** 中授权。
+- **开发期注意事项**：`cargo tauri dev` 或频繁重编译时，如果二进制仅做 ad-hoc 签名（`-`），部分 macOS 版本可能出现 TCC 权限失效需要重新勾选。建议在本地钥匙串创建一个自签名代码签名证书（或使用 Apple Development 证书）固定签名身份。
 
----
-
-## 五、 环境准备与 Git / Xcode 工作流说明（针对 Apple Silicon + Sequoia 15.7.5+）
-
-因为采用的是 **Swift Package Manager (`swift build`) Sidecar** 模式，**你不需要使用 Xcode IDE 来写代码或点 Run/Archive**：
-
-1. **本地提前准备**：
-   - 安装 **Xcode Command Line Tools**（`xcode-select --install`），或直接从 App Store 安装 Xcode（仅用于提供 Swift 编译器与 macOS 15 SDK）。
-   - **Git 工作流完全不变**：依然是 `git clone` -> `pnpm install` -> `pnpm dev:controller`。构建脚本会自动触发 `swift build -c release` 并把生成的 `ax-bridge` 二进制放到 `src-tauri/binaries/` 下供 Tauri 打包。
-2. **macOS Sequoia 15.7.5 开发期权限踩坑预警（重要）**：
-   - **辅助功能权限（TCC）重置问题**：Tauri 默认使用 ad-hoc 签名（`"signingIdentity": "-"`）。每次重新编译后，macOS 可能会认为二进制签名变了，导致你必须在「系统设置 -> 隐私与安全性 -> 辅助功能」里删掉重新勾选。
-   - **开发期规避技巧**：
-     1. 开发调试时，直接把权限授予你的终端（如 iTerm2 / Terminal / VS Code），从终端启动 `pnpm dev` 时子进程会继承终端的辅助功能权限；
-     2. 打包 `.app` 时，在本地 macOS「钥匙串访问」创建一个自签名代码签名证书（Self-Signed Certificate），并在 `tauri.conf.json` 中固定 `signingIdentity`，即可一劳永逸避免每次编译重新授权。
-   - **Apple Events（控制 Safari）权限**：如果使用 AppleScript 控制 Safari 新建独立窗口，需在 `Info.plist` 中声明 `NSAppleEventsUsageDescription`，首次触发时系统会弹窗请求「允许控制 Safari」。
+### 2. 「不干扰鼠标/工作」的可行性拆解（实话实说）
+1. **读取页面内容（完全无干扰）**：
+   - 通过 `AXUIElementCreateApplication(safariPid)` 读取 Safari 的窗口列表、`AXWebArea`、按钮、链接、输入框、文本内容与坐标，**100% 不会移动鼠标、不会抢占焦点、不影响你干别的活**。
+2. **模拟操作（存在明显限制）**：
+   - **能后台无感做的**：对标准原生控件、常规 `<button>` / `<a>` 调用 `AXUIElementPerformAction(element, kAXPressAction)`，不会移动物理鼠标。
+   - **做不到稳定后台无感的**：
+     - 现代 React/Vue SPA 中，大量自定义 `<div>` 点击事件、Hover 菜单、Canvas 交互对 `kAXPressAction` 响应不稳定。
+     - **文本输入**：通过 `kAXValueAttribute` 直接改值经常**无法触发网页 JS 的 `onInput` / `onChange` / `keydown` 事件**；若改用 `CGEventPost` 模拟键盘敲击，则通常要求目标窗口处于激活（Focused）状态。
+     - **总结**：简单表单和链接点击可以尝试后台 `AXPress`，但**不要对「全自动无感后台操作任意复杂网页」抱 100% 幻想**。当遇到不响应 `kAXPressAction` 的页面时，需要有降级策略（例如短暂激活窗口执行点击后切回，或提示用户）。
 
 ---
 
-## 六、 建议的下一步行动（Phase 1）
+## 四、Safari 保活机制、多标签页与独立桌面（Space）问题
 
-如果认可上述架构结论，建议第一步先做最小可验证闭环（MVP）：
-1. 将当前仓库改造为 `apps/preview-instant` 与 `apps/p2p-remote-controller` 的 pnpm Monorepo 结构，配置双命令启动与 `monitor-cloud` 托盘图标（含右键打开 DevTools）。
-2. 编写极简的 `native/ax-bridge-swift` Sidecar，验证：**申请辅助功能权限 -> 询问并打开独立 Safari 窗口 -> 实时抓取该窗口的 `AXWebArea` 可点击元素列表**。
-3. 在 P2P Remote Controller 界面中展示抓取结果并提供 **Quick Copy** 按钮，由你实际在本地测试几个真实登录后的目标网页，把复制出来的数据发给我，我们再根据实际拿到的无障碍树结构决定下一步的精细解析与 WebRTC 协议设计。
+### 1. Safari 页面保活机制（为什么后台会失活？）
+在 Apple Silicon macOS 上，Safari / WebKit 为了省电有严格的后台节流策略：
+- **后台 Tab（同一窗口未选中的标签页）**：JS `setTimeout`/`setInterval` 被大幅降频或冻结，`requestAnimationFrame` 彻底暂停；一段时间后对应的 `com.apple.WebKit.WebContent` 进程会被挂起，导致 **`AXWebArea` 无障碍树变空或数据陈旧**。
+- **最小化窗口（Minimized）**：窗口最小化后渲染管线暂停，同样会触发休眠。
+- **App Nap**：当 Safari 没有任何可见窗口时，macOS 会触发 App Nap。
+
+### 2. 独立桌面（Space）后台轮流激活可行吗？
+- **结论：不行。**
+- 原因一：macOS 同一时刻全局只能有一个活跃 Space 和一个焦点窗口。如果你把 Safari 放在桌面 2，后台脚本一旦调用 `activate` 或 `AXRaise` 聚焦它，**系统会强制把你的屏幕从桌面 1 切到桌面 2**，严重打断你的正常工作。
+- 原因二：macOS 没有提供跨 Space 创建或静默移动窗口的公开 API（只有易失效的私有 CGS API）。
+
+### 3. 推荐的务实替代方案
+- **独立窗口 + 同桌面不最小化（遮挡可接受）**：
+  - 让程序通过 AppleScript/JXA 为自己新建一个**独立的 Safari 窗口**（而不是塞进你正在用的窗口里做标签页）。
+  - 只要这个窗口**不最小化**（可以放在屏幕边缘，或者直接被你当前的工作窗口盖在下面），WebKit 通常会认为该窗口的当前活跃 Tab 仍处于「可见窗口容器」中，配合必要时的 `ProcessInfo` 防休眠或轻量心跳，可用性远高于后台 Tab。
+- **把「把某个标签页拽出来」作为可选动作**：通过 Safari 脚本接口或读取当前 URL 后在新窗口打开，即可将目标页面隔离到独立窗口。
+
+---
+
+## 五、页面追踪、过滤隔离与 Redirect / Popup 处理机制
+
+### 1. 页面到底靠什么追踪？（不是靠 Title，也不是靠 URL）
+- 网页 Title 会变，SPA 的 URL（History API `pushState`）也会变，因此**不能用 Title 或 URL 作为唯一标识**。
+- 正确的追踪锚点是 **Safari 窗口 ID（`window id` / `CGWindowID`）**：
+  - 在 Safari AppleScript/ScriptingBridge 中，每个窗口都有一个唯一的整数 `id`（直到窗口关闭前恒定不变）。
+  - 在 `AXUIElement` 中，可通过桥接获取对应的 `CGWindowID`。
+  - **特点**：无论页面发生 302 Redirect、前端路由跳转、还是动态修改 `<title>`，**这个 `window id` 始终不变**。
+
+### 2. 隔离流程与 Popup / Redirect 跟随设计
+1. **启动检查**：检测 Safari 是否在运行。若未运行，弹窗询问用户是否启动 Safari；若已运行，询问是否允许新建一个**受控专属 Safari 窗口**。
+2. **白名单绑定**：记录该新建窗口的 `window_id` 为 `managedWindowIds` 集合。扫描时**只读取 `managedWindowIds` 内的窗口**，彻底过滤掉用户自己打开的所有其他 Safari 窗口与标签页（避免误读隐私数据，也避免扫描大量无关节点导致卡顿）。
+3. **Redirect 跟随**：同一窗口内重定向，无需额外处理，`window_id` 不变，重新读取 `AXWebArea` 即可。
+4. **Popup 弹窗跟随**：
+   - 情况 A（弹窗变成了该窗口内的新 Tab）：监测到受控窗口的 `tabCount` 增加，自动将焦点指针切换到最新 Tab。
+   - 情况 B（弹窗打开了新的 Safari 窗口）：在执行可能触发弹窗的操作前后，对比 Safari 的 `window_id` 列表；若紧随操作后出现新 `window_id`，自动将其纳入 `managedWindowIds` 进行接管。
+
+---
+
+## 六、技术栈选型结论：为什么是「Tauri (Rust) + SwiftPM Sidecar」？
+
+### 1. 为什么不建议纯 Rust 调用 `AXUIElement`？
+- `AXUIElement` 属于 C/CoreFoundation 层 API，充满 `CFTypeRef`、`AXValueRef` 手动内存管理与回调桥接。在 Rust 中通过 FFI 编写不仅代码冗长、容易内存泄漏，而且调试极其痛苦。
+- 在 **Swift** 中，`ApplicationServices` + `AppKit` + `NSAppleScript` 是原生一等公民，代码量仅为 Rust FFI 的 1/5，且可直接配合 Xcode 自带的 **Accessibility Inspector** 进行可视化调试。
+
+### 2. 为什么不建议完全放弃 Tauri 改用纯 Swift App？
+- **调试与预览需求**：你的核心需求之一是在桌面端预览/模拟移动端 PWA 拿到的画面与数据结构，使用 **Tauri + React + DevTools** 可以直接复用浏览器控制台、DOM 调试和现有仓库组件。
+- **WebRTC + 私有协议 + PWA + Signaling Server**：
+  - 现有仓库已经有一套稳定的 Rust `hyper` LAN Server；
+  - 后续你的手机端打算采用 **PWA + Service Worker 离线缓存 UI 重建**，桌面端作为 WebRTC Peer 常驻连接 Signaling Server。这些网络与前端编解码逻辑放在 **Tauri (Rust + TypeScript)** 中开发效率最高，且能直接与 `AGY Preview Instant` 共享 Preset、Tag、Title 等配置。
+
+### 3. 复合架构通信方式
+- 在 `packages/macos-ax-helper/` 下建立一个纯 Swift 命令行工具（`SwiftPM`）：
+  - 负责：`AXUIElement` 权限检查、Safari 窗口创建与生命周期管理、`AXWebArea` 树抓取与精简序列化、执行 `AXPress` 等动作。
+  - 通信：由 Tauri Rust 后端以 **Sidecar (`externalBin`)** 形式拉起，通过 **标准输入输出（JSON-RPC / NDJSON）** 或本地 Unix Domain Socket 与 Rust 高速通信。
+  - **优点**：完全解耦。Swift 只管「系统无障碍层抓数据与执行动作」，Rust/TS 只管「WebRTC 信令、私有协议编解码、PWA 数据推送、Debug UI 展示」。
+
+---
+
+## 七、Xcode 与开发环境准备清单（面向初次使用者）
+
+既然你之前没有使用过 Xcode 的 Git 编译运行工作流，采用上述 **Tauri + SwiftPM Sidecar** 方案可以让你**几乎不需要接触复杂的 Xcode 工程配置**：
+
+1. **安装工具**：
+   - 从 Mac App Store 安装 **Xcode**（或先运行 `xcode-select --install`，但推荐安装完整 Xcode，因为内置了调试无障碍树必备的 **Accessibility Inspector**）。
+   - 安装后运行一次 `sudo xcode-select -s /Applications/Xcode.app/Contents/Developer`。
+2. **日常开发与 Git 工作流（完全命令行化）**：
+   - 你依然只需要 `git clone` -> `pnpm install` -> `pnpm tauri dev`。
+   - `packages/macos-ax-helper` 通过 `Package.swift` 管理，构建脚本只需执行：
+     ```bash
+     swift build -c release --arch arm64
+     ```
+     即可产出 Apple Silicon 原生二进制文件，不需要打开 Xcode GUI 点 Run，也不会产生难解的 `.xcodeproj` Git 冲突。
+3. **何时才需要打开 Xcode？**
+   - **仅用于调试工具**：打开 `Xcode -> Open Developer Tool -> Accessibility Inspector`，用鼠标指着 Safari 页面，即可实时看到每个元素的 `AXRole`、`AXTitle`、`AXIdentifier` 与支持的操作，极大加速开发。
+   - **如果真想在 Xcode 里单步调试 Swift 代码**：直接在终端执行 `open packages/macos-ax-helper/Package.swift`，Xcode 会自动识别并打开它。
+4. **最低系统要求利用**：
+   - 锁定 `macOS 15.0+` (`Sequoia 15.7.5`) 与 `arm64` 后，无需兼容 Intel (x86_64) 和老旧 macOS API，Swift 并发（`async/await`）与最新系统框架均可直接使用。
+
+---
+
+## 八、建议的下一步行动路线（Phase 1）
+
+1. **Monorepo 脚手架搭建**：将现有应用迁移/组织为 `pnpm + Cargo` workspace，新增 `P2P Remote Controller` Tauri 应用，配置 `monitor-cloud` 托盘图标与右键 Console 菜单。
+2. **Swift AX Helper 原型**：创建 `macos-ax-helper`（`arm64`, macOS 15+），实现：
+   - 申请 `AXUIElement` 权限；
+   - 检测/启动 Safari 并新建受控专属窗口，返回 `window_id`；
+   - 抓取受控窗口内 `AXWebArea` 的精简 JSON 树（过滤无关节点）。
+3. **Debug 界面与 Quick Copy**：在 `P2P Remote Controller` 窗口中展示抓到的 Safari 页面结构树，提供 **Quick Copy** 按钮，你实际拿几个常用网站（含登录态、SPA、弹窗）抓一次数据发给我，我们再根据真实节点数据设计私有协议与 WebRTC/PWA 端 UI 重建方案。

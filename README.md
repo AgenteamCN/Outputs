@@ -1,90 +1,171 @@
-# Safari P2P 改造报告：AXObserver 主动推送、页面持久化、时间轴导出与本地抓包路径分析
+# RocketCompanion Developer Broadcasting & Replay Watch Together 复现与根因分析报告
 
-> **代码提交**：`0a61e5dd1cb3e30621925a0d6bc8af79341df8b1`（`verified: true`，分支 `a2`）
-> **构建说明**：本沙盒为 Linux x86_64 环境，已完成前端 TypeScript / ESLint / Vite 生产构建验证（`pnpm --filter p2p-remote-controller check && pnpm --filter p2p-remote-controller build` 全量通过）；Swift (`MacosAxHelper`) 与 Rust (`src-tauri`) 需在你的 macOS 上执行 `pnpm ax-helper:build && pnpm p2p:dev` 完成原生编译与实机测试。
-
----
-
-## 一、本次已完成的功能改造（按你的需求落地）
-
-### 1. `AXObserver` 主动推送 + 消除 `Refresh` / `Scan` 割裂
-- **Swift 辅助进程（`packages/macos-ax-helper`）**：
-  - 新增 `AxObserverManager.swift`：在独立 `CFRunLoop` 后台线程上挂载 macOS `AXObserverCreate`，自动监听 Safari 进程的：
-    - `kAXTitleChangedNotification`（标题变化，解决 `Open New` 后长期显示 `Untitled`）
-    - `AXLoadComplete`（WebKit `AXWebArea` 加载完成）
-    - `kAXWindowCreatedNotification` / `kAXUIElementDestroyedNotification`（窗口新建/关闭）
-    - `kAXFocusedWindowChangedNotification`（窗口焦点切换）
-    - `AXLiveRegionChanged`（带 ARIA Live Region / `role="alert"` 的弹窗或提示）
-  - 改造 `JsonRpcServer.swift`：增加线程安全的 `stdoutLock`，支持在处理 RPC 请求的同时，向 `stdout` 主动推送 `{"method": "ax_event", "params": {...}}` 通知，并新增 `start_observing` / `stop_observing` RPC（在 `get_safari_status`、`open_managed_window`、`scan_window_elements` 时自动挂载）。
-- **Rust 桥接层（`apps/p2p-remote-controller/src-tauri`）**：
-  - 改造 `ax_bridge.rs`：将原本同步阻塞的 `stdout.read_line()` 拆分为独立 `stdout` 异步读取线程 + `pending` RPC 请求映射表（15 秒超时），收到 `ax_event` 时通过 Tauri `app.emit("ax-event", params)` 实时推给前端。
-- **前端统一同步（`apps/p2p-remote-controller/src/App.tsx`）**：
-  - 顶部新增 **`AXObserver Active / Off`** 状态徽章。
-  - 收到 `ax-event` 后自动防抖（220ms）触发窗口列表更新与（当 `Auto-Rescan` 开启且命中当前选中窗口时）AX 树重扫，并将 `windowTitle` / `url` 实时回写到窗口标签上。
-  - 点击顶部 `Refresh` 时，若当前有选中的活跃窗口，会同步重扫 AX 树；点击窗口标签扫描 AX 树时，也会把最新 `title` 和 `url` 同步到标签上，彻底消除两者割裂。
-
-### 2. 页面 ID 持久化 + 消失询问删除
-- 将 `managedTargets`（含 `windowId`、`title`、`url`、`tabCount`、`status`、`lastSeenAt`）、`selectedWindowId` 与 `targetUrl` 持久化到 `localStorage`。
-- 当已记录的 Safari 窗口被关闭或消失时，**不再静默移除**，而是将其标记为 `missing`（标签变为黄色虚线 `[Missing]`），并在顶部弹出确认横幅，提供：
-  - **`Reopen URL`**：按原 URL 重新打开并替换旧记录
-  - **`Remove Record`**：用户确认后再移除记录
-
-### 3. 全链路时间轴记录与导出（`Timeline` 标签页）
-- 右侧面板新增 **`Timeline (N)`** 标签页，按毫秒时间戳记录每一条事件，并明确标注：
-  - `source`：`ax_observer`（系统无障碍推送）/ `user_action`（用户点击操作）/ `auto_refresh`（由推送触发的窗口刷新）/ `auto_rescan`（由推送或动作触发的 AX 重扫）/ `system`
-  - `triggeredRefresh`：`true` / `false`（该事件是否触发了自动刷新）
-  - `windowId`、`durationMs`、`detail`
-- 提供 **`Export Timeline JSON`**（直接下载 `.json` 文件）和 **`Copy Timeline`**（一键复制到剪贴板），方便你实机测试后直接导出发给我分析。
+- **目标分支**：`z/agy/rc/multiplayer-recheck`
+- **新增复现 Commit**：`9c7d27e2e4256fd2957085bccf6ea58456714f07`（Verified Bot Commit）
+- **复现套件**：`scripts/runDevBroadcastReproV2.mjs`（`pnpm run repro:dev-broadcast-v2`）
+- **测试回放样本**：`rc-replay-3v3-1-0-2026-11-13T07-26-58.rcreplay`
 
 ---
 
-## 二、macOS 实机操作指南（如何测试并导出时间轴）
+## 一、快速复现方法
 
-1. 在 macOS 本地拉取最新 `a2` 分支代码并重新编译 Swift Helper 与启动 P2P：
-   ```bash
-   git pull origin a2
-   pnpm ax-helper:build
-   pnpm p2p:dev
-   ```
-2. 确认顶部三个状态徽章均正常：`AX Trusted`、`Safari Automation OK`、`AXObserver Active`。
-3. 点击 **`Open New`** 打开 `https://aistudio.google.com`（此时不要点 Refresh，先观察 3~5 秒，看 `AXObserver` 是否自动把标题从 `Untitled` 更新并自动扫描出元素）。
-4. 在 AI Studio 页面或 P2P 面板上执行几次点击/输入操作，然后再手动关闭一个窗口测试 `[Missing]` 询问条。
-5. 切换到右侧 **`Timeline`** 标签页，点击 **`Export Timeline JSON`** 导出 JSON 文件发给我即可。
+```bash
+# 确保已初始化 public 子模块（包含 camera.wasm 等静态资产）
+git submodule update --init --depth 1 public
 
----
+# 指定 3v3 回放文件并运行真实 Headless Chrome + WebGL + WASM 复现套件
+RC_REPLAY_PATH=/path/to/rc-replay-3v3-1-0-2026-11-13T07-26-58.rcreplay pnpm run repro:dev-broadcast-v2
+```
 
-## 三、深度解答：Safari 不注入脚本能否拿到数据包错误详情？会违反 ToS 吗？
-
-### 1. 关于 Safari 注入脚本与 ToS 的边界
-- **Apple / Safari 侧**：Safari 官方在“开发”菜单中原生提供了 `允许来自 Apple 事件的 JavaScript`（`do JavaScript`），并有官方的 `Safari Web Extensions` 体系，**在自己本机浏览器里使用这些接口本身完全合规**。
-- **目标网站（如 Google AI Studio）ToS 侧**：大多数在线服务条款限制的是“未授权的自动化批量抓取、绕过速率限制或逆向工程”。如果是个人辅助操作/状态观测，只要不绕过鉴权或高频刷接口，通常属于灰区辅助工具；但如果你希望**完全不向网页 DOM/JS 注入任何脚本**，下面分析纯本地系统的其他通道。
-
-### 2. 不注入脚本、不用 Chrome：macOS Safari 还有哪些本地通道能拿到 HTTP 非 200 错误详情？
-
-你提到一个非常关键的问题：*“数据都已经进到我电脑里了，Back End 已经把 `code` / `reason` 发过来了，为什么一定要 MITM？”*
-
-**macOS 底层隔离真相**：
-Safari 的网络请求与 TLS 加解密发生在独立且受沙盒/SIP 保护的系统进程 **`com.apple.WebKit.Networking`** 内存空间中。外部进程（包括我们的 `P2P Remote Controller`）**无法直接跨进程读取它的内存明文**。因此，在不注入页面 JS 的前提下，macOS 本地只剩两条路径：
-
-| 通道方案 | 实现原理 | 能否拿到非 200 响应的 `code` / `reason` | 需要什么权限 / 配置 | 优缺点评估 |
-| :--- | :--- | :--- | :--- | :--- |
-| **路径 1：本地 HTTPS 代理 / macOS `NETransparentProxyProvider`**（推荐的零注入方案） | 在本机启动一个轻量 Rust 代理（如基于 `hudsucker`），或在系统设置中配置本地代理，将自签根证书加入 macOS **系统钥匙串（System Keychain）并设为“始终信任”**。Safari **默认信任用户手动信任的系统根证书**（不会像独立 App 那样因 Pinning 报错）。 | **可以（100% 拿到完整 HTTP 状态码、Header、JSON Error Body、SSE 流）** | 1. 引导用户安装并信任一次本地根证书（或使用 `NETransparentProxyProvider` 需 Apple Developer 签名）；<br>2. 若目标站走 HTTP/3 (QUIC)，需在 Safari 关闭 QUIC 使其回退到 HTTPS/TCP。 | **完全零页面脚本注入**；但需要处理证书信任与代理开关。 |
-| **路径 2：Safari Web Inspector / `safaridriver`** | 通过 Apple 原生 `webinspectord` / `safaridriver`（WebDriver）连接 Safari。 | **极受限**（传统 `safaridriver` 主要用于 DOM 操控，对网络响应 Body 拦截支持远不如 Chrome CDP）。 | 需开启 Safari「允许远程自动化」 | 不适合用来稳定抓包解析错误 JSON。 |
-| **对比：JS Hook（`do JavaScript` / Safari 扩展）** | 仅在页面内 Hook `fetch` / `XHR` 只读监听返回体并回传本地 WS。 | **可以（100% 拿到）** | Safari 开启「允许来自 Apple 事件的 JavaScript」或安装轻量 Safari 扩展。 | 工程最简单、无证书问题、无 QUIC 问题；唯一前提是允许注入只读监听脚本。 |
+当前基线（`9c7d27e`）运行结果：**`reproduced=4/4`**，全部 4 类问题均已在真实浏览器双端（Host + Client）稳定复现，详细 JSON 快照输出至 `/tmp/dev-broadcast-repro-v2.json`。
 
 ---
 
-## 四、待你确认的问题（决定下一步自动化与手机端联调方向）
+## 二、已复现问题清单、根因定位与分步修复指南
 
-请你在实机跑完本次更新并导出 Timeline 后，确认以下 5 个问题，以便我们定死下一步方案：
+### 问题 1：Developer Broadcasting Room 默认 Freeplay 进球后无法触发 Cinematic Goal Replay（球黑掉卡死）
 
-1. **网络错误包捕获路线二选一**：
-   - 你更希望走 **「本地 HTTPS 代理 + 钥匙串信任一次根证书」（零页面脚本注入）**，还是 **「Safari 开启允许 Apple 事件 JS / 扩展做只读 Hook」（零证书、无 QUIC 干扰）**？
-2. **`AXObserver` 在 AI Studio 的实测覆盖度**：
-   - 导出 Timeline 后，我们就能直接看到 AI Studio 页面加载、按钮变化、报错弹窗出现时，Safari 到底发了哪些 `AXObserver` 通知、哪些没发（决定是否需要在任务执行期开启 500~1000ms 节流辅助扫描）。
-3. **加载等待完成（Wait-for-Idle）的判定信号**：
-   - 后续自动化发送 Prompt 后，AI Studio 会有加载动画。你希望优先依据什么判断“回答已生成完毕”？（例如：`Stop` 按钮消失变回 `Run/Send`、还是结合网络 SSE 流 `[DONE]` 结束信号？）
-4. **手机端优先控制路径**：
-   - 手机端操作时，是让手机继续通过 **AGY 主程序的 LAN 服务（`14200` 端口）** 转发指令给 P2P，还是让 P2P 自己直接开一个局域网/本地 HTTP+WS 控制端口（如 `14201`）？
-5. **Safari 窗口 vs 多标签页（Tab）**：
-   - 当前设计是“一个自动化任务对应一个独立 Safari 窗口（`windowId`）”，这能避免多标签页互相抢焦点。后续是否需要支持**同一个 Safari 窗口内的多个 Tab 切换**？
+- **复现现象**：
+  - Host 创建 Developer Sync Room 后默认处于 `freeplay` 模式，且 `runtime.authoritativeServer` 存在（`hasAuthServer: true`）。
+  - 将球高速射入球门（`posY` 越过 `5120` 球门线到达 `5601` -> `5884`）后，`FreeplayMode.isGoalReplayActive()` 始终为 `false`，`goalAndTouch.goalResetTicks` 始终为 `0`，`goalIncidentTick` 为 `-1`，球停在球门网内（`ballVelY: 0`）并进入 RocketSim 的进球后熄灭/黑化状态，无法自动进入 Cinematic Goal Replay 与重置开球，只能手动通过 Ball Control 拿球。
+- **根因定位**：
+  - `src/game/modes/freeplay/FreeplayGoalAndTouchSubController.ts` 的 `stepAfterPhysicsTick()` 中存在提前返回逻辑：
+    ```ts
+    if (
+      (scenePort.authoritativeServer || scenePort.networkReconciler) &&
+      !(this.goalResetTicks > 0 && this.replayPendingType === 'expire')
+    ) {
+      if (sim.pollGoal) sim.pollGoal();
+      return;
+    }
+    ```
+  - 当 Host 开启 Developer Broadcasting Room 时，`scenePort.authoritativeServer` 非空，但此时 Host 并不是在运行 `AuthoritativeServerHost` 的 Match 权威状态机，而是在 **Broadcasting Host（Pure CSR 广播主控）** 模式下本地运行 `FreeplayMode`。上述判断把“Broadcasting Host”错误等价于“远程 Match 客户端”，直接 `pollGoal()` 吞掉进球标志并 `return`，导致 Freeplay 的进球检测、球冻结、Cinematic Goal Replay 与开球重置全部被跳过。
+  - 同时，即便 Host 触发了 Freeplay Goal Replay，也需要通过 `server.pushBroadcastSignal(...)`（`GOAL_REPLAY_WILL_START` / `GOAL_REPLAY_START` / `GOAL_REPLAY_END`）广播给 Client，并在 `FreeplayMode.skipGoalReplay()` 中区分 `isBroadcastingHost` 与真正的远程客户端（`FreeplayMode.ts` 中 `if (this.runtime?.networkReconciler && !this.directorPreview.isReplayActive)` 目前也会受影响）。
+- **分步修复建议**：
+  1. 在 `FreeplayGoalAndTouchSubController.stepAfterPhysicsTick()` 中引入明确的角色判定：仅当处于 **非 Host 广播的在线客户端**（即 `Boolean(scenePort.networkReconciler) && !isDevSyncHostBroadcastingMode(Boolean(scenePort.authoritativeServer))`）时才跳过本地 Freeplay 进球逻辑；Broadcasting Host 必须允许走完整的本地 Freeplay Goal Detection & `beginGoalReplay()` 流程。
+  2. 在 `SimulationStage.ts` 中确认 `physics.pollGoal()` 不会在 `FreeplayGoalAndTouchSubController.stepAfterPhysicsTick()` 之前提前消费掉 Freeplay 的 goal latch（注意 `FreeplayMode.stepAfterPhysicsTick` 在 `physics.step` 阶段内执行时序）。
+  3. 在 `FreeplayGoalAndTouchSubController` / `directorPreview` 触发 `beginGoalReplay` 和 `completeReplaySession` 时，若 `isDevSyncHostBroadcastingMode(Boolean(scenePort.authoritativeServer))` 为真，同步通过 `authoritativeServer.pushBroadcastSignal` 发送 `GOAL_REPLAY_WILL_START`、`GOAL_REPLAY_START` 和 `GOAL_REPLAY_END`（或 `KICKOFF_START`）给 Pure CSR Client，确保两端同步进入/退出电影级回放视角。
+
+---
+
+### 问题 2：Replay Watch Together 时 Client 缺失人名、左右 1-3 / 4-6 名单条及上方积分牌 UI
+
+- **复现现象**：
+  - Host 加载 `rc-replay-3v3-1-0-2026-11-13T07-26-58.rcreplay` 后：
+    - Host DOM：`domScoreboard: true`（`Alpha:StepperScoreboardHUD` 可见，显示比分与时间），`domRosterCards: 10`（左右两侧各队玩家条及人名正常显示）。
+    - Client DOM：`matchMode: "replay-viewer"`, `activeRoomActivity: "replay"`，但 **`domScoreboard: false`、`domRosterCards: 0`、`cardNames: []`**，Client 看不到任何积分牌和左右 6 名玩家的名称。
+- **根因定位**：
+  1. **`TelemetryStage._syncEdgeRosterHud()` 提前 return 导致 `isClientSyncedReplay` 成为死代码**：
+     - 在 `src/game/pipeline/stages/TelemetryStage.ts` 中，`isReplayViewerLoaded` 仅检查本地是否加载了 `standaloneReplayViewer?.hasLoadedReplay` 或 `rlrcSession?.hasLoadedReplay`（Client 上均为 `false`）。
+     - 在函数开头：
+       ```ts
+       if (
+         !isReplayViewerLoaded &&
+         matchMode !== 'exp-multi-bots' &&
+         matchMode !== 'match' &&
+         matchMode !== 'online-warmup' &&
+         matchMode !== 'dev-test-lab'
+       ) {
+         return;
+       }
+       ```
+       当 Client 的 `matchMode` 为 `'freeplay'`（或尚未切换为 `'replay-viewer'`）时直接在此 `return`，而提交 `96fc3a1` 新增的 `isClientSyncedReplay`（`appState?.onlineSession?.activeRoomActivity === 'replay' && rvStoreState?.viewerState !== 'idle'`）写在了该 `return` 之后近 100 行处，根本无法执行到 `globalHudTransientChannel.setRoster(...)`。
+  2. **`InGameHUD` / `GoalReplayHudOverlay` 的 `isReplayViewerLoaded` 依赖 `loadedFileName && totalFrames > 0` 与 `useReplayViewerStore` 同步链路**：
+     - 在 `src/ui-core/hud/InGameHUD.tsx` 与 `src/ui-core/hud/GoalReplayHudOverlay.tsx` 中，`showTopScoreboard` 和 `showEdgeRosterStrips` 依赖 `isReplayViewerLoaded`（即 `replayViewerFileName && replayViewerTotalFrames > 0 && replayViewerState !== 'idle'`）。
+     - 实际运行中，Host 通过 `StandaloneReplayViewer` 加载 `.rcreplay` 后，`useReplayViewerStore` 在 Client 端未能持续满足 `loadedFileName` + `totalFrames > 0`（或首次 `ROOM_ACTIVITY_SWITCH` / `GlobalWorkspaceBroadcast` 时 `rvStore` 字段未完整同步，导致 `domScoreboard === false`）。
+  3. **积分牌比分与倒计时未纳入 `WorkspaceReplaySyncPayload`**：
+     - `src/network/protocol/GlobalWorkspaceProtocol.ts` 中的 `WorkspaceReplaySyncPayload` 与 `RLRCReplaySessionController._syncOnlineRoom` / `replayOnlineSyncHelper.ts` 仅同步了 `fileName`、`totalFrames`、`currentFrame`、`playbackState`、`flowPct`、`focusedCarIndex`、`roster`，**没有同步 `blueScore`、`orangeScore`、`remainingSeconds`、`isOvertime`**，也没有在 `devSyncChannelHandlers.ts` 中更新 `hudStore`，导致即便积分牌显示出来，Client 的比分和时钟也不会随回放帧变化。
+- **分步修复建议**：
+  1. 将 `isClientSyncedReplay` 的判断提前到 `TelemetryStage._syncEdgeRosterHud()` 的入口守卫条件中（允许 `isReplayViewerLoaded || isClientSyncedReplay || matchMode === 'replay-viewer'` 通过守卫），确保 Client 每帧都能调用 `globalHudTransientChannel.setRoster(...)` 写入 6 名玩家的名字与队伍颜色。
+  2. 在 `InGameHUD.tsx` 与 `GoalReplayHudOverlay.tsx` 中，当 `onlineSession.activeRoomActivity === 'replay'`（且处于 `isDevSyncRoom`）时，直接允许显示 `showTopScoreboard` 与 `showEdgeRosterStrips`，不再因为本地未加载文件（`totalFrames === 0`）而隐藏整个 Replay HUD。
+  3. 扩展 `WorkspaceReplaySyncPayload`（`GlobalWorkspaceProtocol.ts`）以及 `replayOnlineSyncHelper.ts` / `RLRCReplaySessionController.ts` / `devSyncChannelHandlers.ts`，增加 `blueScore`、`orangeScore`、`remainingSeconds`、`isOvertime` 字段并同步到 Client 的 `hudStore`，使上方积分牌与 Host 完全一致。
+
+---
+
+### 问题 3：观战目标切换（1-6 号位）与默认观战目标未同步到 Client
+
+- **复现现象**：
+  - 初始进入 Replay Watch Together 时：Host 默认观战 `focusedCarIndex: 3`（或 `0`），Client 默认观战 `playerCarIndex`（与 Host 不一致）。
+  - Host 切换观战目标至 3 号车（`focusedCarIndex = 2`）后等待 600ms：
+    - Host `camera.focusedCarIndex === 2`。
+    - Client `useSpectateWorkspaceStore.hostCameraSync.focusedCarIndex === 2`（`wsIsSpectating: true`, `wsFollowHostCamera: true`, `car2Visible: true`），**但 Client 的 `camera.focusedCarIndex` 仍然停留在 `0`**！
+- **根因定位**：
+  1. **`channel.onCameraStateSync` 未同步更新 `useSpectateWorkspaceStore.hostCameraSync`**：
+     - 在 `src/game/runtime/devSyncChannelHandlers.ts` 中，`channel.onGlobalWorkspaceBroadcast` 会调用 `applyIncomingWorkspaceBroadcast(msg)` 更新 `useSpectateWorkspaceStore`，但 `channel.onCameraStateSync` 仅调用 `applyCameraSyncToPort(camera, camSync)`，**没有更新 `useSpectateWorkspaceStore.getState().hostCameraSync`**。
+     - 下一帧 `GameCameraSubsystem.update()` 执行 `resolveFrameCameraMetadata()` -> `getSpectateCameraFollowTargetIndex()` 时，读取的是旧的 `useSpectateWorkspaceStore.hostCameraSync.focusedCarIndex`，然后执行 `r.camera.setFocusedCarIndex(obsTargetIdx)`，立刻把刚刚切换的视角覆盖回旧目标。
+  2. **Camera Focus 状态存在多源冲突（`GameCameraSubsystem` vs `CameraManager` vs `ReplayViewer`）**：
+     - 在 `repro_v2` 中，即使 `wsFocusedCarIndex` 已经更新为 `2` 且 `car2Visible === true`，Client 的 `camera.focusedCarIndex` 仍为 `0`。原因在于 `GameCameraSubsystem.resolveFrameCameraMetadata()` 仅在 `isReplayPov` 为 false 时读取 `spectateFollowIdx`，且在 `StandaloneReplayViewer` / `ReplayViewerCausalSyncController` / `useReplayPovSlotHotkeys` 中，Host 切换 1-6 号位后如果只改了 `rv` 内部状态或 `playerCarIndex` 而未同步触发 `AuthorityCameraSyncTracker` 或被 `CameraAndArenaStage` / `GameCameraSubsystem` 的 `activeCar` 逻辑覆盖，Client 就不会跟随。
+  3. **Client 独立视角与 Host 强制跟随的边界**：
+     - 需求明确：只要 Host 发生了一次切换（1-6 号位或自由视角/球视角），所有未开启独立摄像机锁定的 Client 必须立刻跟随切换到同一目标；若 Host 长时间未切换，Client 本地自主切换不应被周期性广播强制拉回（即 `AuthorityCameraSyncTracker` 的边沿触发语义必须严格生效，且仅在 Host 实际改变 `focusedCarIndex` 时递增 `cameraSyncSeq`）。
+- **分步修复建议**：
+  1. 在 `src/game/runtime/devSyncChannelHandlers.ts` 的 `channel.onCameraStateSync` 中，当 `shouldApplyIncomingCameraSync` 返回 `true` 时，除了调用 `applyCameraSyncToPort(camera, camSync)`，还必须同步更新 `useSpectateWorkspaceStore` 的 `hostCameraSync`（以及 `useReplayViewerStore.activePovCarIndex`）。
+  2. 排查 `GameCameraSubsystem.resolveFrameCameraMetadata()` 与 `CameraManager.setFocusedCarIndex()`：确保当 `ws.isSpectating && ws.followHostCamera && !allowClientIndependentCamera` 时，`obsTargetIdx` 优先使用 `ws.hostCameraSync.focusedCarIndex`，并且**仅在 Host 发送了新的 `cameraSyncSeq`（边沿触发）时**才覆写 Client 当前的 `focusedCarIndex`，避免 Client 本地切人后被下一帧 `GameCameraSubsystem` 覆写，也避免 Host 切人后 Client 无法持久保持。
+  3. 初始加入房间或进入 Replay 时，Host 主动下发一次带有当前 `focusedCarIndex` 的 `cameraSync`（递增 `cameraSyncSeq`），从而消除“Host 看 1 号位、Client 默认看 4 号位”的初始错位。
+
+---
+
+### 问题 4：Exhibition（`exp-multi-bots`）倒计时 3-2-1 在 Client 端只触发 `3`，缺失 `2` 和 `1` 及对应音效
+
+- **复现现象**：
+  - Host 启动 Exhibition 3v3 后，Host `match.state` 完整经历：`kickoff(3) -> kickoff(2) -> kickoff(1) -> playing(0)`。
+  - Client `match.state` 仅经历：`lobby(0) -> kickoff(3)`，DOM 倒计时文字只出现过 `"3"`，**`2` 和 `1` 从未触发，对应音效也只播放了第 3 秒**。
+- **根因定位（协议语义错配）**：
+  - **发送端**（`src/game/modes/experimental-multi-bots/experimentalMultiBotsLifecyclePipeline.ts`）：
+    - 在 `3`、`2`、`1` 秒切换时调用：
+      ```ts
+      replayPort.emitReplaySignal(MATCH_SIGNALS.KICKOFF_WILL_START, state.countdownTicks, sec);
+      ```
+      这里传入的 `param1` 是**剩余 tick 数**（`360`、`240`、`120`），`param2` 是**当前秒数**（`3`、`2`、`1`）。
+  - **接收端**（`src/game/runtime/RuntimeKickoffSignalSubController.ts` 的 `case MATCH_SIGNALS.KICKOFF_WILL_START`）：
+    - 将 `sig.param1` 当作**绝对目标 tick（`targetFrame`）**，将 `sig.param2 === 1` 当作 `isOvertimeKickoff`！
+    - 执行 `if (targetFrame > 0 && effectiveTick >= targetFrame)` 判断：
+      - 当房间已经运行超过 360 ticks（或进入第 2 秒时 `effectiveTick` 已经 `>= 240`），`effectiveTick >= targetFrame` 立刻成立！
+      - Client 误以为倒计时已经过期，直接把 `matchPhase` 置为 `'playing'`、`kickoffCountdown` 置为 `0`，并清空 `latchedKickoffSeconds`！因此只要房间 tick 稍大或进入第 2 秒（`param1 = 240`），`2` 和 `1` 就必然被直接吞掉。
+- **分步修复建议**：
+  1. **统一 `KICKOFF_WILL_START` 信号契约**：在 `experimentalMultiBotsLifecyclePipeline.ts` 中，计算绝对目标 tick：`const targetTick = currentTick + state.countdownTicks`（且仅在进入 kickoff 时以 `targetTick` 作为 `param1`，`isOvertime ? 1 : 0` 作为 `param2`），与 `AuthoritativeServerHost` 保持完全一致的协议语义；或者在 `RuntimeKickoffSignalSubController` 中明确区分“绝对 `targetFrame`”与“显式倒计时秒数信号”，禁止混用 `param1`/`param2`。
+  2. 同时在 `ExperimentalMultiBots` 的 `replayPort.emitReplaySignal` 路径下，确保每次秒数跳变（3 -> 2 -> 1）或基于统一的 `targetFrame` 在 Client 本地按 `remainingTicks = targetFrame - effectiveTick` 驱动 `latchedKickoffSeconds.add(3/2/1)` 与 `audio.play('match_countdown_321', 1.0)`。
+
+---
+
+## 三、先前测试为何未覆盖这些问题（“假测试”审计与测试策略建议）
+
+对仓库现有测试脚本审计后，结论如下：**先前的 `runMultiplayerSyncIssuesRepro.ts` 属于典型的“Mock 绕过型假测试”，而 `runDevSyncReproSuite.mjs` 属于“只测 Happy Path 的浅层 E2E”**。
+
+1. **`scripts/runMultiplayerSyncIssuesRepro.ts`（5 个场景全部误报 `NOT_REPRODUCED`）**：
+   - **只测编解码与纯函数，绕过了真实运行时状态机**：
+     - *Issue 2（Exhibition 倒计时）*：测试里手动调用 `systemControl.pushBroadcastSignal(KICKOFF_WILL_START, 200, 180, 3)` 并只断言 `reconciler.onSignals` 收到信号，**从未运行** `experimentalMultiBotsLifecyclePipeline` 与 `RuntimeKickoffSignalSubController`，因此完全没发现 `param1` 语义冲突导致 2 和 1 被吞掉。
+     - *Issue 4（Replay UI 与 Roster）*：测试里直接在脚本中手动调用 `resolveModeRosterEntries(...)`，**从未运行** `TelemetryStage._syncEdgeRosterHud()` 和 React HUD 渲染，因此完全没发现 `TelemetryStage` 在第 169 行提前 `return` 导致 Client 端根本不推送 Roster。
+     - *Issue 5（Goal Replay）*：测试里手动调用 `systemControl.pushBroadcastSignal(GOAL_REPLAY_WILL_START, ...)`，**从未运行** `FreeplayGoalAndTouchSubController.stepAfterPhysicsTick()`，因此完全没发现 Broadcasting Host 在 Freeplay 进球时会被 `scenePort.authoritativeServer` 提前拦截。
+2. **`scripts/runMultiplayerSuiteTests.ts`（24 个单元测试）**：
+   - 主要覆盖传输层（WebRTC/Tunnel/Framer）、协议编解码（GlobalPayloadCodec / GlobalWorkspaceProtocol）、状态机单测（CoachHandover / AuthorityCameraSyncTracker / PauseAck）。
+   - 这些单测**有价值**（可防止底层协议与控制器回归），但不能替代端到端集成校验。
+3. **`scripts/runDevSyncReproSuite.mjs`（9 个 Headless Chrome E2E）**：
+   - 虽然启动了真实 Chrome + WASM，但断言过浅：
+     - Freeplay 只测了直线行驶，**未测射门进球**；
+     - Exhibition 只测了 `numCars === 6`，**未测倒计时 `3->2->1->GO` 时序与音效**；
+     - Replay 只测了帧推进与 Pause ACK，**未测 Client DOM 积分牌/名单条渲染及 1-6 号位切人持久化**；
+     - Camera 只测了 `ballCam` 布尔开关，**未测 `focusedCarIndex` 切换与跨帧保持**。
+
+### 测试体系演进建议
+
+- **保留** `runMultiplayerSuiteTests.ts` 作为底层协议与单元不变量回归测试；
+- **废弃或重写** `runMultiplayerSyncIssuesRepro.ts` 中脱离真实管线的 Mock 测试；
+- **以本次新增的 `scripts/runDevBroadcastReproV2.mjs`（`pnpm run repro:dev-broadcast-v2`）作为核心验收门禁**：修复上述 4 个问题后，重新运行 `pnpm run repro:dev-broadcast-v2`，直到输出 `reproduced=0/4`（全部 `PASS_FIXED`）为止，并将其纳入后续 CI/人工发版前必跑回归。
+
+---
+
+## 四、状态解耦性评估：`Spectating` vs `Controlling` 抽象架构审视
+
+从本次复现的 4 个问题来看，代码库在传输层（`WebRTC` / `Tunnel` / `GlobalPayloadCodec`）耦合度较低，但在 **GameRuntime 业务层与 HUD 层**，`spectating`（观战/广播接收）与 `controlling`（本地或权威控制）尚未彻底解耦，主要表现为以下 4 处隐式耦合：
+
+1. **角色与模式混为一谈**：
+   - `FreeplayGoalAndTouchSubController` 用 `scenePort.authoritativeServer || scenePort.networkReconciler` 来判断是否由远程权威控制，导致“开房广播的 Host（Controlling）”被当成“远程客户端（Spectating）”而失去本地进球回放能力。
+   - **建议抽象**：将运行期角色显式收敛为两维正交状态：
+     - **Control Role（控制权）**：`local_authority`（Host 本地主导 / Coach 移交后的 Client 主导） vs `spectate_mirror`（Pure CSR 镜像跟随）。
+     - **Activity Mode（业务场景）**：`freeplay` / `replay` / `exhibition` / `static_training` / `match`。
+2. **Client UI 渲染条件耦合了“本地资源加载状态”**：
+   - `TelemetryStage` 与 `InGameHUD` 假设只有本地加载了 `.rcreplay` 或本地处于 `match` 模式才渲染积分牌和 1-6 号位名单条，违背了“Client 处于 `spectate_mirror` 时，UI 形态应完全由 Host 广播的 Activity 与 Metadata 驱动”的原则。
+3. **控制权动态移交（Coach Handover）与反向 Spectating 的权衡**：
+   - 将抽象收敛为 `spectating` 与 `controlling` 的排列组合，完全可以支撑 **Replay Watch Together**、**Static Training Pack Together**、**Coach 演示 -> 移交 Client 控制权 -> 收回控制权** 等任意模式组合；但工程上需注意两个权衡点：
+     - **Epoch 栅栏与状态快照对齐**：控制权从 Host 切到 Client（Host 变为反向 `spectating`）瞬间，必须通过 `authorityEpoch` 严格隔离旧帧，并在交接点做一次状态对齐（目前 `CoachAuthorityHandoverController` 已具备基础框架，但 HUD 提示与 Camera Authority 切换需与 `useSpectateWorkspaceStore` 统一单一数据源）。
+     - **模式逻辑归属权**：当 Host 将控制权交给 Client 进行 Static Training Pack 试打时，**“何时判定训练重置/射门结束”的逻辑归属权**仍在 Host 的模式控制器还是跟随 `controlling` 方？建议 **模式生命周期（Reset/Score/Phase）始终由 Room Host 统一裁决与广播**，Client 在获得 `controlling` 权时仅接管车辆物理输入与本地预测/权威帧上报，避免双端同时运行模式状态机产生脑裂。

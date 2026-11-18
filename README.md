@@ -1,86 +1,105 @@
-# `agyPreviewInstant` (`p2p-remote-controller`) 问题诊断、方案讨论与代码实现报告
+# RocketCompanion 多人联机测试审计、真实化改造与分步修复计划
 
-## 一、时间轴与错误日志联合诊断
-
-### 1. 时间轴操作还原
-从导出的 232 条 Timeline 事件与 Console 日志可以完整还原你的真实操作链路：
-
-1. `06:41:55.560Z` (`id: 58`)：打开受管窗口 `#21367`（`https://aistudio.google.com/`）。
-2. `06:42:31.973Z ~ 06:42:34.522Z` (`id: 73~77`)：页面重定向至 `https://aistudio.google.com/prompts/new_chat`，`AXLoadComplete` 触发，自动扫描出 31 个元素（`AXLoaded=true`）。
-3. `06:42:59.511Z` (`id: 78`)：点击 `AXButton "No thanks"`，重扫后主界面展开为 96 个元素。
-4. `06:43:10.654Z` (`id: 80`)：点击 `AXButton "Link API Key"`，弹窗出现（元素收敛为 4 个）。
-5. `06:43:25.235Z` (`id: 85`)：点击 `AXButton "Skip"`；`06:43:27.298Z` (`id: 93`)：点击 `AXButton "Select key"`，弹窗关闭，主界面恢复为 104 个元素。
-6. **故障窗口 `06:43:33 ~ 06:44:55`**：
-   - `06:43:33.633Z` 与 `06:43:36.486Z`：Safari 连续推送大量 `AXUIElementDestroyed`（`windowId: null`），说明 SPA 内部的 Toast / 遮罩层或动态容器刚被销毁，DOM 树结构发生了缩减。
-   - `06:44:00.722Z ~ 06:44:55.462Z`：你在前端连续点击了 9 次元素，全部在 `ax_perform_action` 报错 `Element path out of bounds at index 0`。
-7. **恢复与后续操作 `06:44:58 ~ 06:46:40`**：
-   - `06:44:58.854Z` (`id: 138`)：你手动点击 `Scan AXTree`（重新扫描出 101 个元素）。
-   - 随后 `06:45:31 ~ 06:46:40`：聚焦并点击 `Select Antigravity agent harness model` -> 选择 `Gemini 4 Hydrogen` -> 点击 `1 rule` -> `Add to allowlist` -> 对 `Domain` 输入框执行两次 `perform_set_value` -> 点击 `Save`，全部一次成功。
-
-### 2. 为什么会出现 `Element path out of bounds at index 0`？
-这是**自动化侧刷新/定位机制的遗漏**，而不是页面 AX 标签改名导致的问题：
-
-1. **纯下标路径脆弱性**：`AccessibilityEngine.swift` 使用从 `AXWebArea` 出发的整数下标数组 `path: [Int]`（如 `[3, 0, 21]`）定位元素。一旦 SPA 动态插入或销毁顶层容器（如弹窗、Toast、Banner），`AXWebArea` 的第 0 层子节点数就会变化，旧路径立刻失效。
-2. **`AXUIElementDestroyed` 未触发自动重扫**：此前 `App.tsx` 中 `isScanNotif` 只监听 `AXLoadComplete`、`AXTitleChanged`、`AXLiveRegionChanged`，没有包含 `AXUIElementDestroyed`（且该事件 `windowId` 为 `null`），导致 `06:43:36` 界面结构变化后 `scanResult` 未刷新。
-3. **失败未入 Timeline 且无过期自愈**：此前 `ax_perform_action` 抛错后没有写入 Timeline（导致时间轴上看不到这 9 次失败点击），也没有在遇到 `out of bounds` 时自动触发重扫。
-   - **安全原则**：后台检测到路径过期后，**不能直接用旧下标盲目重试**（因为重扫后同一坐标可能是别的按钮），正确做法是自动触发后台重扫刷新元素树（或后续升级为基于 `role + title/description/identifier` 的语义重定位）。
+- **目标仓库与分支**：`Antigravi-ty/RocketCompanion` (`z/agy/rc/multiplayer-recheck`)
+- **本次推送 Verified Commit**：[`5cec557dfc96e19eec083b308c6dd9ff47516a45`](https://github.com/Antigravi-ty/RocketCompanion/commit/5cec557dfc96e19eec083b308c6dd9ff47516a45) (`signature.isValid: true`, `state: VALID`)
+- **回放基准文件**：`rc-replay-3v3-1-0-2026-11-13T07-26-58.rcreplay`
 
 ---
 
-## 二、加载状态、`Refresh Current` 与手机端 Workflow 思路
+## 一、Commit 历史审计：假测试是如何产生的？
 
-1. **加载状态获取**：
-   - 整页导航时，`AXWebArea` 的 `AXLoaded` 与 `AXLoadComplete` 可靠；但 SPA 内部路由切换或异步请求期间，`AXLoaded` 往往保持 `true`。
-   - 后续可补充**双信号判断**：`AXLoaded` + **事件静默期（Debounce Stability）**，即收到 `AXLiveRegionChanged` / `AXUIElementDestroyed` 后标记为 `Settling...`，静默超过 300ms~500ms 再标记为 `Ready`。
-2. **`Refresh Current` / `Retry Current`**：
-   - 当前已有 `Open New` 和 `Focus Current`，建议在控制条增加 `Refresh Current`（通过 Apple Events `tell active tab to reload` 或对 Safari 发送 `Cmd+R`），用于在网络波动时直接刷新当前受管窗口，后续可联动代理/节点切换插件。
-3. **手机端远程控制 Workflow 建议**：
-   - PC 端（`p2p-remote-controller`）承担 **状态聚合 + 语义执行器** 的角色：维护受管窗口、AX 树、错误日志与页面网络状态。
-   - 手机端不直接传递脆弱的 `path: [Int]`，而是接收 PC 端提炼后的**高阶语义卡片**（按钮名、输入框、当前状态徽标、最近报错摘要），点击后由 PC 端执行、自动重扫并回传结果。
+通过检查 `scripts/` 目录下所有联机测试脚本的 Git 提交历史，结论是**“两者兼有”**：一部分测试**从最初创建就是绕过真实管线的 Mock 测试**，而更严重的是 **`runMultiplayerSyncIssuesRepro.ts` 在实现（implement）阶段被直接修改，手动注入了预期信号和载荷，使其从“未覆盖真实管线”进一步退化为“必定通过的假测试”**。
 
----
+### 1. `scripts/runMultiplayerSyncIssuesRepro.ts`（`repro:sync-issues`）—— 先天 Mock + 实现期人为改测试
+- **创建阶段（`836fe89`）**：从第一天起就只实例化了底层 `HostBroadcastPublisher`、`MatchSystemControlSubController`、`PredictionReconciler` 和纯函数 `resolveModeRosterEntries`，**完全没有运行** `FreeplayGoalAndTouchSubController`、`ExperimentalMultiBotsLifecyclePipeline`、`RuntimeKickoffSignalSubController`、`TelemetryStage` 或 React HUD。
+- **实现阶段被篡改（`4907669` & `aba3e1f`）**：
+  - 在 `4907669` 中，开发者修改了 `reproIssue1`，**手动把构造好的 `testControls` 直接传给 `publisher.publishIfReady({ acknowledgedControls: testControls })`**，绕过了真实控制采集链路。
+  - 在 `aba3e1f` 中，开发者进一步修改了 `reproIssue2`、`reproIssue3`、`reproIssue4`、`reproIssue5`：
+    - `reproIssue2` 直接手动调用 `systemControl.pushBroadcastSignal(MATCH_SIGNALS.KICKOFF_WILL_START, 200, 180, 3)` 和 `SCORE_UPDATED`，**自己发信号给自己收**，完全没经过 `ExperimentalMultiBotsLifecyclePipeline` 和 `RuntimeKickoffSignalSubController`。
+    - `reproIssue3` 直接手动调用 `systemControl.pushBroadcastSignal(MATCH_SIGNALS.FLIP_RESET_GAINED, ...)`。
+    - `reproIssue4` 直接手动把伪造的 `replaySync: { fileName, totalFrames, roster: [...] }` 塞进 `syncReplayWorkspaceToOnlineRoom`，并把 `clientUiNotEntered` 的判定条件放宽（去掉了 `clientMode !== 'replay-viewer'` 的检查）。
+    - `reproIssue5` 直接手动调用 `systemControl.pushBroadcastSignal(MATCH_SIGNALS.GOAL_REPLAY_WILL_START / GOAL_REPLAY_START)`，绕过了 `FreeplayGoalAndTouchSubController`。
+  - 结果：该脚本在 `9c7d27e` 基线上全部报 `0/5 issues reproduced (NOT_REPRODUCED)`，制造了“问题已修完”的假象。
 
-## 三、不注入脚本获取 Safari HTTP 非 200 Body 的技术方案对比
+### 2. `scripts/runDevSyncReproSuite.mjs`（`repro:dev-sync-bugs`）—— 真浏览器但浅层 Happy-Path 断言
+- 创建于 `98efe40`，在 `c50af67` 和 `8f459e4` 中扩展为 9 个场景（`c50af67` 的修改属于修复 `kb.keys.add` Set API 与增加 `waitFor`，并非刻意造假）。
+- **核心问题在于断言过浅**：
+  - **Scenario 1 (Freeplay)**：仅检查直线行驶距离 `< 250`（且 `kb.keys['KeyW'] = true` 对 `Set` 无效），未测 Freeplay 射门进球触发 Goal Replay。
+  - **Scenario 2 (Exhibition 3v3)**：仅检查 `numCars === 6`，未检查 Client 是否完整经历 `3 -> 2 -> 1` 倒计时。
+  - **Scenario 3 (3v3 Replay)**：仅检查帧游标与 Pause ACK，未检查 Client DOM 上方的积分牌（`StepperScoreboardHUD`）与左右 1-6 名单条（`roster-card-*`）。
+  - **Scenario 9 (Camera Sync)**：仅检查 `ballCam` 布尔切换，未检查 `focusedCarIndex`（1-6 号位切人）在 Client 端是否同步并持久保持。
 
-### 1. 本地 HTTPS 代理 vs 传统外部 MITM，为什么不触发 Certificate Pinning？
-- **本质差异**：本地 HTTPS 代理在协议层依然是 TLS 代理（浏览器 <-> 本地代理 <-> 目标服务器），但**信任机制完全不同**：
-  - 外部 MITM 使用未知 CA，会被操作系统与浏览器拦截。
-  - 在 macOS 上将本地代理自签 Root CA 放入 **System Keychain（系统钥匙串）并设为“始终信任”** 后，Safari/WebKit（`com.apple.WebKit.Networking`）会将其视为合法受信任根证书。
-- **为什么不会触发 Certificate Pinning**：
-  - 现代浏览器（包括 Safari）已废弃 HTTP Public Key Pinning (HPKP)；而浏览器内置的预置 Pinning 列表（如对部分自家域名的保护）在行业惯例上**会对用户手动安装到系统信任库的本地 Root CA 豁免**（否则企业代理和开发者调试工具全部无法工作）。这与独立原生 App 在代码里硬编码公钥的做法不同。
-- **需要注意的坑**：
-  - **HTTP/3 (QUIC)** 走 UDP 443，会绕过传统 TCP HTTP/HTTPS 代理，需要在 Safari 关闭 QUIC 使其回退到 HTTP/2 over TCP，或者使用 `NETransparentProxyProvider`。
-  - **SSE 流式响应**：代理必须支持分块流式透传（不能等整个响应结束才转发），只在状态码 `>= 400` 时缓存并提取错误 JSON Body。
-
-### 2. 为什么 Safari Web Inspector / `safaridriver` 拿不到 HTTP Body？
-- **`safaridriver`**：严格遵循 W3C WebDriver 规范，定位是 DOM 查询与输入自动化，标准协议中**没有**像 Chrome DevTools Protocol (`Network.getResponseBody`) 那样暴露底层网络响应体读取接口。
-- **`webinspectord`**：这是 Apple 为自家 Safari 开发者工具提供的私有守护进程，协议未公开稳定文档且受系统签名/沙盒边界约束，第三方应用无法可靠挂载并抓取 Response Body。
-
-### 3. JavaScript Hook（`fetch` / `XHR`）的技术原理与监听范围
-- **技术原理**：在页面主世界（Main World）中对 `window.fetch` 和 `XMLHttpRequest.prototype.open / send` 做只读包装（Monkey Patch）。当 `fetch` 返回 `!response.ok`（或 `XHR` 的 `status >= 400`）时，通过 `response.clone().text()`（注意必须 `clone()`，否则会提前消耗掉业务代码的响应流）旁路读取 Body，连同 URL、Status、Method 通过本地 WebSocket 或 `console.error` 回传给控制端。
-- **是否为全局监听**：
-  - 它是**当前注入页面（Tab/Frame）内的全局监听**——页面内任何 JS 模块发起的 `fetch` / `XHR` 都会经过它；
-  - 但**不是跨 Tab / 跨站点的系统级全局监听**，需要每个受管页面在加载后注入（或者用轻量 Safari Web Extension 的 `content_scripts` 在 `document_start` + `world: "MAIN"` 自动注入，避免每次手动触发）。
-- **局限**：无法捕获图片/字体等非 JS 请求，也无法读取 CORS `opaque` 响应；对于正常 200 的 SSE 流应直接跳过 `clone()` 以免增加内存开销。
+### 3. `scripts/runDevRoomSyncE2E.mjs`（`test:dev-room-sync-e2e`）—— Stage 6 仍为手动状态注入
+- Stage 6（Replay Watch Together）中直接通过 `authoritativeServer.enterStateOnlyMode(snap, 420)` 与 `onBroadcastGlobalWorkspace({ playbackPaused: true, ... })` 手动注入状态帧，未加载真实 `.rcreplay` 文件，也未检查 Client DOM 积分牌与 1-6 名单条，导致在功能实际残缺的情况下依然全绿通过。
 
 ---
 
-## 四、本次已落地的代码修复与验证
+## 二、本次测试机制改造与真实运行结果
 
-仓库：`https://github.com/Antigravi-ty/agyPreviewInstant`（分支 `a2`，Verified Bot Commit `fa2e84c2a52e2a2df8413d37d0649cc45741bfa5`）
+已在提交 [`5cec557`](https://github.com/Antigravi-ty/RocketCompanion/commit/5cec557dfc96e19eec083b308c6dd9ff47516a45) 中完成以下改造并验证：
 
-1. **`set_value` 支持多行换行**：
-   - 将 `apps/p2p-remote-controller/src/App.tsx` 中 `AXTextField` / `AXTextArea` 的 `<input type="text">` 替换为 `<textarea rows={2}>`，并在 `apps/p2p-remote-controller/src/styles/app.css` 补充 `textarea` / `select` 样式，解决单行 input 自动吞掉 `\n` 的问题。
-2. **关闭 Regex 搜索自动纠错**：
-   - 为过滤输入框（以及 `set_value` 输入框）添加 `autoCorrect="off" autoCapitalize="off" autoComplete="off" spellCheck={false}`，防止 macOS WKWebView 篡改正则表达式字符。
-3. **分级日志导出与复制（`Compact` / `Standard` / `Full`）**：
-   - 新增 `apps/p2p-remote-controller/src/utils/logExport.ts` 与单元测试 `apps/p2p-remote-controller/src/utils/logExport.test.ts`。
-   - 支持在顶部 `Quick Copy` 与 `Timeline` 导出中切换 `Compact`（仅错误 + 关键操作 + 扫描摘要，不含冗长元素列表）、`Standard`（折叠连续重复 `AXUIElementDestroyed` 噪音 + 摘要）、`Full`（全量原始数据）。
-4. **防过期与错误可观测性增强**：
-   - 将 `AXUIElementDestroyed` 纳入 `autoRescan` 触发条件；
-   - `handlePerformAction` 失败时写入 `perform_<action>_failed` 到 Timeline；遇到 `out of bounds` 且开启 `Auto-Rescan` 时自动后台刷新 AX 树并提示重试。
-5. **工具链与验证**：
-   - 已在沙盒安装 `pnpm`（`12.21.0`）并完成依赖安装；
-   - `pnpm p2p:check`（`tsc --noEmit` + `eslint src`）：通过；
-   - `pnpm --filter p2p-remote-controller test`（`vitest run`）：4/4 测试全部通过；
-   - `pnpm p2p:build`（`tsc && vite build`）：构建成功。
+1. **重写 `scripts/runMultiplayerSyncIssuesRepro.ts`（并新增 `scripts/runTsWithVite.mjs` 以支持 Vite SSR 模块解析）**：
+   - **移除所有手动 `pushBroadcastSignal` / `replaySync` / `acknowledgedControls` 假注入**，改为直接驱动真实业务管线：
+     - `issue-1`：通过 `collectHostBroadcastControls` -> `HostBroadcastPublisher` -> `PredictionReconciler` -> `mapRemoteControlsToOverlayKeys`。
+     - `issue-2`：在 `tick >= 400` 房间运行态下，直接运行 `startExpKickoffCountdownState` + `stepExpCountdownPhaseState` -> `MatchSystemControlSubController` -> `PredictionReconciler` -> `RuntimeKickoffSignalSubController.handleSignal`。
+     - `issue-3`：通过 `broadcastHostFlipResetSignalsIfNeeded` 验证信号链。
+     - `issue-4`：直接实例化 `TelemetryStage` 并调用 `_syncEdgeRosterHud()`（模拟 Client `matchMode='freeplay'` 且 `activeRoomActivity='replay'`）。
+     - `issue-5`：直接实例化 `FreeplayGoalAndTouchSubController` 并调用 `stepAfterPhysicsTick()`（模拟 Dev Sync Broadcasting Host 存在 `authoritativeServer` 且球过球门线 `posY=5600`）。
+   - **实测结果（`pnpm run repro:sync-issues`）**：从 `0/5` 变为 **`3/5 issues reproduced`**，精准命中：
+     - `[REPRODUCED] issue-2`：Client 倒计时观测到 `[]`，缺失 `[3, 2, 1]`。
+     - `[REPRODUCED] issue-4`：`TelemetryStage._syncEdgeRosterHud()` 提前 return，输出 `roster entries=0`。
+     - `[REPRODUCED] issue-5`：`FreeplayGoalAndTouchSubController` 提前 return 并调用 `pollGoal()` 吞掉进球，`goalResetTicks=0`。
+
+2. **强化 `scripts/runDevSyncReproSuite.mjs`（真实 Headless Chrome + WebGL + WASM）**：
+   - 修复 Scenario 1 中 `kb.keys.add/delete`；
+   - Scenario 2 增加 Client `match.state` 轮询，强制要求观测到 `[3, 2, 1]`；
+   - Scenario 3 增加 Client DOM 检查，强制要求 `domScoreboard === true` 且 `domRosterCards >= 6`；
+   - Scenario 9 增加 Host 切换 `focusedCarIndex = 2` 后等待 600ms 校验 Client `camera.focusedCarIndex === 2`。
+   - **实测结果（`RC_REPLAY_PATH=/tmp/rc-replay-3v3-1-0-2026-11-13T07-26-58.rcreplay pnpm run repro:dev-sync-bugs`）**：从 `8/9` 变为 **`passed=6/9, reproducedBugs=3`**，直接暴露 Scenario 2（`clientCountdownNums: [3]`）、Scenario 3（`domScoreboard: false, domRosterCards: 0`）、Scenario 9（`c2FocusedAfterSwitch: 0`）。
+
+3. **额外暴露的新问题（审计期间观察到）**：
+   - **Host 端 3v3 回放 Roster DOM 卡片数量异常**：在 `repro:dev-broadcast-v2` 中，3v3（6 车）回放时 Host 侧 `domRosterCards` 达到 **10**（`cardNames` 中混杂了 `1PlayerYOU33x`、`2Nexto #2...`、`4Player 4...` 与 `4Nexto #4...` 等重复/残留卡片），需要在修复 `TelemetryStage` 与 `EdgeRoster` 渲染时一并排查去重/清理逻辑。
+   - **Countdown 音效 Hook 盲区**：`repro:dev-broadcast-v2` 中 `hostCountdownAudioCount` 和 `clientCountdownAudioCount` 均为 `0`，因 Headless 环境下挂载在 `rt.audioSubsystem` 上的音频触发路径与测试 spy 挂载点不一致，后续修复 Issue 4 时应同步核对 `GameAudioSubsystem` / `SignalAudioEngine` 的真实触发。
+
+---
+
+## 三、分步修复计划与团队分工安排
+
+建议按 **“架构解耦 -> 核心 Bug 修复 -> 门禁全绿回归”** 分 3 个阶段推进，预计可由 **2 名工程师（或按 Runtime/网络 与 UI/HUD 双线并行）** 完成：
+
+### 阶段 1（P0）：控制权与观战状态解耦 + 倒计时协议对齐（Owner A：Runtime / Network）
+1. **显式区分 `Broadcasting Host` 与 `Remote Spectating Client`（修复问题 1 / issue-5）**
+   - **文件**：`src/game/modes/freeplay/FreeplayGoalAndTouchSubController.ts`、`src/game/modes/freeplay/FreeplayMode.ts`、`src/game/pipeline/stages/SimulationStage.ts`
+   - **动作**：
+     - 将提前 return 守卫从 `scenePort.authoritativeServer || scenePort.networkReconciler` 改为 `Boolean(scenePort.networkReconciler) && !isDevSyncHostBroadcastingMode(Boolean(scenePort.authoritativeServer))`。
+     - 确认 `SimulationStage.ts` 中 `physics.pollGoal()` 不会在 `FreeplayMode.stepAfterPhysicsTick()` 之前消费掉 goal latch。
+     - 在 `beginGoalReplay` / `completeReplaySession` 时，若处于 `isDevSyncHostBroadcastingMode`，通过 `authoritativeServer.pushBroadcastSignal` 广播 `GOAL_REPLAY_WILL_START`、`GOAL_REPLAY_START`、`GOAL_REPLAY_END` 给 Pure CSR Client；同步修复 `FreeplayMode.skipGoalReplay()`。
+2. **统一 `KICKOFF_WILL_START` 信号契约（修复问题 4 / issue-2）**
+   - **文件**：`src/game/modes/experimental-multi-bots/experimentalMultiBotsLifecyclePipeline.ts`、`src/game/runtime/RuntimeKickoffSignalSubController.ts`
+   - **动作**：
+     - 发送端在进入 kickoff 时计算绝对目标 tick `targetTick = currentTick + KICKOFF_COUNTDOWN_TICKS`，以 `(targetTick, isOvertime ? 1 : 0)` 发送 `KICKOFF_WILL_START`（或明确协议区分绝对 `targetFrame` 与显式秒数），消除 `effectiveTick >= 240/360` 时 2 和 1 被吞掉的问题。
+     - 确保 Client 端 `latchedKickoffSeconds` 稳定触发 `3 -> 2 -> 1` 与 `audio.play('match_countdown_321', 1.0)`。
+
+### 阶段 2（P0）：Replay Watch Together UI/积分牌同步 & 摄像机切人同步（Owner B：HUD / Camera / Workspace）
+3. **打通 Client Replay 积分牌与 1-6 名单条（修复问题 2 / issue-4）**
+   - **文件**：`src/game/pipeline/stages/TelemetryStage.ts`、`src/ui-core/hud/InGameHUD.tsx`、`src/ui-core/hud/GoalReplayHudOverlay.tsx`、`src/network/protocol/GlobalWorkspaceProtocol.ts`、`src/replay/replayOnlineSyncHelper.ts`、`src/game/runtime/devSyncChannelHandlers.ts`
+   - **动作**：
+     - 将 `isClientSyncedReplay`（`onlineSession?.activeRoomActivity === 'replay' && rvStoreState?.viewerState !== 'idle'`）提前到 `TelemetryStage._syncEdgeRosterHud()` 第 169 行的入口守卫条件中，避免死代码。
+     - 在 `InGameHUD.tsx` / `GoalReplayHudOverlay.tsx` 中，当处于 `isDevSyncRoom && activeRoomActivity === 'replay'` 时允许显示 `showTopScoreboard` 与 `showEdgeRosterStrips`，不再强依赖本地 `totalFrames > 0`。
+     - 扩展 `WorkspaceReplaySyncPayload` 增加 `blueScore`、`orangeScore`、`remainingSeconds`、`isOvertime`，并在 `devSyncChannelHandlers.ts` 中同步写入 `hudStore`。
+     - **顺带排查**：检查 3v3 回放时 Host 出现 `domRosterCards: 10` 的重复卡片问题，确保双端严格只渲染当前模式的 6 张卡片。
+4. **修复 1-6 号位观战目标同步与初始对齐（修复问题 3）**
+   - **文件**：`src/game/runtime/devSyncChannelHandlers.ts`、`src/game/subsystems/GameCameraSubsystem.ts`、`src/game/modes/freeplay/StandaloneReplayViewer.ts`
+   - **动作**：
+     - 在 `channel.onCameraStateSync` 中，当 `shouldApplyIncomingCameraSync` 为真时，除调用 `applyCameraSyncToPort(camera, camSync)` 外，必须同步更新 `useSpectateWorkspaceStore` 的 `hostCameraSync`（以及 `useReplayViewerStore.activePovCarIndex`），防止下一帧 `GameCameraSubsystem.update()` 被旧 store 状态覆盖回 `0`。
+     - 严格遵守边沿触发语义（`cameraSyncSeq` 递增时才覆写 Client），保证 Host 切人时 Client 立即跟随，Host 未切换时 Client 本地自由视角不被周期拉回。
+     - 初始进入房间或切换至 Replay 时，Host 主动广播一次含当前 `focusedCarIndex` 的 `cameraSync`。
+
+### 阶段 3（P1）：最终验收门禁（Owner A + Owner B 联调）
+所有修复完成后，必须依次运行以下全部命令并达到指定通过标准，方可合入：
+1. `pnpm run check`（`radar` + `tsc --noEmit` 零错误）
+2. `pnpm run test:multiplayer-suite`（24/24 PASS）
+3. `pnpm run repro:sync-issues`（从 `3/5 reproduced` 降为 **`0/5 reproduced`**）
+4. `RC_REPLAY_PATH=/tmp/rc-replay-3v3-1-0-2026-11-13T07-26-58.rcreplay pnpm run repro:dev-sync-bugs`（从 `6/9` 变为 **`9/9 PASS, reproducedBugs=0`**）
+5. `RC_REPLAY_PATH=/tmp/rc-replay-3v3-1-0-2026-11-13T07-26-58.rcreplay pnpm run repro:dev-broadcast-v2`（从 `4/4 reproduced` 降为 **`reproduced=0/4`**）
+6. `pnpm run test:dev-room-sync-e2e`（`ALL E2E CHECKS PASSED`，且后续建议将 Stage 6 也升级为真实 `.rcreplay` 加载 + DOM 校验）

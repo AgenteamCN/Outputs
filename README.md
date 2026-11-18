@@ -1,35 +1,39 @@
-# 状态确认、`.githooks` 权限修复与并发等待机制说明
+# EMQX P2P Remote Controller 端到端联调与 Antigravity 任务下发报告
 
-## 1. 当前注入与控制台状态确认
-- **注入与网络录制已完全正常**：`Injection Verified`、`recording=true`，且已成功捕获 Google AI Studio 的 `UpdatePrompt` XHR 请求与响应；输出中也未包含敏感私钥/Token。
-- **控制台两处小提示均无害**：
-  - `CoreText note: Client requested name ".SFNSMono-Light"...`：macOS WebKit/AppKit 系统字体回退提示，不影响功能。
-  - `ax_bridge.rs` `warning: field id is never read`：Rust 结构体反序列化字段未使用警告，不影响运行。
-- **下一步**：可以直接点击 **Connect EMQX**（当前状态是 `EMQX: Off`），即可通过 EMQX Bridge 实时联调指令与审批流。
+## 1. 通信链路与 Worker 验证
+- **Cloudflare Worker 代理 (`agentplayground.maboco-mark.workers.dev`)**：
+  - 已验证 `/mqtt/rpc` 接口可直接通过 `cloudflare:sockets` 连接 `e9c769c2.ala.cn-hangzhou.emqxsl.cn:8883`（绕过沙箱非标准端口限制）。
+  - 注意：Python `urllib` 默认 User-Agent 会触发 Cloudflare 403，需携带标准 UA（如 `curl/8.5.0`）。
+- **EMQX 主题与决策机制**：
+  - 成功与本地客户端（`p2p_mac_*`，主题前缀 `agy_p2p_v1`）建立双向通信。
+  - 验证了所有审批动作：`approve`、`reply_and_approve`、`reply_only`、`deny_with_reason`，云端均可完整收到 `reply` 文本、`result`、`error` 及 `recentUserActions` 增量时间线。
 
----
+## 2. 端到端 Safari AX 自动化流程打通
+在目标 Safari 窗口 `#24640` 上，使用纯原生 macOS Accessibility (`scan_window` + `perform_action`) 完整跑通了以下流程：
+1. **快捷入口与模式定位**：
+   - 可直接使用 `https://aistudio.google.com/prompts/new_chat?model=antigravity-preview-09-2026` 跳过模式切换。
+   - 确认 Antigravity Agent Preview 完整代号为 `antigravity-preview-09-2026`。
+2. **API Key 绑定**：
+   - 识别 `Link API Key` 弹窗，依次执行 `press("Link API Key")` -> `press("Skip")`（跳过计费）-> `press("Select key")`。
+3. **模型与 Network Allowlist 配置**：
+   - 切换 Harness Model 为 `Gemini 4 Hydrogen` (`gemini-4-hydrogen`)。
+   - 打开 `Network Configuration`，展开并删除旧规则（`Gemini API (default)`），`Add to allowlist` -> `focus` 输入框 -> `set_value("*")` -> `press("Save")`，成功保存 `*` 放行全部域名。
+4. **任务下发与启动**：
+   - 对 `Enter a prompt` 执行 `focus` -> `set_value` 填入完整任务指令（包含 `AGY Preview Instant Graphics and Media` ~20% CPU / ~10% GPU / Energy Impact ~220-240 与 `127.0.0.1:1420` ~100 Energy Impact 排查要求、GitHub App Token 获取方式、备份网关 POST 指令）。
+   - `scan_window` 二次确认文本写入后，点击 `Run` 按钮 `[3,0,15,18]`，成功启动 Antigravity Agent Preview 会话：
+     `https://aistudio.google.com/prompts/1Ni93jQeU8DgkL1yJ0gXw3jpSMUB4Gvie`。
 
-## 2. `.githooks/*` “无行差异却提示修改”的根因与修复
+## 3. 代码修复与 Verified Bot Commit
+已在分支 `a2` 提交并推送签名验证提交 [`67abc87`](https://github.com/Antigravi-ty/agyPreviewInstant/commit/67abc87f30b7ca58afc83781b5479cb0d41c1cb9)（`verified: true`，`Co-authored-by: Mark`）：
+- `apps/p2p-remote-controller/src/App.tsx`：
+  - 补全解析 `RemoteCommandRequest` 时遗漏的 `script: parsed.script` 字段，修复远程 `execute_javascript` 无法传参的问题。
+  - 修复 `reply_and_approve` 时 `Bridge Chat` 只显示用户回复而隐藏执行结果/Error 的问题，现同时展示回复与 `[command (decision) ok/Error]`。
+- `apps/p2p-remote-controller/src/components/EmqxBridgePanel.tsx`：
+  - 在 Pending Approvals 元信息中展示截断后的 `script` 预览。
 
-### 根因
-对比 `b65f0868fdc006b9aad9214fdbd0f417be831c8d`（分支 `what-the-hell-commit`）确认：
-```diff
-old mode 100644
-new mode 100755
-```
-**文件内容一行未改，只是文件权限位变了**：
-- `origin/a2` 树里 `.githooks/post-checkout`、`post-merge`、`post-rewrite` 存的是 `100644`。
-- `scripts/git/ensureGitHooks.ts` 每次启动都会执行 `fs.chmodSync(hookPath, 0o755)` 赋予可执行权限，导致 Git 认为这 3 个文件变成了 `100755` 脏状态，但行级 diff 为空。
-
-### 已处理
-- **已修复主分支 `a2`**：通过 GitHub REST `git/trees` 将 `.githooks/post-checkout`、`post-merge`、`post-rewrite` 的 mode 正式更新为 `100755`（Verified Bot Commit `b2af7d6df41c63586442033e951de77d415fa73d`）。
-- **已删除临时分支**：`origin/what-the-hell-commit` 已删除（HTTP 204）。后续只需继续在 `a2` 分支拉取即可，不会再反复变脏。
-
----
-
-## 3. 云端 Agent 调用 Worker 等待机制：阻塞 vs 并行
-
-- **单次工具调用内部是同步等待 HTTP 响应**：当 Agent 调用 `execute_bash` 去请求 `POST https://agentplayground.maboco-mark.workers.dev/mqtt/rpc`（例如 `waitMs: 25000`）时，那一次工具调用会像等待一个慢 HTTP 接口一样挂起等待，直到收到你的 EMQX 回复或达到 `waitMs` 超时返回。
-- **为什么不会“彻底卡死”且支持并行**：
-  1. **同轮并发工具调用（Parallel Tool Calls）**：Agent 可以在同一轮同时发出多个独立工具调用——例如**一边用 `execute_bash` 调 Worker 等待你的 EMQX 消息，一边并行读/改仓库文件或跑 lint**；但需要注意，如果后续步骤强依赖你在 EMQX 里的回复结果（比如等你确认某步操作），就必须等那次 `waitMs` 返回后才能决定下一步。
-  2. **分段短轮询（Bounded Polling）**：每次 bash 命令上限 300 秒、Worker `waitMs` 上限 55 秒。实际上每次设 `waitMs = 20~30s` 即可：收到消息就提前返回，超时则由 EMQX 持久会话（`cleanSession: false` + `QoS 1`）继续替我们缓存未读消息，下一轮再取，不会漏消息也不会一直占着 Worker CPU。
+## 4. 联调中发现的待优化问题（供后续迭代）
+1. **Network Injection 状态同步 Bug**：当页面发生 SPA 跳转（如从 `new_chat` 跳转到 `/prompts/<id>`）或刷新时，页面内注入的录制器会丢失（`installed=false`），但前端 `netVerifyStatus` 未及时重置为未验证状态。
+2. **AX `set_value` 前置条件与动态节点偏移**：
+   - `AccessibilityEngine.swift` 中设值 action 名为 `"set_value"`（非 `"AXSetValue"`），点击为 `"press"`。
+   - WebView 输入框需先 `focus` 再 `set_value`；且地址栏、轮播图等动态 DOM 会导致 `nodePath` 偏移，建议后续支持基于 `role + title/value` 正则匹配的稳定定位或操作前自动校验。
+3. **`get_status` 窗口过滤**：目前返回系统全部 Safari 窗口，后续可支持按目标 PID 或窗口列表过滤。

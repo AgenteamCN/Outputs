@@ -1,17 +1,28 @@
-### 问题原因
+# P2P Remote Controller & EMQX Chat Diagnosis + Fixes
 
-1. **清空默认选项未同步到后端持久化**：在 `src/stores/presetStore.ts` 中，`writeOptionalId`（用于 `agy_default_sys_inst_preset_id_v1` 等默认项）和 `writeStringValue` 在值为空或 `null` 时调用了 `localStorage.removeItem(key)`。而 `src/utils/lanPairingUrl.ts` 中的 `collectLocalPresetsSnapshot` 只收集 `typeof localStorage.getItem(key) === "string"` 的键，导致清空默认 System Instruction 后该键从同步快照中缺席，`src-tauri/src/storage/lan_store.rs` 中的 `save_synced_lan_presets` 仍保留旧值并在下次打开页面或重启应用时恢复旧默认值。
-2. **桌面端启动时未优先应用后端同步的持久化配置**：在 `src/stores/lanStore.ts` 的 `initLanSession` 桌面端分支中，启动时调用的是 `hydrateMissingPresetsInLocalStorage(backendPresets)`，只填充 `localStorage` 中缺失或为空的键。当通过终端 `Ctrl+C` 终止或窗口关闭前 WebView 尚未将 `localStorage` 刷盘时，已同步写入 `lan_config.json` 的新默认值会被 `localStorage` 中的旧值忽略，随后又被 `saveSyncedPresetsToBackend(collectLocalPresetsSnapshot())` 用旧值覆盖回后端。
+## 1. Root Cause Analysis
 
-### 修复内容
+### (1) Why `chat` does not automatically listen for replies (and multi-agent collision)
+- **`agentplayground.maboco-mark.workers.dev` (`emqx_worker.mjs`)** is a **stateless, short-lived HTTP-to-MQTT RPC bridge** (`waitMs` capped at `55000ms`). Each `/mqtt/rpc` call opens a TLS socket to EMQX (`8883`), optionally subscribes/publishes, waits up to `waitMs`, and then sends `DISCONNECT` (`0xe0 0x00`) and closes the socket.
+- Because AI agents are turn-based, an agent **only receives messages while actively executing an `/mqtt/rpc` poll** (such as when it sends an `ask_user` command to `agy_p2p_v1/cmd/<target>` and blocks on `agy_p2p_v1/resp/<requestId>` + `agy_p2p_v1/chat`). Pure `chat` messages sent when no agent is polling are only preserved if the agent previously subscribed with the **same `clientId`** and `cleanSession: false` (persistent MQTT session).
+- **Multi-agent visibility & conflict**: Both agents and the desktop client share `agy_p2p_v1/chat` and `agy_p2p_v1/cmd/#`. If two agents use the same `clientId` (e.g., the default `agy_cloud_agent_v1`), EMQX performs a session takeover and whichever agent polls next consumes the queued messages. Using distinct `clientId`s (e.g. `agy_agent_b_session`) and targeted `cmd/<agent>` + `resp/<requestId>` topics isolates approval responses cleanly.
 
-- **`src/stores/presetStore.ts`**：修改 `writeOptionalId` 与 `writeStringValue`，在清空或置为 `null` 时写入空字符串 `""` 而非 `removeItem`，使 `readOptionalId` 仍返回 `null`，同时确保 `collectLocalPresetsSnapshot` 能将清空状态同步至后端 `lan_config.json` 与 LAN 客户端。
-- **`src/stores/lanStore.ts`**：桌面端 `initLanSession` 启动同步改用 `applySyncedPresetsToLocalStorage(backendPresets)`（与 Web 端一致），确保 `lan_config.json` 中同步落盘的最新默认配置覆盖未刷盘或陈旧的 `localStorage`，并移除未使用的 `hydrateMissingPresetsInLocalStorage` 导入。
-- **`src/utils/lanPairingUrl.ts`**：将 `agy_agent_name_presets_v1`、`agy_default_agent_name_preset_id_v1`、`agy_custom_default_agent_name_v1` 补全到 `SYNCED_PRESET_STORAGE_KEYS`，保证所有预设默认项同步一致。
-- **`src/test/presetPersistence.test.ts`**：新增单元测试，覆盖默认 System Instruction 的设置、清空为 `null` 时快照包含 `""`、以及后端持久化值覆盖陈旧 `localStorage` 的场景。
+### (2) Why mobile messages were sent twice (`~1ms` apart, e.g. `3.3 KB` then `147 B`)
+- In `apps/p2p-remote-controller/src/App.tsx`, the `useEffect` registering `listen<PocketDeckRemoteAction>("lan:remote-action", ...)` stored `unlisten` asynchronously inside `.then((fn) => { unlisten = fn; })`.
+- Under React `<StrictMode>` in development, `useEffect` mounts, unmounts before `listen()` resolves (while `unlisten` is still `null`), and remounts—leaving **two active `lan:remote-action` listeners**. Every mobile `POST /api/action` triggered `handleSendEmqxChat` twice: the first call consumed `recentUserActions` (`3.3 KB`) and updated `lastSyncedTimelineIdRef`, and the second call 1ms later sent an empty diff (`147 B`).
 
-### 验证与提交
+### (3) Why `Shift+Return` sent instead of inserting a newline
+- Both `PocketDeckView.tsx` and `EmqxBridgePanel.tsx` used a single-line `<input type="text">` and checked `if (e.key === "Enter")` without `!e.shiftKey` or `!e.nativeEvent.isComposing`.
 
-- **工具链**：安装全局 `pnpm`（`12.21.0`）并执行 `pnpm install --frozen-lockfile`。
-- **检查与测试**：执行 `pnpm check`（`tsc --noEmit && pnpm lint && pnpm test`）全部通过（0 errors，2 个测试文件共 16 项测试通过），`pnpm build` 构建通过。
-- **远程提交**：通过 GitHub GraphQL `createCommitOnBranch` 提交并签名推送至 `a2` 分支（`fb9df3f56a752098de781de6f2f5f2c5ba5050a1`，`verified: true`），本地已 `git fetch && git reset --hard origin/a2`。
+## 2. Implemented Fixes (Verified Bot Commits on `a2`)
+
+1. **`9020931`** — `fix(p2p-remote-controller): prevent mobile double-send and support Shift+Enter newlines`
+   - `apps/p2p-remote-controller/src/App.tsx`: Added a `disposed` guard to the `lan:remote-action` `useEffect` so any `listen()` resolving after unmount immediately calls `fn()`.
+   - `apps/p2p-remote-controller/src/components/PocketDeckView.tsx` & `EmqxBridgePanel.tsx`: Replaced `<input type="text">` with `<textarea rows={1}>` and gated Enter-to-send on `e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing` with `e.preventDefault()`.
+2. **`32cadcc`** — `fix(p2p-remote-controller): move Bridge Chat input above newest-first activity list`
+   - `apps/p2p-remote-controller/src/components/EmqxBridgePanel.tsx`: Moved the `Send message to cloud agent...` textarea + Send button directly beneath the `Bridge Chat / Activity` header, right above the newest-first message list.
+
+## 3. Toolchain & Verification
+- Installed `pnpm` (`12.21.0`) and workspace dependencies (`pnpm install`).
+- Ran `pnpm --filter p2p-remote-controller test` (`2 test files, 8 tests passed`), `pnpm --filter p2p-remote-controller build` (`tsc && vite build` succeeded), and `eslint` on modified files (`PocketDeckView.tsx`, `EmqxBridgePanel.tsx` — 0 errors).
+- Verified live bidirectional communication with the user over `agentplayground.maboco-mark.workers.dev/mqtt/rpc` (`ask_user` -> `reply_only` received on `agy_p2p_v1/resp/req_agent_b_hello_1`).

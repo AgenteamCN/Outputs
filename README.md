@@ -1,37 +1,51 @@
-# Wave 0 Arch-0D 完成报告（快照离散字段与连续插值语义隔离）
+# Wave 0 Arch-0A 完成报告：模拟管线显式状态机
 
-- **仓库**：`Antigravi-ty/RocketCompanion`
+## 1. 分支与提交信息
 - **基线分支**：`origin/z/agy/rc/multiplayer-recheck` (`d69e01c`)
-- **新分支**：`z/agy/rc/wave0-arch-0d`
-- **Verified Bot Commit**：[`ed7d5df4a8fd9fd39bfa0b03458f0e49feec7932`](https://github.com/Antigravi-ty/RocketCompanion/commit/ed7d5df4a8fd9fd39bfa0b03458f0e49feec7932)（`signature.isValid: true`）
+- **新建分支**：`z/agy/rc/wave0-arch-0a`
+- **Bot 签名提交**：`3deaedf7fed88e62293ec0f7497cacca089cd02b`（GitHub GraphQL `createCommitOnBranch`，`signature.state = VALID`）
+- **Commit URL**：https://github.com/Antigravi-ty/RocketCompanion/commit/3deaedf7fed88e62293ec0f7497cacca089cd02b
 
-## 1. 变更内容
+---
 
-1. **显式声明 BoostPad 离散/连续字段偏移表与隔离插值管线**
-   - 新增 [boostPadSnapshotInterpolationPipeline.ts](file:///workspace/RocketCompanion/src/replay/boostPadSnapshotInterpolationPipeline.ts)：
-     - 显式声明 `BOOST_PAD_DISCRETE_FIELD_OFFSETS`（`isActive` 为 `'discrete-step'`，`cooldown` 为 `'monotone-cooldown'`，跨帧向上跳变阈值 `cooldownJumpThresholdSec = 0.05`）。
-     - 实现 `interpolateBoostPadSnapshots(prevSnap, currSnap, out, t)`：
-       - `isActive` 严格使用最近邻/阶跃取值（`t >= 0.5 ? currActive : prevActive`），绝不线性插值，并保持输出为 `0` 或 `1`。
-       - 当 `outActive === 1` 时强制 `cooldown = 0`。
-       - 当 `prevActive === 0 && currActive === 0` 且处于单调倒计时（`currCd <= prevCd + 0.05`）时对 `cooldown` 线性插值；若发生跨帧向上跳变（如重生后立即被拾取或状态重置），则禁止跨跳变插值，改用阶跃取值。
-   - 更新 [ReplayFrameInterpolator.ts](file:///workspace/RocketCompanion/src/replay/ReplayFrameInterpolator.ts)：
-     - 在 `interpolateReplaySnapshots()` 末尾调用 `interpolateBoostPadSnapshots(prevSnap, currSnap, out, t)`，消除 BoostPad 状态随 `currSnap` 无条件拷贝/跳变的问题（同时满足 Radar 18.0 KB 体积硬上限）。
+## 2. 核心改动（Arch-0A）
 
-2. **明确 `SpectateInterpolationBuffer.sample()` 输出契约**
-   - 更新 [ReplicationStateInterpolator.ts](file:///workspace/RocketCompanion/src/network/sync/ReplicationStateInterpolator.ts)：
-     - 显式声明 `SPECTATE_BOOST_PAD_DISCRETE_OFFSETS`。
-     - 在 `SpectateInterpolationSample` 新增 `frameCursor: number` 与 `isDuplicateFrame: boolean` 字段；在 `SpectateInterpolationStats` 新增 `duplicateSamples: number`。
-     - 在 `SpectateInterpolationBuffer` 中追踪 `frameRevision` 与上一次采样的 `lastSampledFrameCursor` / `lastSampledRevision`，所有 `sample()` 返回路径统一经由 `buildSample(...)` 输出 `frameCursor` 与 `isDuplicateFrame`（`reset()` 时清除游标历史）。
+### 2.1 显式状态机与策略表：`src/game/pipeline/stages/simulationFrameClassifierPipeline.ts`
+- 新增互斥运行模式枚举 `SimulationDriveMode`（6 种模式）：
+  - `'local-freeplay'`
+  - `'host-authoritative'`
+  - `'host-goal-replay'`
+  - `'client-csr-spectate'`
+  - `'client-goal-replay'`
+  - `'local-replay-playback'`
+- 新增显式策略接口 `SimulationDrivePolicy`：
+  - `mode: SimulationDriveMode`
+  - `shouldStepLocalPhysics: boolean`
+  - `shouldHoldAccumulator: boolean`
+  - `shouldBroadcastSnapshot: boolean`
+  - `shouldRunLookahead: boolean`
+  - `shouldFeedReplayTimeline: boolean`
+- 新增 `classifySimulationDrivePolicy(input)` 与 `resolveSimulationDriveMode(input)`，将原先分散的 `isBroadcastingHost`、`isPureCsrClient`、`isClientInputAuthority`、`reconciler.replayPlaybackMode`、`flags.isGoalReplay`、`flags.shouldHoldAccumulator`、`remoteHasAuthority` 等布尔组合统一收口为单一互斥模式与策略表。
 
-3. **回归与契约单元测试**
-   - 更新 [runMultiplayerSuiteTests.ts](file:///workspace/RocketCompanion/scripts/runMultiplayerSuiteTests.ts) 的第 16 项测试 `testSpectateInterpolationBufferReverseDelay`：
-     - 覆盖 `frameCursor`、`isDuplicateFrame`（重复采样判定与 `reset()` 后复位）。
-     - 覆盖 BoostPad `isActive` 阶跃取值、`isActive === 1` 时 `cooldown === 0`、单调倒计时插值以及跨帧向上跳变保护。
+### 2.2 模拟阶段收口：`src/game/pipeline/stages/SimulationStage.ts`
+- `SimulationStage.execute()` 改为先计算 `flags` 与 `policy = classifySimulationDrivePolicy(...)`。
+- 物理步进 / 累加器冻结改为基于 `policy.shouldHoldAccumulator` 与 `policy.shouldStepLocalPhysics` 分发（保留 `client-csr-spectate` / `client-goal-replay` 的 `interpolator.sync(timestamp)` 契约及本地 Goal Replay 的插值保护）。
+- 主机广播收口为 `if (policy.shouldBroadcastSnapshot && server)`，显式由 `'host-authoritative'` 与 `'host-goal-replay'` 策略控制，并透传 `isGoalReplay: policy.mode === 'host-goal-replay'`。
+- 将 `policy` 传入 `stepNetworkReconciliationAndReplayStream(...)`。
 
-## 2. 工具链与门禁验证
+### 2.3 网络对账与回放流收口：`src/game/pipeline/stages/simulationNetworkReconcilePipeline.ts`
+- `NetworkReconcileStepInput` 新增 `policy: SimulationDrivePolicy`。
+- 拆分 `shouldFlushReconcilerControls(...)`、`canRecordLiveDiagnosticTick(...)`、`feedStreamedReplayPacket(...)` 等纯职责辅助函数。
+- 消除原有的 10 处复合布尔 `if` 分支，改为基于 `policy.mode` 与 `policy.shouldFeedReplayTimeline` 扁平分发，无损保留 `476b783`（Bug 1）的 Goal Replay 流式帧游标与 `appendStreamedReplayFrame` 逻辑。
 
-- 工具链补充：全局安装 `pnpm` (`12.21.0`)，完成 `pnpm install`。
-- 门禁结果（全部通过）：
-  - `pnpm run check`（`radar` + `tsc --noEmit`）：**GREEN**（1426/1426 TS 文件，0 循环依赖，0 值重导出，所有文件均在 18.0 KB / 800 行硬上限内）
-  - `pnpm run radar:audit`：**GREEN**
-  - `pnpm run test:multiplayer-suite`：**24/24 PASS**
+---
+
+## 3. 门禁与验证结果
+
+| 检查项 | 结果 | 详情 |
+| --- | --- | --- |
+| `pnpm run check` (`radar` + `tsc --noEmit`) | **PASS (GREEN)** | 1425/1425 TS 文件 100%，`tsc --noEmit` 0 错误，0 循环依赖 |
+| `pnpm run radar:audit` | **PASS** | **`BoolHotspots` 从 9 降至 7**，`SimulationStage.ts` 与 `simulationNetworkReconcilePipeline.ts` 均已彻底移出 `BoolHotspots` |
+| `pnpm run test:multiplayer-suite` | **PASS (24/24)** | 全部 24 项多人联机矩阵测试通过 |
+| 6 模式策略单元测试 | **PASS** | 验证 6 种 `SimulationDriveMode` 策略字段输出符合预期 |
+| `pnpm run repro:dev-broadcast-v2` | **环境受限** | 无 GPU/WebGL 容器中于 `Timeout waiting for Host boot after 60000ms` 超时（符合已知环境基线，需在带 WebGL 渲染能力的 runner 跑端到端浏览器回归） |

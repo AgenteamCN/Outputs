@@ -1,56 +1,67 @@
-# 任务完成报告（分支 `a2` · Commit `9d83956`）
+# RocketCompanion Dev Broadcast / Replay / Memory 问题复现报告
 
-## 1. 关于 `recentUserActions` 携带十几条 AX 事件的机制说明
-
-**结论：是的，只要你在 Remote Controller（或 Pocket Deck）里点击审批/回复，或者在 Agent Chat 里发送消息，Mac 端就会主动把增量 AX 事件打包进那条 MQTT 消息里，并不是 `/mqtt/rpc` 网关自己附加的。**
-
-具体代码路径在 `apps/p2p-remote-controller/src/App.tsx` 与 `apps/p2p-remote-controller/src/utils/emqxBridgeUtils.ts`：
-
-1. **两个触发入口**：
-   - `handleEmqxDecision`（点击 Approve / Deny / Reply 按钮发送 `.../resp/<requestId>` 时）
-   - `handleSendEmqxChat`（在 Agent Chat 发送聊天消息到 `.../chat` 时）
-2. **数据筛选与条数上限（`buildPiggybackTimelineDiff`）**：
-   - 每次发送前，Mac 端会从 `getTimelineEvents()` 取出 `id > lastSyncedTimelineIdRef.current` 的所有未同步 AX / 用户操作事件，发送后更新 `lastSyncedTimelineIdRef.current`。
-   - 条数上限由 `defaultLevel` 决定：**默认 `compact` 模式最多携带最近 15 条**（`standard` 40 条、`full` 100 条），所以通常就是“十几条 AX 事件 JSON，单条消息几 KB”。
-   - 如果在刚重启应用后（`lastSyncedTimelineIdRef.current` 重置为 `0`），或两次回复之间浏览器/AX 产生了较多事件，第一次回复/发消息就会把最近最多 15 条事件顺带捎过来；如果连续发两条消息且中间没有新 AX 事件，第二条的 `recentUserActions` 就会是 `[]`。
+**仓库**: `Antigravi-ty/RocketCompanion`  
+**分支**: `z/agy/rc/multiplayer-recheck`  
+**提交**: [`366a6869e67b0f2e4d597e661bf9b5da3073e6dd`](https://github.com/Antigravi-ty/RocketCompanion/commit/366a6869e67b0f2e4d597e661bf9b5da3073e6dd)（Verified Bot Commit）  
+**新增测试脚本**: `scripts/runDevBroadcastReproV3.mjs`（`pnpm run repro:dev-broadcast-v3`）  
+**原则**: 本次仅做**问题复现与测试套件更新**，未修改产品源码修复 bug。
 
 ---
 
-## 2. Notifications & Chat 持久化最近 200 条消息
+## 一、复现汇总（5/5 全部稳定复现）
 
-为避免新提交代码、重启 Mac 端后丢失交流上下文，已在 `p2p-remote-controller` 中将 `Notifications & Chat` 消息列表持久化到 `localStorage`（上限 **200 条**）：
+运行 `node scripts/runDevBroadcastReproV3.mjs`（双 Chrome Headless CDP + Vite Dev Server + BroadcastChannel / Pure CSR），输出 `reproduced=5/5`：
 
-- **`apps/p2p-remote-controller/src/utils/emqxBridgeUtils.ts`**：
-  - 新增 `MAX_PERSISTED_CHAT_MESSAGES = 200` 及存储键 `p2p_emqx_bridge_chat_v1`。
-  - 新增 `loadEmqxChatMessages()`（启动时反序列化并校验字段合法性，截断保留最近 200 条）与 `saveEmqxChatMessages()`（写入最近 200 条）。
-- **`apps/p2p-remote-controller/src/App.tsx`**：
-  - `chatMessages` 状态改为通过 `loadEmqxChatMessages()` 惰性初始化。
-  - 新增 `useEffect` 在 `chatMessages` 变化时自动调用 `saveEmqxChatMessages(chatMessages)`（点击 `Clear` 清空时也会同步清空持久化存储）。
-  - `appendBridgeMessage` 的内存保留上限从 150 条提升至 `MAX_PERSISTED_CHAT_MESSAGES`（200 条）。
-
----
-
-## 3. 移动端 Pocket Deck 右上角 Commit ID 与相对时间修复
-
-**原问题原因**：`PocketDeckView.tsx` 原先显示的是 `#{activeSnapshot.commitId || commitId}`。其中 `activeSnapshot` 是 Mac 宿主机通过 `/api/state` 和 `/ws` 实时推送过来的状态，导致手机端在未点击 `Update` 刷新 PWA 缓存的情况下，依然会显示 Mac 端最新 check out 的 commit ID，从而造成“以为已经自动更新”的误导。
-
-**本次改动**：
-- **`apps/p2p-remote-controller/vite.config.ts` & `src/vite-env.d.ts` & `src/services/lanService.ts`**：
-  - 构建/打包前端时通过 `git show -s --format=%ct HEAD` 注入 `__APP_COMMIT_TIME__`（若无 git 上下文则回退到构建时间），并提供 `getAppCommitTime()`。
-- **`apps/p2p-remote-controller/src/utils/emqxBridgeUtils.ts`**：
-  - 新增 `formatRelativeTimeCompact(isoTime, nowMs)`，将提交时间格式化为 `just now`、`15m ago`、`3h ago`、`2d ago`。
-- **`apps/p2p-remote-controller/src/components/PocketDeckView.tsx`**：
-  - 右上角改为**始终显示移动端当前实际运行包自身的 `commitId` 与相对时间**（例如 `#9d83956 · 5m ago`），每 60 秒自动刷新一次相对时间。
-  - 当宿主机推送的 `activeSnapshot.commitId` 与手机当前运行的 `commitId` 不一致时，不再篡改显示的 commit ID，而是高亮 `Update` 按钮（`className="primary"`）并在 tooltip 中提示宿主机当前版本，方便明确判断是否需要手动点击 `Update`。
+| 编号 | 场景 ID | 状态 | 核心复现指标 |
+| :--- | :--- | :--- | :--- |
+| 1 | `bug-1-goal-replay-client-no-motion` | `[REPRODUCED_BUG]` | `clientReplayFrames: 0`, `clientReplayPlaybackMode: false`, `clientReplayBallTravel: 0` |
+| 2 | `bug-2-replay-watch-together-nametag-unsynced` | `[REPRODUCED_BUG]` | UI `EdgePlayerSlotCard`: `6`，`nameTagIsMultiCar: false`, `nameTagCarEntriesCount: 0`, `activeLabels: []` |
+| 3 | `bug-3-broadcast-choppy-state-only-no-physics-lookahead` | `[REPRODUCED_BUG]` | `physicsStepCalls: 0`, `prevEqCurrRatio: 1`, `maxStepRatio: 3.89` (`medianDeltaUu: 566.2`, `maxDeltaUu: 2200.55`) |
+| 4 | `bug-4-boost-state-flicker-every-frame` | `[REPRODUCED_BUG]` | `totalCarBoostingRapidToggles: 1`, `sampleCar0Boosting: [0,...,0,1,0,0,...]` |
+| 5 | `bug-5-memory-footprint-and-close-retention` | `[REPRODUCED_BUG]` | Boot 后 WASM `271–325 MB` + JS Heap `162–200 MB`；Active `336.2 MB`；`dispose()` 后 `wasmMemoryBytes: 0` 但 JS Heap `337.4 MB`（`heapRetentionRatio: 1`）；Tauri `CloseRequested` 仅 `prevent_close() + hide()` |
 
 ---
 
-## 4. 验证与提交记录
+## 二、逐项根因定位与复现证据
 
-- **检查与测试**：
-  - `pnpm --filter p2p-remote-controller check`（`tsc --noEmit` + `eslint src`）：0 errors
-  - `pnpm --filter p2p-remote-controller test`（Vitest）：2 个测试文件、10 个用例全部通过（新增 200 条消息持久化截断测试与相对时间格式化测试）
-  - `pnpm --filter p2p-remote-controller build`（`tsc && vite build`）：构建成功
-- **Git 提交**：
-  - 仓库与分支：`Antigravi-ty/agyPreviewInstant` (`a2`)
-  - Verified Bot Commit：[`9d83956`](https://github.com/Antigravi-ty/agyPreviewInstant/commit/9d83956a1352c6f042d84bbd9495d10aa9f4264c)（`signature.isValid: true`）
+### 1. Client 端 Goal Replay 能正常进入/退出但无动态（Spectating 与 Match Cinematic Goal Replay 未打通）
+- **复现表现**:
+  - Client 端进入 Goal Replay 时，`hudPhase === 'replay'`、`phase === 'replay'`，但 `clientReplayPlaybackMode: false`、`clientReplayFrames: 0`。
+  - 球与车辆位置完全静止在 kickoff 坐标 `(0, 0, 93.15)`（`clientReplayBallTravel: 0`、`clientInterpBallTravel: 0`），退出后重新同步正常。
+- **代码根因**:
+  1. `src/game/runtime/RuntimeGoalReplaySignalSubController.ts` 中 `handleGoalReplayStart` 在 `isDevSyncClientPureCsrSpectateMode(reconciler)` 为 `true` 时直接跳过 `reconciler.setReplayPlaybackMode(true)`。
+  2. `src/game/pipeline/stages/simulationNetworkReconcilePipeline.ts` 中 `if (isPureCsrSpectate && !reconciler.replayPlaybackMode && spectateInterpolationBuffer)` 分支把 `drainedReplayPackets` 全部送入 `spectateInterpolationBuffer`，导致后续 `else if` 分支中的 `replayTimelineController.appendStreamedReplayFrame(...)` 不可达，Goal Replay 时间轴帧数为 `0`。
+
+### 2. Replay Watch Together 同步了 UI 信息，但 3D NameTag 未同步
+- **复现表现**:
+  - 双方进入 `activeRoomActivity: 'replay'` 后，Client 端 UI 侧已渲染 6 个 `EdgePlayerSlotCard`（UI Roster 与计分板已同步），但 3D NameTag 状态为 `nameTagIsMultiCar: false`、`nameTagCarEntriesCount: 0`、`activeLabels: []`。
+- **代码根因**:
+  - `src/game/runtime/devSyncChannelHandlers.ts` 处理 `replaySync` 时仅更新了 `useReplayViewerStore` 与 `hudStore`，没有调用 `setNameTagRuntimeState({ isMultiplayerOrMultiCarMode: true, carEntries: ... })`（`VehicleNameTagSystem` 依赖该运行时状态渲染 3D NameTag）。
+
+### 3. 广播回放卡顿（仅下发/应用 State 快照，未使用确定性物理引擎做缓冲前瞻）
+- **复现表现**:
+  - Client 端采样 20 帧：`physicsStepCalls: 0`、`prevEqCurrRatio: 1`（每帧 `prevState === currState`），单帧位移最大跳变 `2200.55 uu`（中位数 `566.2 uu`，`maxStepRatio: 3.89`）。
+- **代码根因**:
+  - `src/game/pipeline/stages/SimulationStage.ts` 在 `isPureCsrClient` 分支下直接执行 `interpolator.sync(timestamp)` 并跳过 `physics.step(...)`，完全依赖 `SpectateInterpolationBuffer` 的纯状态插值，未在缓冲区积累到一定帧数（如 `> 5` frames）时利用确定性物理引擎做多帧连续步进/前瞻。
+
+### 4. Boost 状态逐帧闪烁
+- **复现表现**:
+  - Client 端 20 帧采样中检测到 `car[0].isBoosting` 出现 `0 -> 1 -> 0` 跳变（`totalCarBoostingRapidToggles: 1`，`carBoostingTogglesByCar: [1, 0, 0, 0, 0, 0]`）。
+- **代码根因**:
+  - 快照压缩/插值路径中，`globalPhysicsSnapshotSectionCodec.ts` 的 `unpackBoostPadBitmaskIntoSnapshot` 会在 pad inactive 时将冷却时间重置为 `BOOST_PAD_TIMEOUT_BIG`/`SMALL`，且 `interpolateReplaySnapshots` 在 `alpha = 0.5` 对 `car[19..39]` 离散开关做硬切换，加之网络快照与本地插值帧之间的状态切换导致 boost 状态高频闪烁。
+
+### 5. 高内存占用与关闭窗口后不释放（需 Quit 才释放）
+- **复现测量（Chrome CDP Performance / Heap / WebGL + Tauri 源码检查）**:
+  - **Host 启动后**: `jsHeapUsedMB: 162`、`wasmMemoryBytes: 271056896`（约 `258.5 MB`）、`geometries: 40`、`programs: 33`。
+  - **Client 启动后**: `jsHeapUsedMB: 199.8`、`wasmMemoryBytes: 325320704`（约 `310.2 MB`）。
+  - **Client 活跃阶段**: `jsHeapUsedMB: 336.2`、`jsHeapTotalMB: 377.7`、`domNodes: 750`、`replayBufferFrames: 279`、`geometries: 62`、`programs: 58`。
+  - **Client `runtime.dispose()` 后**: `wasmMemoryBytes` 降为 `0`、`domNodes` 降至 `24`，但 **JS Heap 保持 `337.4 MB`（`heapRetentionRatio: 1`，100% 滞留）**。
+  - **Tauri 端 (`src-tauri/src/lib.rs`)**: `WindowEvent::CloseRequested` 调用了 `api.prevent_close(); window.hide();`，关闭窗口时仅隐藏窗口，并未销毁 WebView 或触发 `runtime.dispose()`，导致整个进程（以及 WASM/WebGL/JS Heap）驻留后台直到用户彻底 Quit。
+
+---
+
+## 三、验证与构建检查
+
+- `pnpm run check`（`radar` + `tsc --noEmit`）：**GREEN**（1425/1425 TS 文件，0 循环依赖，0 错误）
+- `pnpm run test:multiplayer-suite`：**24/24 PASS**
+- `pnpm run repro:dev-broadcast-v3`：**5/5 REPRODUCED**

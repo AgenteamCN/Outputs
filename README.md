@@ -1,139 +1,111 @@
-# RocketCompanion 多人同步与内存修复：架构诊断与细粒度执行计划
+# RocketCompanion：先清架构还是直接修 Bug？—— Wave 0 架构重构前置计划 + 瘦身版 Wave 1–3 下发方案
 
 > 基线分支：`origin/z/agy/rc/multiplayer-recheck`（HEAD: `943b749`）
-> 目标：在不直接改动业务代码的前提下，评估 Wave 1–3 的可拆分性、Track A/B 先行合并可行性、以及仓库架构对修复难度的影响，给出可落地的细粒度并行与合并计划。
+> 核心原则：**拒绝在“布尔地狱 + 散落命令式同步 + 无生命周期单例”上继续打补丁（雕花）**；但也不搞脱离测试基线的“全仓大重写”。采用 **Wave 0（精准架构止血前置波）→ 瘦身版 Wave 1–3（基于清晰契约修 Bug）** 的两段式工程方案，可直接下发给研发/Agent 团队执行。
 
 ---
 
-## 一、核心结论摘要
+## 一、战略决策：为什么选择「Wave 0 精准重构前置」而非「全仓重写」或「直接硬修」？
 
-1. **Track A-1（Bug 1）与 Track B（Bug 2）可以立即合并，零冲突。**
-   两者修改文件完全正交（模拟管线 vs. Runtime Sync Channel / NameTag 状态同步），建议在 Wave 1 率先合入作为 **Integration Checkpoint 1**，使 Bug 1 + Bug 2 先清零，同时为 Wave 2（Bug 3）提供稳定的 Goal Replay 管线基线。
-2. **Wave 1 Track C（Bug 5）之所以“太难”，核心原因在于把 4 个完全正交的子系统捆绑成了一个巨石分支，且被 `runDevBroadcastReproV3.mjs` 的四元 `OR` 门禁绑死。**
-   可拆分为 **C1（WASM 内存） / C2（Three.js 几何体与车位销毁） / C3（JS Heap / AI 模型与 RingBuffer 清理） / C4（Tauri 窗口关闭语义）** 四个独立子轨道。其中 C1–C3 均为纯 Web/TS/CDP 可验证，C4 是唯一依赖 Rust/Tauri 工具链的部分。
-3. **Wave 2（Bug 3）与 Wave 3（Bug 4）均可进一步细拆为“数据/缓冲契约层”与“管线/动画消费层”两步走**，降低在 `SimulationStage.ts` 与 `simulationNetworkReconcilePipeline.ts` 上反复返工的风险。
-4. **“难修”的本质确实与仓库架构强相关**（详见第四节）：状态标志位组合爆炸、NameTag/Team 缺乏单一数据源（25+ 处散落调用）、全局单例缺乏生命周期卸载协议、以及 `Float32Array` 快照将连续量与离散布尔量混在同一线性插值通道中。
+| 方案 | 优点 | 致命问题 | 结论 |
+| :--- | :--- | :--- | :--- |
+| **A. 直接按原 Wave 1–3 硬修** | 看似少一步 | 在 `SimulationStage` 的布尔泥潭和 25 处散落 `setNameTagRuntimeState` 上打补丁，修 Bug 1 容易炸 Bug 3，修 Bug 3 必炸 Bug 4，后续新模式继续复发 | ❌ 不可持续（雕花） |
+| **B. 全仓推倒重来** | 理论上最干净 | 仓库有 1,425 个 TS 文件且已通过 `radar.ts`（0 循环依赖、0 越级引用、严格体积上限），问题**不在全仓**，只集中在 4 个局部架构坏味道；全仓重写会直接摧毁现有 E2E 基线 | ❌ 成本与风险失控 |
+| **C. Wave 0 精准架构前置 + 瘦身版 Wave 1–3** | **先清理 4 个病灶的抽象契约，再填 Bug 修复逻辑**；每一步都有 `pnpm run check` 与现有测试套件兜底 | 多 1 个前置 Wave，但大幅压缩 Wave 1–3 的联调与返工时间 | ✅ **最优解** |
 
----
-
-## 二、环境与工具链实测状态
-
-在当前 Linux 验证容器（`/workspace/RocketCompanion`）中已完成以下检查与补齐：
-
-| 工具/依赖 | 状态 | 说明 |
-| :--- | :--- | :--- |
-| `node` | ✅ `v22.23.5` | 支持 `--experimental-strip-types` |
-| `pnpm` | ✅ 已安装 `v12.21.0` | 原环境缺失，已通过 `npm install -g pnpm` 补齐并完成 `pnpm install`（3.5s） |
-| `pnpm run check` | ✅ PASS | `radar.ts`（1425/1425 TS 文件、0 循环依赖）与 `tsc --noEmit` 均绿灯通过 |
-| `google-chrome` | ✅ `158.0.8127.36` | 可用于 `repro:dev-broadcast-v3` Headless CDP 测试 |
-| `rustc` / `cargo` / `cc` | ❌ 缺失 | 当前容器无 C 编译器与 Rust 工具链，**仅影响 Sub-track C4（`src-tauri/src/lib.rs`）的编译验证**；C1–C3 及 Bug 1–4 均可在当前环境直接开发与验证 |
-
-> **测试回放文件**：运行 `pnpm run repro:dev-broadcast-v3` 前需确保 `rc-replay-3v3-1-0-2026-11-13T07-26-58.rcreplay` 位于 `/tmp/`、`/workspace/` 或通过 `RC_REPLAY_FILE` 指定。
+> **关键认知**：`RocketCompanion` 并非整体烂掉（`radar.ts` 门禁已经保证了模块边界与单文件体积），真正导致 Bug 1–5 难修的是 **4 个高耦合局部病灶**。Wave 0 只针对这 4 个病灶做“手术刀式”重构。
 
 ---
 
-## 三、细粒度拆分与合并计划（Wave 1 → Wave 3）
+## 二、Wave 0：架构清理前置波（4 路并行，纯重构 + 契约建立）
 
-### Wave 1：低耦合快赢 + Track C 四路拆解
+> **Wave 0 总门禁**：每条轨道合入前必须保持 **零行为退化**——通过 `pnpm run check`（`radar` + `typecheck`）、`pnpm run test:multiplayer-suite`、`pnpm run repro:dev-broadcast-v2`。
 
-#### 1. Track A-1（Bug 1：Goal Replay 客户端静态无动态）— **优先合入**
-* **分支**：`fix/bug-1-goal-replay-client-dynamics`（基于 `z/agy/rc/multiplayer-recheck`）
-* **核心改动面**：
-  * `src/game/pipeline/stages/simulationFrameClassifierPipeline.ts`
-  * `src/game/pipeline/stages/SimulationStage.ts`
-  * `src/game/pipeline/stages/HostBroadcastPublisher.ts`
-  * `src/replay/ReplayFrameInterpolator.ts`
-  * `src/game/pipeline/stages/simulationNetworkReconcilePipeline.ts`
-* **门禁**：`bug-1-goal-replay-client-static-no-dynamics.reproduced === false`。
+### Arch-0A：模拟管线显式状态机（消除布尔组合地狱）
+* **解决的架构病灶**：`SimulationStage.ts`（468L）与 `simulationNetworkReconcilePipeline.ts`（281L）同时用 `isPureCsrClient`、`isPureCsrSpectate`、`reconciler.replayPlaybackMode`、`flags.isGoalReplay`、`flags.shouldHoldAccumulator`、`server` 等 6+ 个布尔值隐式组合出 5 种运行模式，导致分支极其脆弱。
+* **重构动作**：
+  1. 在 `src/game/pipeline/stages/simulationFrameClassifierPipeline.ts` 中定义**显式互斥枚举** `SimulationDriveMode`：
+     - `'local-freeplay'`
+     - `'host-authoritative'`
+     - `'host-goal-replay'`
+     - `'client-csr-spectate'`
+     - `'client-goal-replay'`
+     - `'local-replay-playback'`
+  2. 为每种模式派生显式策略对象 `SimulationDrivePolicy`：
+     ```ts
+     interface SimulationDrivePolicy {
+       mode: SimulationDriveMode;
+       shouldStepLocalPhysics: boolean;
+       shouldHoldAccumulator: boolean;
+       shouldBroadcastSnapshot: boolean; // 显式声明，不再用 !isPaused && tickChanged 隐式推断
+       shouldRunLookahead: boolean;
+       shouldFeedReplayTimeline: boolean;
+     }
+     ```
+  3. 将 `SimulationStage.ts` 与 `simulationNetworkReconcilePipeline.ts` 中的多重布尔 `if/else` 全部收口为基于 `policy.mode` / `policy.*` 的扁平分发。
+* **直接收益**：Wave 1（Bug 1）和 Wave 2（Bug 3）不再互相踩踏，各自只需修改对应 `mode` 的策略表与独立 handler。
 
-#### 2. Track B（Bug 2：3D NameTag 与 `arena.carTeams` 不同步）— **与 Track A-1 并行并先行合并**
-* **分支**：`fix/bug-2-replay-nametag-team-sync`（基于 `z/agy/rc/multiplayer-recheck`）
-* **核心改动面**：
-  * `src/game/runtime/devSyncChannelHandlers.ts`
-  * `src/game/runtime/onlineSessionEnvironmentPipeline.ts`
-* **与 Track A-1 的合并评估**：
-  * **文件重叠度 = 0**，**语义耦合 = 0**。
-  * **合并策略**：Track A-1 与 Track B 各自通过 `pnpm run check` 后，直接合并生成集成分支（如 `int/wave1-bug1-bug2`），作为 Wave 2 的统一底座。
+### Arch-0B：Roster / Team / NameTag 单一数据源投影（SSOT）
+* **解决的架构病灶**：`setNameTagRuntimeState` 散落在全库 **25+ 个文件** 中命令式调用，`hudStore`、`replayViewerStore`、`arena.carTeams`、`physics.setCarTeam` 各自为政。
+* **重构动作**：
+  1. 新建/收敛统一的协调投影器 `src/game/runtime/MatchRosterProjection.ts`（或收敛至 `OnlineRosterSyncCoordinator.ts`），作为**唯一允许批量同步车辆队伍与 NameTag 的出口**：
+     - 输入：`RosterSnapshot`（carIndex, name, team, isLocal, activeCount）
+     - 原子输出：同步更新 `physics.setCarTeam(...)`、`arena.setCarTeam(...)`、`setNameTagRuntimeState(...)`、`hudStore` / `replayViewerStore`。
+  2. 率先将 `devSyncChannelHandlers.ts`、`onlineSessionEnvironmentPipeline.ts` 接入该投影器（后续渐进迁移其余 20+ 处）。
+* **直接收益**：Wave 1（Bug 2）在接入投影器后即天然解决，且彻底杜绝后续新模式漏调 `setNameTagRuntimeState`。
 
-#### 3. Track C（Bug 5：内存释放与 Tauri 关闭）— **拆分为 4 个独立子轨道（C1–C4）**
+### Arch-0C：资源生命周期总线与延迟分配契约（Disposable Registry）
+* **解决的架构病灶**：WASM 194.5 MB replay buffer 启动即 eager 分配；AI `SafeTensorsLoader`（~114 MB）、`wasmSimdMatVec`（~120 MB）、`customVehicleAssets`、`THREE.Cache` 均为无卸载协议的模块级单例；`ArenaWorld` 退出仅隐藏车辆不销毁槽位。
+* **重构动作**：
+  1. 定义轻量级生命周期接口 `RuntimeDisposableResource`（`id`, `scope: 'session' | 'replay' | 'ai'`, `dispose(): void`）及全局注册表 `src/game/runtime/RuntimeResourceRegistry.ts`。
+  2. 确立两项硬约束：
+     - **延迟分配（Lazy Allocation）**：重型缓冲区（如 `initReplayBuffer`）严禁在 Boot/Constructor 阶段无条件初始化，必须由 `isRecordingFullReplay` 或首次录制请求按需触发。
+     - **统一退出回收**：`MatchModeTransitionBridge.returnToFreeplay()` 与 `applyCleanFreeplaySubsystemsReset()` 统一调用 `RuntimeResourceRegistry.disposeScope('replay' | 'ai')`。
+  3. 为 WASM 回收（`reclaimWasmMemoryIfGrown`）、Arena 车辆槽位销毁（`removeCar` + 非共享几何体回收）、AI 缓存清理（`resetWasmSimdMatVec` / `clearSafeTensorsModelCache`）预留标准注册入口。
+* **直接收益**：Bug 5 的 C1/C2/C3 不再是“到处打补丁”，而是各自向 `RuntimeResourceRegistry` 注册一个干净的 `Disposable` 实现。
 
-在 `scripts/runDevBroadcastReproV3.mjs`（L489–493）中，Bug 5 的判定是一个四元 `OR` 门禁：
-```js
-const bug5Reproduced =
-  (bootMem.wasmMB ?? 0) >= 256 ||
-  retainedWasmMB > 0 ||
-  retainedGeometries > 0 ||
-  tauriCloseHidesWindow;
-```
-这意味着只要其中任意一项未修，总开关就仍是 `reproduced: true`。但各子项的底层指标在 `/tmp/dev-broadcast-repro-v3.json` 中是**独立输出**的，因此完全可以拆成 4 个可独立验收的子任务：
-
-| 子轨道 | 目标指标 | 涉及文件 | 工具链需求 | 相互依赖 |
-| :--- | :--- | :--- | :--- | :--- |
-| **C1：WASM 启动预分配与退出回收** | `bootMem.wasmMB < 256`（目标 ~64 MB）且 `retainedWasmMB <= 0` | `RocketSimArenaBarrierController.ts`（移除启动时 eager `initReplayBuffer`）、`PhysicsEngineManager.ts`（按 `isRecordingFullReplay` 守卫）、`RocketSimWasm.ts`、`RocketSimPhysicsEngine.ts`（`reclaimWasmMemoryIfGrown`）、`MatchModeTransitionBridge.ts` | 纯 Web / TS | 无，完全独立 |
-| **C2：Three.js 几何体与车辆槽位销毁** | `retainedGeometries <= 0`（从 +65 降至 <= 0） | `ArenaWorld.ts`、`arenaVehicleSlotPipeline.ts`（`removeCar` + 裁切尾部空槽）、`ArenaVehicleLoadoutManager.ts`、`VehicleFactory.ts`（`collectReferencedGeometries` 仅销毁非共享几何体）、`RespawnGhostPreview.ts`、`customGlbCarModel.ts`、`freeplayKickoffAndArenaResetPipeline.ts`、`ReplayViewerCausalSyncController.ts` | 纯 Web / TS | 建议 C2 先于 C3 合入，避免 `freeplayKickoffAndArenaResetPipeline.ts` 冲突 |
-| **C3：JS Heap / AI 模型与 RingBuffer 清理** | `retainedJsMB` 显著回落（227 MB → ~91 MB） | `wasmSimdMatVec.ts`（`resetWasmSimdMatVec`）、`SafeTensorsLoader.ts`（`clearSafeTensorsModelCache`）、`freeplayKickoffAndArenaResetPipeline.ts`（`applyCleanFreeplaySubsystemsReset` 清理 `ringBuffer`、`ballTrajectoryPredictor`、`renderer.renderLists`、`THREE.Cache.clear()`） | 纯 Web / TS | 接在 C2 之后改 `freeplayKickoffAndArenaResetPipeline.ts` |
-| **C4：Tauri 窗口关闭语义** | `tauriCloseHidesWindow === false` | `src-tauri/src/lib.rs`（移除无条件 `api.prevent_close(); window.hide();`，主窗口关闭时清理子窗口/tunnel，处理 `WindowEvent::Destroyed`） | **需要 `cargo` / `rustc` + Tauri 系统库** | 完全独立，可随时合入 |
-
-> **并行建议**：C1、C2、C4 可与 Wave 1 的 Bug 1、Bug 2 **同时开工**；C3 在 C2 合入后快速跟进。每完成一个子轨道，直接核对 `/tmp/dev-broadcast-repro-v3.json` 对应字段即可验收，无需等待全部 4 项齐备。
-
----
-
-### Wave 2：确定性 WASM 物理前瞻（Bug 3）— 细分为两步
-
-* **前置基线**：必须基于 **Bug 1 已合入** 的代码（因为 Bug 1 和 Bug 3 共同修改 `SimulationStage.ts` 与 `simulationNetworkReconcilePipeline.ts`，且 Goal Replay 的状态机分支必须先稳定）。
-* **为什么建议拆成 2 步**：直接把缓冲队列改造和 WASM 物理步进混在一起，极易引入 Replay 快退/Goal Replay 跳变问题。
-
-1. **Wave 2-A：前瞻缓冲契约层（`ReplicationStateInterpolator.ts`）**
-   * 为 `SpectateInterpolationBuffer` 引入缓冲前瞻阈值（如 `>= 5` 帧）与游标推进接口，区分“缓冲不足等待”与“可驱动前瞻窗口”，并确保与 Goal Replay / Pause 状态切换时的 `reset()` 语义兼容。
-   * 可通过单元测试（`runMultiplayerSuiteTests.ts`）先行验证缓冲状态机。
-2. **Wave 2-B：确定性 WASM 前瞻驱动与快照收敛（`SimulationStage.ts` + `simulationNetworkReconcilePipeline.ts`）**
-   * 在 `isPureCsrClient` 下，当缓冲满足阈值时，不再只调用静止的 `interpolator.sync(timestamp)`，而是驱动本地 WASM 物理连续步进（保证 `tickCount` 连续递增，消除 `distinctTicks === 1` 与 `frozenBallFrames >= 3 && maxBallStepUu > 200`），并在新权威快照到达时平滑收敛误差。
-   * **门禁**：`bug-3-replay-choppy-motion-no-physics-lookahead.reproduced === false`。
+### Arch-0D：快照离散字段与连续插值语义隔离
+* **解决的架构病灶**：`SpectateInterpolationBuffer`（`ReplicationStateInterpolator.ts`）把包含离散布尔态（BoostPad `isActive`）和连续物理量的 `Float32Array` 混在一起做线性插值/覆盖，导致前瞻切换或抖动时触发虚假边缘跳变。
+* **重构动作**：
+  1. 在 `ReplicationStateInterpolator.ts` / `ReplayFrameInterpolator.ts` 中显式声明 **BoostPad 离散字段偏移表**（`isActive` 走最近邻/阶跃取值，严禁线性插值；`cooldown` 增加单调性/跨帧跳变保护）。
+  2. 明确 `SpectateInterpolationBuffer` 的输出契约：`sample()` 必须同时给出 `frameCursor / isDuplicateFrame` 标记，供下游渲染系统识别“重复帧/静止帧”。
+* **直接收益**：Wave 3（Bug 4）的闪烁根因在插值层即被切断，`BoostPadSystem.ts` 只需做极简防抖。
 
 ---
 
-### Wave 3：BoostPad 模型闪烁（Bug 4）— 细分为两步
+## 三、Wave 0 之后：瘦身版 Wave 1–3 执行计划
 
-* **前置基线**：必须基于 **Wave 2（Bug 3）已合入** 的代码。原因是物理前瞻引入后，客户端本地预测帧与远端快照修正帧交替出现，正是诱发 BoostPad 冷却时间抖动与 `respawnedAndCollected` 误判的主要场景。
+完成 Wave 0 并合入主集成分支后，原 5 个 Bug 的修复复杂度大幅下降，按以下顺序快速推进：
 
-1. **Wave 3-A：插值与快照离散字段保护（`ReplicationStateInterpolator.ts` / `ReplayFrameInterpolator.ts`）**
-   * 审查 `SpectateInterpolationBuffer.sample()` 与 `applyReplayFrameToEngine()`：确保 BoostPad 的离散激活标志（`isActive`）不被线性插值成中间态，且连续 `cooldown` 在跨帧插值/前瞻校正时不出现虚假回跳。
-2. **Wave 3-B：`BoostPadSystem.ts` 状态跳变去抖与重复帧守卫**
-   * 加固 `BoostPadSystem.ts`（L294–316）中的 `respawnedAndCollected` 与 `isBufferFrozen` 判定：屏蔽同帧重复应用、微小网络抖动导致的冷却回弹（`cooldown` 轻微增大但不应触发 `startCollectAnimation`），避免 `pad.full.visible` 逐帧翻转。
-   * **门禁**：`bug-4-boostpad-model-flicker.reproduced === false`（`maxSinglePadFlips < 2 && totalPadFlips < 8`），并跑通全量 `repro:dev-broadcast-v3`（`reproducedCount === 0/5`）。
+### Wave 1（3 路并行，基于 Wave 0 底座）
+1. **Track A-1（Bug 1：Goal Replay 客户端动态）**
+   * 在 `Arch-0A` 的 `SimulationDrivePolicy` 中为 `'host-goal-replay'` 开启 `shouldBroadcastSnapshot = true`（携带 replay 帧游标），为 `'client-goal-replay'` 开启 `shouldFeedReplayTimeline = true`。
+   * 验收：`bug-1-goal-replay-client-static-no-dynamics.reproduced === false`。
+2. **Track B（Bug 2：NameTag 与队伍同步）**
+   * 确认 `devSyncChannelHandlers.ts` 与 `onlineSessionEnvironmentPipeline.ts` 全量走 `Arch-0B` 的 `MatchRosterProjection` 即可。
+   * 验收：`bug-2-replay-nametag-and-team-desync.reproduced === false`。
+3. **Track C（Bug 5：拆为 4 个 Disposable 子任务并行）**
+   * **C1（WASM 内存）**：接入 `Arch-0C` 延迟分配 + `reclaimWasmMemoryIfGrown`（`bootMem.wasmMB < 256`, `retainedWasmMB <= 0`）。
+   * **C2（Three.js 槽位与几何体）**：`ArenaWorld.removeCar` + `collectReferencedGeometries` 注册到 `Arch-0C`（`retainedGeometries <= 0`）。
+   * **C3（AI / JS Heap 清理）**：`SafeTensorsLoader` / `wasmSimdMatVec` / `ringBuffer` 注册到 `Arch-0C`（`retainedJsMB` 回落）。
+   * **C4（Tauri 关闭语义，独立 Rust 轨道）**：修改 `src-tauri/src/lib.rs` `WindowEvent::CloseRequested`，在具备 `cargo`/`rustc` 的 CI 或本地环境验证（`tauriCloseHidesWindow === false`）。
+
+### Wave 2（基于 Wave 1 合入后，2 步推进 Bug 3）
+* **2-A**：基于 `Arch-0A` 的 `'client-csr-spectate'` 模式，在 `SpectateInterpolationBuffer` 增加 `>= 5` 帧前瞻窗口与游标状态机。
+* **2-B**：在 `SimulationStage` 中为 `'client-csr-spectate'` 开启 `shouldRunLookahead = true`，驱动本地 WASM 物理连续步进与快照收敛。
+* 验收：`bug-3-replay-choppy-motion-no-physics-lookahead.reproduced === false`。
+
+### Wave 3（基于 Wave 2 合入后，收尾 Bug 4 + 全量门禁）
+* **3-A**：利用 `Arch-0D` 的 `isDuplicateFrame` 标记与离散字段阶跃输出，校验前瞻切换帧的 BoostPad 状态一致性。
+* **3-B**：在 `BoostPadSystem.ts` 增加重复帧跳过与冷却微抖阈值保护。
+* 验收：`bug-4-boostpad-model-flicker.reproduced === false`，最终全量运行 `pnpm run check && pnpm run repro:dev-broadcast-v3` 确认 `reproducedCount === 0/5`。
 
 ---
 
-## 四、架构诊断：为什么这些 Bug 在当前仓库中修起来很吃力？
+## 四、工具链与下发检查清单
 
-通过静态检查 `origin/z/agy/rc/multiplayer-recheck`（1,425 个 TS 文件），可以确认**代码仓库的架构特征确实显著放大了修复难度**，主要体现在以下 4 点：
-
-1. **核心模拟管线的“状态标志位组合爆炸”**
-   * `SimulationStage.ts`（468 行）与 `simulationNetworkReconcilePipeline.ts`（281 行）同时承载本地 Freeplay、Host 广播、Pure CSR Spectate、本地 Replay 回放、Goal Replay 五种模式。
-   * 逻辑高度依赖多重布尔组合（`isPureCsrClient`、`isPureCsrSpectate`、`reconciler.replayPlaybackMode`、`flags.isGoalReplay`、`flags.shouldHoldAccumulator`、`server`）。修改任意一个分支（如 Bug 1 解开 Goal Replay 广播），很容易影响相邻分支（如 Bug 3 的 `interpolator.sync` 时机），这也是 Track A 必须串行推进的根本原因。
-2. **NameTag / Team 同步缺乏单一数据源（SSOT）**
-   * 全库有 **25+ 个文件** 散落调用 `setNameTagRuntimeState(...)`；与此同时，`hudStore`、`replayViewerStore`、`arena.carTeams`、`physics.setCarTeam` 各自维护一份队伍与车辆列表。
-   * 当新入口（如 Dev Sync Replay Watch Together）接入时，只要遗漏其中一环的命令式同步（如只更新了 UI store 没调 `setNameTagRuntimeState`），就会出现 UI 与 3D 世界割裂（Bug 2）。
-3. **全局单例与隐式缓存缺乏统一的 `Dispose` 生命周期协议**
-   * `RocketSimArenaBarrierController` 在启动期即 eager 预分配 ~194.5 MB replay buffer；`SafeTensorsLoader`（~114 MB）、`wasmSimdMatVec`（~120 MB）、`customVehicleAssets`、`THREE.Cache` 均以模块级单例驻留。
-   * `ArenaWorld` 在退出多车模式时仅做 `visible = false` 隐藏而非销毁槽位与非共享几何体。缺乏“模式退出即统一回收”的生命周期契约，导致 Bug 5 需要横跨 15 个文件逐一补洞。
-4. **扁平 `Float32Array` 快照导致离散状态与连续插值耦合**
-   * 车辆/球/BoostPad 状态打包在同一 `Float32Array` 快照中，`SpectateInterpolationBuffer` 对整块浮点数组做统一插值或覆盖，未对离散布尔态（BoostPad `isActive`）与单调倒计时（`cooldown`）做语义隔离，导致物理前瞻或快照抖动直接表现为模型闪烁（Bug 4）。
-
----
-
-## 五、推荐合并拓扑图
-
-```text
-z/agy/rc/multiplayer-recheck
- ├── [Wave 1] Track A-1 (Bug 1) ──┐
- ├── [Wave 1] Track B   (Bug 2) ──┼──▶ int/wave1 (Bug 1+2 已清零)
- ├── [Wave 1] Track C1  (WASM内存) ──┤         │
- ├── [Wave 1] Track C2  (Three销毁) ─┼─▶ [Wave 2-A/B] Bug 3 (物理前瞻)
- ├── [Wave 1] Track C4  (Tauri关闭) ─┤         │
- └── [Wave 1后] Track C3 (AI/JS堆) ──┘         ▼
-                                        [Wave 3-A/B] Bug 4 (BoostPad防抖)
-                                               │
-                                               ▼
-                                      全量门禁: check + repro:dev-broadcast-v3 (0/5)
-```
+* **Web / TS / CDP 环境（Wave 0 + Wave 1 C1/C2/C3 + Wave 2 + Wave 3）**：
+  - 必需：`node v22.x`、`pnpm`、`google-chrome`、测试回放文件 `rc-replay-3v3-1-0-2026-11-13T07-26-58.rcreplay`。
+  - 每 PR 门禁：`pnpm run check` + `pnpm run test:multiplayer-suite`（Wave 0 必跑）+ `pnpm run repro:dev-broadcast-v3`。
+* **Rust / Tauri 环境（仅 Wave 1 C4）**：
+  - 必需：`rustc` / `cargo` + C 链接器 + Tauri 系统依赖，执行 `cargo check` / `pnpm run tauri:build`。

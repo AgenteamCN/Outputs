@@ -1,36 +1,32 @@
-# 任务报告：EMQX 通信测试、AX 事件机制确认与 `a2` 分支功能验证
+# Wave 1 Track B — Bug 2 修复报告（`fix/bug-2-replay-nametag-team-sync`）
 
-## 1. 关于 `recentUserActions`（AX 事件）的核查结论
+## 1. 分支与提交状态
+- **基准分支**：`origin/z/agy/rc/multiplayer-recheck`
+- **新建分支**：`fix/bug-2-replay-nametag-team-sync`
+- **本地提交**：`ba6527e` — `fix(replay-sync): sync 3D nameTags and arena.carTeams on client during Replay Watch Together`
+- **推送状态**：`git push -u origin fix/bug-2-replay-nametag-team-sync` 失败（沙箱环境未配置 GitHub 凭据：`fatal: could not read Username for 'https://github.com': terminal prompts disabled`）。本地分支与提交已就绪，需在具备推送权限的环境中执行 `git push -u origin fix/bug-2-replay-nametag-team-sync`。
 
-- **问题回答**：在拉取的基线提交 `9d83956` 中，**还没有改**——`App.tsx` 的 `handleEmqxDecision` 与 `handleSendEmqxChat` 仍会在每次回复或发送聊天时调用 `buildPiggybackTimelineDiff` 附带最多 15 条 `recentUserActions`；刚才通过 EMQX 实测你当前运行的 Mac 端（尚未更新到最新提交）时，点 `Reply Only` 回复 `"1"` 也确实附带了 15 条 `recentUserActions` 和 `droppedUserActions: 79`。
-- **是否必须随附打包**：**不需要**。AX 事件并非协议必需字段，只在 Agent 需要排查界面/操作时才有价值；日常 `Chat` 和 `Reply Only` 附带这些事件只会浪费 Context Window。
+## 2. 根因分析
+1. **3D NameTag 未同步**：`src/game/runtime/devSyncChannelHandlers.ts`（`channel.onGlobalWorkspaceBroadcast`）与 `src/game/runtime/onlineSessionEnvironmentPipeline.ts`（`applyClientRoomActivitySwitch`）在收到 Host 下发的 `replaySync` 时，仅更新了 `useReplayViewerStore` 与 `hudStore`，未调用 `setNameTagRuntimeState({ isMultiplayerOrMultiCarMode, carEntries })`，导致客户端 `VehicleNameTagSystem` 仍使用残留的 Freeplay 机器人名牌状态。
+2. **`arena.carTeams` 阵营错位**：
+   - `src/game/runtime/onlineSessionEnvironmentPipeline.ts` 在 `activityId === 'replay'` 切换分支中未同步 `rs.roster` 到 `physics.setCarTeam` 与 `arena.setCarTeam`。
+   - `src/entities/arena/ArenaVehicleFrameStepper.ts` 在客户端首次惰性创建车辆网格（`!arena.cars[carIndex]`）时，直接使用 `carIndex % 2` 作为 `defaultTeam` 调用 `vr.ensureCar(carIndex, defaultTeam, ...)`，覆盖了此前已通过 `arena.setCarTeam(carIndex, team)` 写入的 `vr.carTeams[carIndex]`（例如 `carIndex = 4` 被 `4 % 2 = 0` 覆盖为蓝队）。
 
-## 2. `a2` 分支最新进展与验证结果（提交 `2e427cb`）
+## 3. 修改内容
+- [src/game/runtime/devSyncChannelHandlers.ts](file:///workspace/RocketCompanion/src/game/runtime/devSyncChannelHandlers.ts)
+  - 引入 `setNameTagRuntimeState`，在收到 `replaySync.roster` 时同步更新 `setNameTagRuntimeState({ isMultiplayerOrMultiCarMode: replaySync.roster.length > 1, carEntries })`。
+- [src/game/runtime/onlineSessionEnvironmentPipeline.ts](file:///workspace/RocketCompanion/src/game/runtime/onlineSessionEnvironmentPipeline.ts)
+  - 引入 `setNameTagRuntimeState`，在 `applyClientRoomActivitySwitch` 的 `activityId === 'replay'` 分支中，将 `rs.roster` 同步到 `ctx.physics?.setCarTeam`、`ctx.arena?.setCarTeam` 与 `setNameTagRuntimeState`。
+- [src/entities/arena/ArenaVehicleFrameStepper.ts](file:///workspace/RocketCompanion/src/entities/arena/ArenaVehicleFrameStepper.ts)
+  - 惰性创建车辆网格时优先读取 `vr.carTeams[carIndex]`，仅在未设置时回退到 `carIndex === 6 ? 0 : carIndex === 7 ? 1 : carIndex % 2`。
 
-在准备提交时，`origin/a2` 已由 Bot 账号更新至 `2e427cb`（`feat(p2p-remote-controller): add per-agent channels, 3-button approvals, and on-demand timeline`），我们已 `git fetch && git reset --hard origin/a2` 并完整验证：
-
-1. **按需发送 AX Timeline（不默认打包）**
-   - `handleSendEmqxChat` 与常规 `handleEmqxDecision` 不再附带 `recentUserActions`。
-   - 仅当 Agent 在指令中显式传入 `includeTimeline: true`（或调用 `get_timeline`）时才会附带或返回 Timeline。
-2. **审批按钮精简为 3 个**
-   - 桌面端（`EmqxBridgePanel.tsx`）与移动端（`PocketDeckView.tsx`）统一为 3 个按钮：`Reply Only`、`Approve` / `Approve with Message`、`Deny` / `Deny with Message`。
-   - 输入框有内容时自动切换为 `Approve with Message` / `Deny with Message`；无输入时保持 `Approve` / `Deny`。
-3. **Per-Agent Channel（多 Agent 分频道路由）**
-   - 主题规则（以 `prefix = agy_p2p_v1` 为例）：
-     - 默认频道：`agy_p2p_v1/chat`、`agy_p2p_v1/cmd/<command>`、`agy_p2p_v1/resp/<requestId>`
-     - 指定频道（如 `repo_b`）：`agy_p2p_v1/chat/repo_b`、`agy_p2p_v1/cmd/repo_b/<command>`、`agy_p2p_v1/resp/repo_b/<requestId>`
-   - UI 支持按频道筛选、切换与回复，各频道互不干扰。
-
-### 工具链与测试验证
-已在沙盒内补齐 `pnpm`（v12.21.0）及 workspace 依赖，并在 `2e427cb` 上执行全量验证：
-- `pnpm --filter p2p-remote-controller test`：**2 个测试文件、11 项测试全部通过**（`logExport.test.ts` 4/4，`emqxBridgeUtils.test.ts` 7/7）。
-- `pnpm --filter p2p-remote-controller check`：`tsc --noEmit` 与 `eslint src` **0 错误**。
-- `pnpm --filter p2p-remote-controller build`：`tsc && vite build` **构建成功**。
-
-## 3. EMQX RPC Worker 收发与长轮询实测
-
-通过 `POST https://agentplayground.maboco-mark.workers.dev/mqtt/rpc` 完成实测：
-- **发送 Chat（`agy_p2p_v1/chat`）**：使用 `publishMessages` 字段发送成功，`connackCode: 0`、`subacked: true`、`pubackedCount: 1`。
-- **发送指令与长轮询监听（`agy_p2p_v1/cmd/ask_user` + `waitMs: 50000, returnOnFirstMessage: true`）**：成功发出 `ask_user` 请求并在 21.17s 收到你通过 `Reply Only` 返回的 `"1"`（`agy_p2p_v1/resp/req_1795078984_test`），双向链路完全正常。
-
-> **下一步建议**：在 Mac 端执行 `git pull` 并重新构建/重启应用（Pocket Deck 点击右上角 **Update**），即可生效上述三项改进。
+## 4. 验证结果
+- **静态检查（`pnpm run check`）**：通过（`radar` 1425/1425 TS 文件 GREEN，`tsc --noEmit` 0 错误）。
+- **Prettier 格式检查**：修改文件已通过 `prettier --write` 格式化。
+- **E2E 复现套件（`pnpm run repro:dev-broadcast-v3`）**：
+  - `bug-2-replay-nametag-and-team-desync`：**PASS_FIXED (`reproduced === false`)**
+    - `host.arenaCarTeams`: `[0, 0, 0, 1, 1, 1]`
+    - `client.arenaCarTeams`: `[0, 0, 0, 1, 1, 1]`
+    - `teamMismatch`: `false`
+    - `tagTextMismatches`: `[]`
+    - `client.tags`: `[{"carIndex":1,"displayText":"Nexto #5"},{"carIndex":0,"displayText":"Nexto #4"},{"carIndex":2,"displayText":"Nexto #6"}]`

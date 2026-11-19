@@ -1,25 +1,22 @@
-# RocketCompanion Multi-Issue Reproduction Clues (Preliminary)
+# Interim Reproduction Clues (RocketCompanion `z/agy/rc/multiplayer-recheck` @ `dad6dee`)
 
-Base branch: `origin/z/agy/rc/multiplayer-recheck` (`dad6dee`)
+1. **Issue 1 — Goal Replay enters on Client but has no dynamics (static), then syncs on exit**:
+   - In `src/game/pipeline/stages/SimulationStage.ts`, `stepNetworkReconciliationAndReplayStream` is gated by `!flags.isLocalDirectorPreview` (`activeMode?.directorPreview?.isReplayActive`). During Freeplay Goal Replay on Host, `directorPreview.isReplayActive` becomes `true`, so `server.update()` is skipped completely.
+   - Additionally, `HostBroadcastPublisher.publishIfReady` receives `isPaused: flags.shouldHoldAccumulator` (`true` during `isGoalReplay`), and `tickCount` on Host stays frozen.
+   - Observed in Headless Chrome: Client enters `phase: "replay"`, `camMode: "director"`, `override: true`, while Client ball position stays frozen at `(0, 0, 93)` with `bufFrames: 1`.
 
-## Issue 1: Go Replay enters normally on Client, but has no dynamics (static) until exit
-- **Reproduced live**: Scored goal in Freeplay Dev Sync Room; Client entered `matchPhase === "replay"` (`tlActive: true`), but across 8 samples (1.2s), Client `ballPos` stayed frozen at `[0, 0, 93]`, `spectateInterpolationBuffer` stayed at `bufferedFrames: 1, latestHostTick: 8907`, `snappedSamples` climbed 21->108, and `replayTimelineController` had `tlFrames: 0`.
-- **Root Cause**:
-  1. In `src/game/pipeline/stages/simulationFrameClassifierPipeline.ts`, `isGoalReplay` sets `shouldHoldAccumulator = true`.
-  2. In `src/game/pipeline/stages/SimulationStage.ts`, `this.broadcastPublisher.publishIfReady` receives `isPaused: flags.shouldHoldAccumulator || flags.isReplayPaused || isSpectatePlaybackPaused()` (`true` during Goal Replay).
-  3. In `src/replay/ReplayFrameInterpolator.ts`, `applyReplayFrameToEngine` calls `targetPort.restoreState(frameBuffer, { preserveEngineTick: true })`, so `physics.getHeaderView().tickCount` never advances during Goal Replay.
-  4. In `src/game/pipeline/stages/HostBroadcastPublisher.ts`, `isPaused && !tickChangedWhilePaused` returns `false`, so Host sends **zero** state snapshots during Goal Replay.
-  5. Additionally, on Client, `src/game/pipeline/stages/simulationNetworkReconcilePipeline.ts` enters `if (isPureCsrSpectate && !reconciler.replayPlaybackMode && spectateInterpolationBuffer)` and skips the `else if` branch where `replayTimelineController.appendStreamedReplayFrame(...)` is called.
+2. **Issue 2 — Replay Watch Together: UI roster syncs, but 3D NameTags & `arena.carTeams` do not**:
+   - `src/game/runtime/devSyncChannelHandlers.ts` updates `useReplayViewerStore.resolvedRoster` (UI), but never calls `setNameTagRuntimeState({ isMultiplayerOrMultiCarMode: true, carEntries })` and never updates `arena.carTeams` on Client.
+   - Observed in Headless Chrome with `rc-replay-3v3-1-0-2026-11-13T07-26-58.rcreplay`: Host has `arenaCarTeams: [0,0,0,1,1,1]`, whereas Client has `arenaCarTeams: [0,0,0,1,0,1,0,1]` and missing/unsynced `nameTagSystem` entries.
 
-## Issue 2: Replay Watch Together syncs UI (scoreboard/roster) but not internal 3D NameTags
-- **Root Cause**: `src/game/runtime/devSyncChannelHandlers.ts` and `src/game/runtime/onlineSessionEnvironmentPipeline.ts` update `replayViewerStore` and `hudStore`, but never call `setNameTagRuntimeState({ isMultiplayerOrMultiCarMode, carEntries })` on the Client. Thus `VehicleNameTagSystem` (`shouldShowVehicleNameTags`) keeps `root.visible = false` or stale entries.
+3. **Issue 3 — Choppy/stuttery motion (state-only updates, no deterministic physics lookahead)**:
+   - Observed in Headless Chrome: Client `physics.getHeaderView().tickCount` stays frozen (`528`), ball position repeats identically for 3 consecutive `requestAnimationFrame` ticks (`1095.6, -2944.5`) and then jumps ~1400 uu in a single frame (`189.8, -4015.6` -> `-714.2, -5000.8`).
 
-## Issue 3: Choppy/stuttery motion & state-only broadcast without deterministic buffer-ahead physics
-- **Observation**: Client `SpectateInterpolationBuffer` only interpolates raw 60Hz snapshots (`snappedSamples` spikes whenever jitter exceeds `interpDelayTicks`, and `SimulationStage` calls `interpolator.sync(timestamp)` on `isPureCsrClient`), with no deterministic physics simulation over a lookahead buffer (e.g. >=5 frames).
+4. **Issue 4 — BoostPad Model flickering/jittering violently**:
+   - Observed in Headless Chrome: `BoostPad` `pad.full.visible` flipped 27 times across 30 frames (e.g., pads 11 and 28 flipped 4 times each).
+   - Root cause observed on pad 11: `bufferCooldown` jumped `4 -> 1.91 -> 4 -> 3.12`, triggering `respawnedAndCollected` (`bufferCooldown > prevBufferCd + 0.5`) in `BoostPadSystem.update()`, which repeatedly re-triggered `startCollectAnimation(11)` and toggled `pad.full.visible`.
 
-## Issue 4: BoostPad Model state flickering/jittering every frame
-- **Reproduced live**: Over 20 `requestAnimationFrame` frames during Replay Watch Together, `Host` recorded 17 `pad.full.visible` flips and `Client` recorded 22 `pad.full.visible` flips (e.g. `pad1` flipped `full1: false -> true` while `act1` remained `0`).
-
-## Issue 5: High memory usage (~1.6GB immediate allocation, ~4.38GB Web Content, not released on close)
-- **Root Cause (Tauri close-not-releasing)**: `src-tauri/src/lib.rs` intercepts `WindowEvent::CloseRequested` with `api.prevent_close(); window.hide();` (close-to-tray), keeping the entire WebView + Three.js + WASM + Workers resident until Quit.
-- **Boot memory breakdown**: Measured immediately after boot in headless Chrome: JS heap `161 MB / 175 MB`, WASM `HEAPU8` `259 MB` (plus `AuthoritativeServerWorker` / `BotInferenceWorker` / WebGL render targets & textures).
+5. **Issue 5 — High Memory Usage & Memory Not Released on Close**:
+   - `RocketSimArenaBarrierController.ts` / `onlineSessionEnvironmentPipeline.ts` allocate the 256MB C++ WASM Replay Buffer at startup (`1_BOOT`: `jsUsedMB: 161`, `wasmMB: 259`).
+   - Loading `.rcreplay` increases `wasmMB` to `310` (+51 MB), `jsUsedMB` to `248` (+87 MB), `geometries` to `57` (+17). Exiting back to Freeplay leaves `wasmMB: 310`, `jsUsedMB: 212`, `geometries: 61` (not freed).
+   - In `src-tauri/src/lib.rs`, `WindowEvent::CloseRequested` calls `api.prevent_close(); window.hide();`, so closing the Tauri window never destroys the WebView or releases memory until Quit.

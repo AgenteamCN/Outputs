@@ -1,41 +1,40 @@
-# Wave 0 Arch-0C 完成报告：资源生命周期总线（RuntimeResourceRegistry）
+# Batch A Branch 3 (`fix/agy-layers-and-baseline`) 完成报告
 
-- **目标仓库**: `Antigravi-ty/RocketCompanion`
-- **基线分支**: `origin/z/agy/rc/multiplayer-recheck` (`d69e01c`)
-- **新建分支**: `z/agy/rc/wave0-arch-0c`
-- **已验证签名提交**: [`fa35923`](https://github.com/Antigravi-ty/RocketCompanion/commit/fa35923049c8506b921898236977b924629d58a8) (`signature.isValid: true`, `state: VALID`)
+## 1. 分支与提交信息
+- **仓库**: `Antigravi-ty/agyPreviewInstant`
+- **基线分支**: `origin/a2` (`c3f9e15`)
+- **目标分支**: `fix/agy-layers-and-baseline`
+- **Verified Bot Commit**: `c5637a2d397d9a17e7064ceb5164763d123ed7d5` (`signature.isValid: true`, `state: "VALID"`, 含 `Co-authored-by: Mark <29165094+MaBoCoMark@users.noreply.github.com>`)
+- **Commit URL**: https://github.com/Antigravi-ty/agyPreviewInstant/commit/c5637a2d397d9a17e7064ceb5164763d123ed7d5
 
----
+## 2. 完成内容
 
-## 一、核心改动
+### (1) 解除 AGY 主端 4 处 `utils -> services/stores` 单向依赖违规
+- **`src/utils/rawPromptCopy.ts`** (消除 L1→L2 `tauriBackendClient.ts` 依赖):
+  - 新增 `GithubAuthBlockProvider` 接口，将 `getCachedAuthBlock` 与 `fetchAuthBlock` 改为通过 `copyRawTaskPrompt(..., authProvider?)` 参数注入。
+  - 更新调用方 `src/components/composer/ComposerActionBar.tsx` 传入 `tauriBackendClient` 的读写函数。
+- **`src/utils/taskExportHydrator.ts`** (消除 L1→L3 `environmentStore.ts`、`taskStore.ts`、`telemetryStore.ts` 依赖):
+  - 新增 `TaskExportEnvironmentSnapshot` 与 `TaskExportHydrationDeps` 接口，将 `hydrateTasksAndEnvironmentsForExport(targetTasks, deps)` 改造为纯依赖注入管道，同时将探针失败的空 `catch` 改为 `console.warn` 日志输出。
+  - 更新 5 处组件调用方注入 store 快照与动作：
+    - `src/components/layout/TaskHistorySidebar.tsx`
+    - `src/components/inspector/StepExecutionTimeline.tsx`
+    - `src/components/settings/sections/advanced/SimplifiedWorkflowExportCard.tsx`
+    - `src/components/inspector/TaskOverviewFooterActions.tsx`
+    - `src/components/settings/sections/advanced/EmqxDiagnosticsExportCard.tsx`
 
-1. **新建统一资源生命周期总线**
-   - `src/game/runtime/RuntimeResourceRegistry.ts`
-   - 定义 `RuntimeResourceScope = 'session' | 'replay' | 'ai'` 与 `RuntimeDisposableResource` 接口（`id`, `scope`, `dispose()`）。
-   - 提供 `RuntimeResourceRegistry` 类与全局单例 `runtimeResourceRegistry`，支持 `register`、`unregister`、`has`、`getRegisteredIds`、`disposeScope`、`disposeScopes`、`disposeAll`（同步资源立即释放，异步资源如 WASM 内存回收自动 `Promise.all` 等待）。
+### (2) 修复雷达基线长行违规
+- **`src/utils/githubAuthBlock.ts:9`**:
+  - 将 423 字符的 `DEFAULT_GITHUB_COMMIT_REQUIRED_INSTRUCTION_BODY` 第 2 条指令拆分为多行字符串拼接，运行时内容保持完全一致，消除 `[LINE LENGTH OVERFLOW]` 告警。
 
-2. **清理全库 UnscopedCaches（`radar:audit` 指标 `3 -> 0`）并接入总线**
-   - `src/ai/experimental/SafeTensorsLoader.ts`：新增 `clearSafeTensorsModelCache()`，注册为 `ai:safetensors-model-cache`（`scope: 'ai'`）。
-   - `src/ai/experimental/wasmSimdMatVec.ts`：新增 `resetWasmSimdMatVec()`，重置 `sWasmMem` / `sWasmMatVec` / `sF32View` / `sWeightPtrMap` / `sPendingTensors` / `sInitPromise`，注册为 `ai:wasm-simd-matvec`（`scope: 'ai'`）。
-   - `src/entities/vehicle/vehiclePaintMaterial.ts`：新增 `clearVehiclePaintMaterialCaches()`，清空 `customToonRampCache` / `carPaintCache` / `activeAnodizedMaterials` 并注册为 `entities:vehicle-paint-material-cache`（`scope: 'session'`）；同时注册 `three:global-cache`（`THREE.Cache.clear()`，`scope: 'replay'`）。
-   - `src/replay/ReplayDirectorCsvParser.ts`：将静态表头集合 `STRING_CSV_HEADERS` 显式标注为 `ReadonlySet<string>`。
+### (3) 核查并清理孤立模块
+- **`src/utils/draftRegexEngine.ts`**:
+  - 全仓检索确认 0 处引用，且其全部导出函数均已存在于 `src/utils/draftRegexDuplicate.ts` 中，属于重复遗留死代码，已删除。
 
-3. **统一退出回收入口（接入 `0bc5c69` 已有释放能力）**
-   - `src/game/modes/freeplay/freeplayKickoffAndArenaResetPipeline.ts`：
-     - 新增 `registerFreeplayRuntimeResources(...)`，集中注册 `freeplay:replay-ring-buffer`、`physics:wasm-replay-buffer`（`clearReplayBuffer` + `reclaimWasmMemoryIfGrown`）、`renderer:render-lists`（`renderLists.dispose()`）至 `scope: 'replay'`。
-     - 在 `applyCleanFreeplaySubsystemsReset(...)` 末尾统一调用 `runtimeResourceRegistry.disposeScope('replay')`。
-   - `src/game/modes/freeplay/FreeplayGoalAndTouchSubController.ts`：在 `attach()` 时调用 `registerFreeplayRuntimeResources(...)`。
-   - `src/game/modes/FreeplayMode.ts`：移除 `resetToCleanFreeplay()` 中重复分散的内联清理调用，并保持文件体积控制在 `17.9 KB`（低于 `18.0 KB` 硬上限）。
-   - `src/game/runtime/MatchModeTransitionBridge.ts`：在 `returnToFreeplay()` 中统一触发 `runtimeResourceRegistry.disposeScopes(['replay', 'ai', 'session'])`。
-
----
-
-## 二、验证结果
-
-| 检查项 | 结果 | 关键输出 |
-| --- | --- | --- |
-| `pnpm run check` (`radar` + `tsc --noEmit`) | **PASS** | `1426/1426` TS，`0 Circular Deps`，`0 Upward Imports`，`UnscopedCaches=0` |
-| `pnpm run radar:audit` | **PASS** | `[C]` 未托管缓存降为 `0`（原 `3`） |
-| `pnpm run test:multiplayer-suite` | **PASS** | `24/24` 全部通过 |
-| `pnpm run build` (`vite build`) | **PASS** | 打包退出码 `0` |
-| `RuntimeResourceRegistry` + `SafeTensorsLoader` Node 实测 | **PASS** | `disposeScope('ai')` 后 `getCachedSafeTensors('test-model') === null` |
+## 3. 验证结果
+- **工具链**: 已安装 `pnpm@12.21.0` 并完成 `pnpm install --frozen-lockfile` 与 `node scripts/syncPrivateProfile.mjs`。
+- **`pnpm check`** (`tsc --noEmit && pnpm lint && pnpm test`): **通过 (exit 0)** — TypeScript 编译、ESLint 检查与 2 个测试文件（16 tests）全部通过。
+- **`pnpm radar --skip-tsc --audit`**:
+  - `LayerViolations`: `5` → **`1`**（AGY 侧清零，仅剩 P2P 侧 `apps/p2p-remote-controller/src/types/emqxBridge.ts`，属 Branch 1 范围）。
+  - `Orphans`: `1` → **`0`**。
+  - `SilentCatches`: `66+60` → **`65+60`**。
+  - `githubAuthBlock.ts:9` 长行告警已消除（仅剩 P2P 侧 3 项基线违规，属 Branch 1 范围）。

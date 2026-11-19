@@ -1,28 +1,35 @@
-# Wave 1 Track A-1 Report: Fix Bug 1 (Goal Replay Client Static Without Dynamics)
+# Session Summary (agyPreviewInstant / branch `a2`)
 
-## Branch & Commit
-- **Base branch**: `origin/z/agy/rc/multiplayer-recheck`
-- **Created branch**: `fix/bug-1-goal-replay-client-dynamics`
-- **Commit**: `05c528e` — `fix(multiplayer): stream Goal Replay frames and drive client replay timeline (Bug 1)`
-- **Push status**: Local commit created; `git push -u origin fix/bug-1-goal-replay-client-dynamics` could not complete in this sandbox because no GitHub credentials/token are configured (`fatal: could not read Username for 'https://github.com': terminal prompts disabled`).
+## Completed & Committed (`135f3bb`)
 
-## Root Cause & Changes
-1. **`src/game/pipeline/stages/SimulationStage.ts`**
-   - During `flags.isGoalReplay`, `flags.shouldHoldAccumulator` is `true`, which previously caused `isPaused` to be passed as `true` to `HostBroadcastPublisher.publishIfReady(...)`.
-   - Updated `isHostBroadcastPaused` to exclude `flags.isGoalReplay` (`(flags.shouldHoldAccumulator && !flags.isGoalReplay) || flags.isReplayPaused || isSpectatePlaybackPaused()`) and passed `isGoalReplay: flags.isGoalReplay` to `publishIfReady(...)`.
+Verified bot commit pushed to `Antigravi-ty/agyPreviewInstant` (`a2`):
+- **Commit**: `135f3bb2a2a025e126dd3a73c47eb66c6a9d9de3` (`signature.isValid: true, state: "VALID"`)
+- **Message**: `fix(p2p-remote-controller): block play.google.com trackers, extract v1_ IDs, and auto-poll Network tab`
 
-2. **`src/game/pipeline/stages/HostBroadcastPublisher.ts`**
-   - Added `isGoalReplay?: boolean` to `publishIfReady(...)`.
-   - Because `applyReplayFrameToEngine(...)` restores historical frames with `{ preserveEngineTick: true }`, `physics.getHeaderView().tickCount` and `snap[0]` remain constant during Goal Replay.
-   - When `isGoalReplay && !isPaused`, `publishIfReady` now advances `publishTick` monotonically (`Math.max(currentTick, this.lastPublishedTick + tickStep)`) and writes `snap[0] = publishTick` before calling `server.pushBroadcastSnapshot(snap, publishTick, acknowledgedControls)`, allowing both Host broadcast and Client `SpectateInterpolationBuffer` / `ReplayTimelineController` to ingest consecutive Goal Replay frames.
+### 1. Block `play.google.com` Tracker Requests Before Sending
+- **File**: `apps/p2p-remote-controller/src/services/networkRecorderScript.ts`
+- Added `isBlockedUrl(url)` matching `^https?:\/\/([^/]+\.)?play\.google\.com(\/|$|\?)`.
+- In `window.fetch`: immediately rejects with `Promise.reject(new TypeError(...))` without calling `origFetch` or recording into `entries`.
+- In `XMLHttpRequest.prototype.send`: immediately aborts without calling `origSend`, dispatching `error` and `loadend` events asynchronously.
+- In `navigator.sendBeacon`: returns `false` without sending.
 
-3. **`src/game/pipeline/stages/simulationNetworkReconcilePipeline.ts`**
-   - In the `isPureCsrSpectate && !reconciler.replayPlaybackMode && spectateInterpolationBuffer` branch, when `flags.isGoalReplay && replayTimelineController` is active, drained packets now also initialize `replayTimelineController.beginReplaySession(...)` (if not active) and call `replayTimelineController.appendStreamedReplayFrame(...)` alongside `spectateInterpolationBuffer.pushFrame(...)`.
+### 2. Direct `v1_` Interaction ID Extraction
+- **File**: `apps/p2p-remote-controller/src/services/networkRecorderScript.ts`
+- Updated `scanForInteractions` to extract `\b(v1_[a-zA-Z0-9_-]{20,})\b` directly (capturing IDs from `CreateInteraction` responses and `GetInteractionStream` requests) and normalized `CreatePrompt` prompt IDs (`prompts/...`).
+- `clients6` XHR responses (such as `CreateInteraction` 429 `"Project environment storage quota exceeded."` and 200 responses) are captured via `xhr.responseText` in `syncXhrBody`.
+
+### 3. Auto-Polling on Network Tab
+- **File**: `apps/p2p-remote-controller/src/App.tsx`
+- Added `silent` mode + `netPollInFlightRef` guard to `handlePollNetRecorder` so background polling does not toggle `busy` or spam timeline events.
+- Added a `useEffect` that silently polls `handlePollNetRecorder(false, true)` every `2000ms` while `rightTab === "network"`, `netRecording === true`, `selectedWindowId !== null`, and Safari is running.
 
 ## Verification
-- **`pnpm exec prettier --check`**: Passed on all 3 modified files.
-- **`pnpm run check`** (`radar` + `tsc --noEmit`): Passed (`STATUS: GREEN -- 100% TS, tsc --noEmit clean, hard boundaries & volume caps verified`).
-- **`pnpm run repro:dev-broadcast-v3`**:
-  - Client `spectateInterpolationBuffer` `bufferedFrames` now grows during Goal Replay (`12 -> 22 -> 31 -> 40 -> 46 -> 52`, and `64` in extended sampling) instead of staying stuck at `1`.
-  - Client `replayTimelineController.sessionState.isActive` is `true` with `activeFrames` growing (`24 -> 37 -> 43 -> 45 -> 81`), and on Goal Replay exit (`skipGoalReplay()`), `override` returns to `false` and `camMode` returns to `"pov"`.
-  - **Note on `distinctBallPositions` in `runDevBroadcastReproV3.mjs`**: In `runDevBroadcastReproV3.mjs`, the Host sits idle at `[0, 0, 93.2]` while the Client boots/joins, so `extractGoalReplayFrames` (`lookbackSeconds: 10.0`) captures ~1,150 idle frames at `[0, 0, 93.2]` before the `setBallState` goal shot (`totalFrames: 1351, firstMoved: 1151`). Because `runDevBroadcastReproV3.mjs` samples 6 × 200ms (`1.2s`) immediately at the start of Goal Replay, both Host and Client are still in the `[0, 0, 93.2]` kickoff-idle prefix of the replay (`distinctBallPositions: 1` in that 1.2s window).
+- `pnpm exec tsc --noEmit` in `apps/p2p-remote-controller`: passed (exit code 0).
+- `pnpm test` in `apps/p2p-remote-controller`: 2 test files, 11 tests passed.
+- Verified `buildNetworkRecorderInstallScript` and `buildNetworkRecorderPollScript` output parses cleanly with `new Function(...)`.
+
+## Pending (Waiting for Interactive Session / Fresh Page)
+- **`aiStudioInit.ts` (`Link API key` & `Failed to verify Domain field value is '*'`)**:
+  - `Link API key` currently only detects the button without clicking/selecting a key in the modal.
+  - `Domain` field uses `AXRaise` + `set_value` without `focus` or DOM `input`/`change` event fallback.
+  - Sent questions on EMQX (`agy_p2p_v1/chat`) and waited 3 consecutive ~45s rounds with no reply, so these two items are left untouched for interactive debugging on a fresh AI Studio page.

@@ -1,19 +1,27 @@
-# RocketCompanion `feat/e2e-env-bootstrap` 推送与 Rust/Tauri C4 验证完成报告
+# Wave 2 B-Track（Bug 3 / 2-B）完成报告
 
-## 1. Verified Bot Commits 已推送至 `origin/feat/e2e-env-bootstrap`
+- **分支**：`z/agy/rc/multiplayer-recheck`
+- **基线 Commit**：`1114df1`
+- **已合入 Verified Bot Commit**：[`4ec70dc6efce64790c2f560b20580ffd1c2c695f`](https://github.com/Antigravi-ty/RocketCompanion/commit/4ec70dc6efce64790c2f560b20580ffd1c2c695f)（`signature.isValid = true, state = VALID`）
 
-基于 `origin/z/agy/rc/multiplayer-recheck` (`2565774`)，通过 GitHub GraphQL `createCommitOnBranch`（GPG `verified: true`、`Co-authored-by: Mark <29165094+MaBoCoMark@users.noreply.github.com>`）推送了 2 个已签名提交：
+## 1. 实现内容
 
-1. `7269d90b579c4799b419a0ac6f2e5d8a920a034a` (`fix(e2e): bypass proxy for headless Chrome WebGL2 and add scripts/env bootstrap`)
-   - 解决容器代理劫持 `127.0.0.1` 导致 Chrome 卡死在 `chrome-error://chromewebdata/` 的问题（统一注入 `--no-proxy-server`）。
-   - 新增 `scripts/env/` 环境引导与诊断工具（`pnpm run env:check`、`pnpm run env:setup`、合成 3v3 `.rcreplay` 夹具、预检提示与 `cleanupHeadlessChrome` 安全清理）。
-2. `bf1f4a68e900a277c8ce6157edfd08cf18c11d70` (`feat(env): add Rust/Tauri C toolchain bootstrap and checkEnv probe`)
-   - 在 `scripts/env/bootstrap.sh`（及 `package.json` 的 `pnpm run env:setup:rust`）补齐 Rust（`rustup` minimal）+ Linux Tauri C 构建依赖（`gcc`、`libc6-dev`、`pkg-config`、`libwebkit2gtk-4.1-dev`、`libgtk-3-dev`、`librsvg2-dev`、`libssl-dev`）的一键安装。
-   - 更新 `scripts/env/checkEnv.mjs` 检测 `$HOME/.cargo/bin` 下的 `cargo`/`rustc` 及 `cc`。
+1. **策略表开启前瞻（`src/game/pipeline/stages/simulationFrameClassifierPipeline.ts`）**
+   - 在 `classifySimulationDrivePolicy` 的 `client-csr-spectate` 分支中，仅当未处于暂停/结束/Goal Replay/冻结状态时开启 `shouldRunLookahead: true`。
+2. **本地 WASM 物理前瞻与平滑收敛（`src/game/pipeline/stages/spectatePhysicsLookaheadPipeline.ts` & `src/game/pipeline/stages/simulationNetworkReconcilePipeline.ts`）**
+   - 仅依赖 `SpectateInterpolationBuffer` 现有契约（`sample()`、`isDuplicateFrame`、`renderTick`），无跨轨道冲突。
+   - **正常插值帧（`!sampled.isDuplicateFrame`）**：同步更新 `physics` 与 `interpolator` 状态，并保证 `SIM_OFFSETS.TICK` 单调跟随 `sampled.renderTick` 推进（避免 `preserveEngineTick: true` 导致客户端 `tickCount` 冻结）。
+   - **重复帧 / 缓冲预热（`sampled === null || sampled.isDuplicateFrame`）**：在 `policy.shouldRunLookahead === true` 且已收到首帧后，注入最近 `acknowledgedControls` 并按 120Hz 步进本地 WASM 物理（`physics.step(1)`，上限 30 ticks），同步更新 `interpolator.prevState` / `currState` 与单调 `tickCount`。
+   - **前瞻恢复收敛**：当非重复帧恢复到达时，若球体位移差在阈值内（`<= 900uu`），通过 `interpolateReplaySnapshots(..., 0.45)` 平滑收敛回权威插值快照；超出阈值（如重置/传球瞬移）则立即对齐。
+   - 为严格满足 Radar 单文件体量（`<= 18KB`）与布尔复杂度门禁（`<= 15`），将纯前瞻状态机抽离至 `src/game/pipeline/stages/spectatePhysicsLookaheadPipeline.ts`。
+3. **单元测试（`scripts/runMultiplayerSuiteTests.ts`）**
+   - 新增第 26 项测试 `client-csr-spectate Physics Lookahead & Convergence (Bug 3 / B-Track)`，覆盖策略开关、重复帧触发 `physics.step` 与 `setCarControls`、以及恢复后的平滑收敛。
 
-## 2. Rust / Tauri (C4 `src-tauri/src/lib.rs`) 实测结果
+## 2. 验证结果
 
-- `bash scripts/env/bootstrap.sh --with-rust`：成功安装 `rustc 1.100.0` / `cargo 1.100.0` 及系统 C/WebKit2GTK 开发依赖。
-- `cargo check --manifest-path src-tauri/Cargo.toml`：**PASS (EXIT=0)**，`rc_tauri_shell` 编译检查通过（`Finished dev profile in 0.54s`）。
-- `pnpm run env:check`：全项 `[OK]`（Node.js、pnpm、`node_modules`、`public/` submodule、Chrome、Headless WebGL2、3v3 `.rcreplay`、Proxy bypass、Rust/Tauri `cargo 1.100.0 + cc`）。
-- `pnpm run check`：**PASS (GREEN)**。
+- **工具链**：全局安装 `pnpm@12.21.0`，完成 `pnpm install --no-frozen-lockfile --ignore-scripts`。
+- **`pnpm run check`**（Radar + `tsc --noEmit`）：**PASS (GREEN)**（1429/1429 TS 文件，0 循环依赖，0 未托管缓存，`BoolHotspots=7`）。
+- **`pnpm run radar:audit`**：**PASS (GREEN)**。
+- **`pnpm run test:multiplayer-suite`**：**PASS (26/26)**。
+- **`npx prettier --check`**：修改文件全部格式合规。
+- **环境限制**：`pnpm run repro:dev-broadcast-v3` 需具备 GPU/WebGL 渲染能力的 Runner 在与 A-Track 合入后统一执行完整端到端验收。

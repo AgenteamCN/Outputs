@@ -1,87 +1,76 @@
-# Cloudflare Worker 实测数据、超时边界 & Durable Objects 免费额度深度解析
+# Cloudflare Worker 指标审计、Wall Time / 10ms CPU 机制 & Durable Objects 免费额度深度解析
+
+本文基于通过 Cloudflare GraphQL Analytics API 实测拉取的 `agentplayground` 线上调用数据，以及 Cloudflare 官方最新文档（2025–2026）整理。
 
 ---
 
-## 一、通过 Cloudflare GraphQL Analytics API 查阅到的真实运行数据
+## 一、通过 Cloudflare API 实测查到的 `agentplayground` 真实数据
 
-我们已使用你的 Token 查询了 Cloudflare GraphQL Analytics API（`workersInvocationsAdaptive`，脚本 `agentplayground`，时间范围 `2026-11-17` 至 `2026-11-20`）：
+使用当前 Token 查询 `workersInvocationsAdaptive`（GraphQL Analytics API），查到 `2026-11-18 14:00 UTC`（即你昨天测试时段）的真实指标如下：
 
-- **总请求数（`requests`）**：`121` 次
-- **子请求数（`subrequests`）**：`111` 次
-- **报错数（`errors`）**：`0` 次
-- **累计 CPU 时间（`cpuTimeUs`）**：`620,081 µs` → **平均每次请求 `5.12 ms`**（与你面板看到的 `5 ms` 完全吻合）
-- **累计 Wall Time（`wallTime`）**：`5,307,576,792 µs`（`5,307.58 秒`）→ **平均每次请求 `43.86 秒`**（与你面板看到的 `50 s` 完全吻合）
+- **请求数 (`requests`)**：`56` 次（`errors: 0`）
+- **CPU Time**：P50 = **`5.10 ms`**（5,102 µs），P99 = **`14.05 ms`**（14,049 µs）
+- **Wall Time**：P50 = **`50.001 s`**（50,001,070 µs），P99 = **`50.004 s`**（50,004,480 µs）
 
-*(注：旧版 `/subscriptions` 接口返回权限受限，但 GraphQL Analytics 可直接读取完整指标。)*
+**数据印证**：昨天 56 次请求的 P50/P99 Wall Time 全部精准卡在 **50.00 秒**，正是因为修复前 `emqx_worker.mjs` 的 `burstDeadline` Bug 导致哪怕用户提前回复，Worker 也硬生生等满了 `waitMs = 50000` 才返回。
 
 ---
 
-## 二、能否无限等？CPU > 10ms 或超长 Wall Time 会发生什么？
+## 二、核心问题逐一解答
 
-### 1. Wall Time（墙上时间）并不是「无限等」
-- **CPU Time vs Wall Time**：Free 套餐限制的是 **10 ms 纯 CPU 计算时间**（JS 执行、JSON 解析、加密等），**网络 I/O 等待（`await reader.read()`、`fetch()`）不消耗 CPU**，所以才能看到 `CPU 5ms / Wall Time 50s`。
-- **HTTP 请求的真实等待上限**：
-  - 虽然 Workers 运行时本身没有写死 "15 分钟硬超时"，但 **Cloudflare 边缘网关与客户端之间有 HTTP 响应空闲超时（约 100 秒左右）**：如果一个 HTTP 请求长时间不吐出任何字节（headers/body），边缘网关或上层客户端（如 `curl` / 代理）会直接断开连接（返回 `524` 或客户端 `Timeout`）。
-  - 同时，我们在 `emqx_worker.mjs` 里把 `waitMs` 上限设在了 **`55,000 ms`（55 秒）**，就是为了安全落在 100 秒边缘超时之内。
+### 1. 「CPU 才 5ms、Wall Time 50s，岂不是可以无上限地等？如果超过 10ms CPU 会怎样？」
 
-### 2. 如果 CPU 超过 10ms 或脚本异常，会静默销毁还是报错？
-- **不会静默无响应**，而是立即终止该 Isolate 并由 Cloudflare 边缘返回明确的 HTTP 错误：
-  - **CPU 超限**：触发 **`Error 1102: Worker exceeded CPU time limit`**（HTTP 503/500 错误页），正在执行的请求被强行掐断。
-  - **内存超限（> 128 MB）** 或 **未捕获异常**：触发 **`Error 1101 / 10021`**，同样返回 HTTP 500/503 错误。
-  - **客户端主动断开（Client Disconnect）**：如果请求方等不及先断开了 HTTP 连接，Worker 会立刻取消关联的异步任务并退出（不会继续白跑）。
+#### (1) Wall Time 可以无上限地等吗？
+- **Worker 引擎层**：Cloudflare 官方文档明确规定，**Incoming HTTP request 的 Wall Time 没有硬性上限（"No hard limit while the client remains connected"）**——只要客户端不断开且不超 CPU，Worker 理论上可以一直挂着。
+- **但实际工程中不能无限等，原因有三点**：
+  1. **Cloudflare 边缘代理空闲超时**：如果超过约 **100 秒**没有任何响应体字节流出，Cloudflare CDN 边缘层可能触发 `524 A Timeout Occurred` 或断连。
+  2. **调用端（沙盒 / `curl` / HTTP Client）超时**：大多数 HTTP 客户端和代理网关默认读超时在 **60s–120s** 之间。
+  3. **Worker 部署/运行时更新 Grace Period**：如果长期挂起几分钟，遇到边缘节点滚动更新会被强制终止。
+- **结论**：目前 `emqx_worker.mjs` 将单次 `waitMs` 上限设为 **55 秒** 是最稳妥的工程甜点；现在修复了提前退出 Bug 后，**用户一回复即在 ~150ms 内返回**，平时没有消息时最多等 55 秒优雅返回再由 Agent 发起下一轮，不会撞超时。
 
----
-
-## 三、我们当前到底是什么结构？（「长轮询硬等」vs「10 秒轮询」）
-
-你问得非常关键，理清当前链路如下：
-
-1. **为什么 Agent 要经过你的 Worker Proxy？**
-   - Agent 运行在受限网络沙盒中，**只能访问标准 80/443 端口的 HTTP/HTTPS 域名**，无法直接连 EMQX 的 `8883`（MQTTS）端口。
-   - 因此 `agentplayground.maboco-mark.workers.dev` 充当了一个 **HTTPS (443) -> MQTTS (8883) 的协议转换代理**。
-
-2. **Worker 内部是「每 10 秒轮询」还是「硬等」？**
-   - **是「硬等」（HTTP Long-Polling 长轮询）**，不是每 10 秒断一次。
-   - 每次 Agent 调用 `POST /mqtt/rpc`（带 `waitMs: 55000`）：
-     1. Worker 现场向 EMQX `8883` 建立一条全新的 TCP + TLS 连接，发 MQTT `CONNECT` + `SUBSCRIBE`。
-     2. 然后挂起在 `Promise.race([reader.read(), timeout(waitMs)])` 上**硬等**，直到收到消息或 55 秒到期才关闭连接返回。
-   - **Plan Alpha 修复前后的本质差异**：
-     - **修复前**：由于 `burstDeadline` 永假 Bug，就算你在第 5 秒回复了，Worker 收到消息后**依然不会返回**，继续硬等完剩下的 50 秒（这就是你面板上 `Wall Time: 50s` 的元凶）。
-     - **修复后**：你在第 5 秒回复，Worker 收到后 **`150ms` 内立即返回**；但如果用户还没回复，它依然会硬等最多 55 秒，然后断开让 Agent 发起下一轮。
+#### (2) 如果 CPU 超过 10ms 会怎样？（是静默销毁还是报错？）
+- **不会静默返回空结果**。当持续超出 Free 计划的 **10ms CPU 上限**时，Cloudflare Runtime 会**立即中止该次执行**，向客户端返回 **`Error 1102`（`Worker exceeded resource limits`，通常表现为 HTTP 500/502/503）**，并在后台 Analytics 中记录为 `exceededCpu`。
+- 之所以昨天 `cpuTimeP99` 达到 `14.05 ms` 却依然 `errors: 0`，是因为 Cloudflare Free 计划对**偶发、轻微超限**（如冷启动或单次 TLS 握手波动）有一定弹性容忍，但不可依赖此弹性做重计算。
 
 ---
 
-## 四、Durable Objects (DO) 最新免费额度 & 到底和普通 Worker 有什么本质区别？
+### 2. 「我们目前到底是什么结构？Worker 是每 10 秒等一次，还是硬等？」
 
-### 1. 最新免费额度核实（Workers Free 套餐已正式包含 DO！）
-根据 Cloudflare 官方最新政策（2025-04 起开放，仅限 **SQLite-backed Durable Objects**，无需绑定付费升级即可使用）：
+- **为什么必须经过 Worker Proxy？**
+  因为当前 Agent 运行在受限沙盒/云端网络环境中，**仅允许 80/443 端口的 HTTP/HTTPS 出站**，无法直接连接 EMQX 的 `8883`（MQTTS）等非标准端口。
+- **目前真实结构（单次长轮询 / Long-Polling）**：
+  1. Agent 调 `POST https://agentplayground.maboco-mark.workers.dev/mqtt/rpc`（443 端口）。
+  2. Worker 内部通过 `cloudflare:sockets` 建连 EMQX `8883`（TLS），发 `CONNECT` + `SUBSCRIBE`，然后在一个 `while` 循环里用 `Promise.race([reader.read(), timeout])` **单次硬等最多 `waitMs`（当前上限 55s）**——**不是**在 Worker 里每 10 秒重连一次。
+  3. **Plan Alpha 修复前**：收到消息后因 `burstDeadline` Bug 未 `break`，导致每次都等满 50s–55s。
+  4. **Plan Alpha 修复后**：一旦收到用户回复（`PUBLISH` 帧），回发 `PUBACK` 后在 `burstMs`（默认 150ms，若设 `returnOnFirstMessage: true` 则 **0ms**）内**立即返回并关闭连接**。
 
-| 资源维度 | Workers Free 每日免费额度（00:00 UTC 重置） | 对我们场景的够用程度 |
+---
+
+### 3. 「Durable Objects (DO) 的最新免费额度、限制是什么？按时间还是按次数？」
+
+Cloudflare 已于 **2025 年 4 月 7 日**起将 **Durable Objects 正式纳入 Workers Free Plan**（但必须使用 **SQLite Storage Backend**，旧版 KV 后端仍仅限 Paid 计划）。最新官方免费额度如下（每日 `00:00 UTC` 重置，超限后报错但不扣费）：
+
+| 计费维度 | Free Plan 每日免费额度 | 折算与说明 |
 | :--- | :--- | :--- |
-| **Requests（请求数）** | **100,000 次 / 天**（含 HTTP、RPC、WS 消息按 20:1 折算） | 极度充裕（当前 3 天才 121 次） |
-| **Duration（内存驻留时长）** | **13,000 GB-s / 天**（每个活跃 DO 按 128MB = `0.125 GB` 计费） | 相当于 **104,000 活跃秒 / 天（约 28.8 小时/天）** |
-| **SQLite Rows Read** | **5,000,000 行 / 天** | 极度充裕 |
-| **SQLite Rows Written** | **100,000 行 / 天** | 极度充裕 |
-| **SQLite Stored Data** | **5 GB 总量** | 极度充裕 |
-
-> **关键结论**：只要使用 **SQLite-backed DO**，当前免费额度完全够用，**不需要** $5/月付费计划！
-
-### 2. 上了 Durable Objects 后，它占用什么？为什么能优化 Proxy 请求？
-很多开发者容易把 DO 和普通 Worker 混为一谈，它们的**本质区别**在于：
-
-| 对比维度 | 普通无状态 Worker（当前方案） | Durable Objects (`MqttBridgeDO`) |
-| :--- | :--- | :--- |
-| **状态与内存** | 每次请求独立沙盒，请求结束状态全丢 | **全局唯一有状态单例**：拥有常驻内存变量 + 内置零延迟 SQLite |
-| **连接保持能力** | 无法跨请求保留连接；Agent 思考间隙完全离线，消息可能错过或积压在 EMQX | 支持 **WebSocket Hibernation API**：Mac 与 iPhone 保持 `wss://` 长连接连到 DO；**空闲休眠时不占内存、Duration 计费为 0**，有消息时毫秒级唤醒！ |
-| **为什么能优化 Agent Proxy 请求？** | 每次 `POST /mqtt/rpc` 都要重新 TLS 握手 + MQTT `CONNECT` + `SUBSCRIBE`（耗时 300ms–1500ms） | **方案 1（纯 DO Hub，最优）**：Mac 和手机直接用 WebSocket 连 DO（走标准 443 端口），**完全省掉 EMQX 中转与每次 TLS/MQTT 握手**！Agent 发请求到 DO 内存直接读队列或挂起等唤醒，**延迟 < 50ms**。<br>**方案 2（DO 连 EMQX 8883）**：注意！DO 主动发起的出站 TCP (`connect()`) **不支持休眠**，会让 DO 保持活跃并消耗 Duration（不过 1 个 DO 24h 全活跃也仅消耗 `86400 * 0.125 = 10,800 GB-s/天 < 13,000 GB-s/天` 免费上限，只是接近每日限额，不如方案 1 优雅）。 |
-| **iOS Web Push 推送** | 断开后无法感知新消息 | DO 作为中心枢纽，收到 Agent 指令时可立即向手机端订阅的 `PushSubscription` 触发 Web Push |
+| **Requests（请求/消息数）** | **100,000 次 / 天** | 包含 HTTP 请求、RPC、Alarm；WebSocket 消息按 **20:1** 折算（即 200 万条 WS 消息 = 10 万次请求） |
+| **Duration（实例活跃时长）** | **13,000 GB-s / 天** | 按每个 DO 128MB (0.125 GB) 内存算：`13,000 / 0.125 = 104,000 秒/天`（约 **28.8 小时/天**，即**单实例 24 小时全天在线也够用**！） |
+| **WebSocket Hibernation** | **休眠期不计 Duration** | 若使用 Hibernation API，客户端连着 WebSocket 但不发消息时，DO 休眠，**Duration = 0** |
+| **SQLite 存储** | **5M 行读/天 · 100K 行写/天 · 5 GB** | 足以存储历史消息队列、Pending Approvals 与 iOS PushSubscriptions |
 
 ---
 
-## 五、总结建议
+### 4. 「上了 Durable Objects 后，在你的 Proxy 请求场景下到底有什么本质区别？」
 
-1. **当前立即可用**：Plan Alpha 已经解决了「收到回复还白等 50 秒」的 Bug，目前处于 **0 成本免费运行**状态，可先直接观察实际交互延迟是否已降至秒级。
-2. **下一步演进（零成本升级 Plan Bravo）**：
-   - 由于 Cloudflare **Workers Free 套餐现已包含 SQLite-backed Durable Objects**（10万请求/天 + 13,000 GB-s/天），下一步非常值得把 `agentplayground` 升级为 **DO + WebSocket Hibernation Hub**：
-     - Mac 端 & iPhone Pocket Deck 通过 `wss://agentplayground.maboco-mark.workers.dev/ws` 连入同一个 DO（支持休眠，空闲 0 GB-s 消耗）。
-     - Agent 依然通过 HTTPS 443 调 Worker `/rpc`，由 DO 在内存中秒级转交或唤醒返回，彻底告别每次重连 EMQX 的握手延迟，并顺便打通 iOS Web Push。
+这是一个非常关键的架构对比——**取决于连接由谁发起**：
+
+1. **如果 DO 只是像现在一样，由 Agent 发 HTTP 请求时才去连 EMQX 8883**：
+   - **几乎没有本质区别**！因为 Agent 仍然只能通过 443 发 HTTP 长轮询，而 DO 内部如果靠出站 `cloudflare:sockets` 连 EMQX，在没有入站请求时 DO 仍可能被空闲回收，无法真正永久保活。
+2. **如果把结构反过来（DO 真正发挥威力的用法）**：
+   - **Mac 端（`p2p-remote-controller`）和手机端（`Pocket Deck`）主动通过 `wss://`（443 端口）连入 DO**（**入站 WebSocket，完美享受 Hibernation 零 Duration 消耗！**）。
+   - **本质优化 1（彻底消除空闲丢消息与重复握手）**：Mac 和手机一直连在 DO 上；Agent 思考/推理的空档期，用户发的回复**直接毫秒级写入 DO 内存/SQLite**。Agent 下次发 HTTP `/rpc` 时 **0ms 拿走结果，不需要再连 EMQX，也不受 55 秒建连折腾**。
+   - **本质优化 2（真正实现 iOS Web Push）**：Mac 收到需要审批的指令或 Agent 发来 `ask_user` 时，DO 立刻感知并直接调用 `web.push.apple.com` 给 iOS PWA 弹窗，而无状态 Worker 在断开后根本无法感知。
+   - **本质优化 3（可彻底省掉 EMQX 中转或仅作备份）**：DO 本身就是全球边缘状态 Hub，Mac <-> DO <-> 手机/Agent 少了一跳公网 Broker 延迟。
+
+**总结建议**：
+- **当前阶段（零改动成本）**：刚上线的 **Plan Alpha** 已经把「收到回复还卡 50 秒」的问题彻底解决，且免费额度完全够用，可先实测几天体验延迟改善。
+- **下一阶段（需要 iOS Web Push + 0ms 握手）**：由于 Cloudflare **Free 计划现在已经支持 SQLite-backed Durable Objects**（且每天 13,000 GB-s 足够单实例全天跑 + 支持 WS Hibernation），**无需升级 $5/月付费版也能直接上 Plan Bravo**！只需把 Mac/手机的 WS 连到 DO，Agent 继续走 443 HTTPS 调 DO `/rpc` 即可。

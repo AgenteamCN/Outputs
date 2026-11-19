@@ -1,62 +1,67 @@
-# Batch A 验收评审、Octopus Merge 结果与 Batch B 执行规划
+# Wave 0 Octopus Merge 验证报告与后续最高效并行执行计划
 
-## 一、Batch A 四条分支逐一评审结论
+## 一、Wave 0 Octopus Merge 执行与验证结果
 
-四个分支整体完成度很高，严格遵守了文件所有权隔离与单向依赖规范，**无需重做**，仅在跨分支合入时存在 1 处小冲突与 4 处跨分支导入对齐（已在合并时一并修复并验证通过）：
+### 1. Octopus Merge 结果
+- **目标分支**：`origin/z/agy/rc/multiplayer-recheck`
+- **合并前基线**：`d69e01c`
+- **合并的 4 条 Wave 0 分支**：
+  - `origin/z/agy/rc/wave0-arch-0a` (`3deaedf`) — `SimulationDrivePolicy` 显式状态机
+  - `origin/z/agy/rc/wave0-arch-0b` (`479f742`) — `MatchRosterProjection` SSOT
+  - `origin/z/agy/rc/wave0-arch-0c` (`fa35923`) — `RuntimeResourceRegistry` 生命周期总线与延迟/作用域回收
+  - `origin/z/agy/rc/wave0-arch-0d` (`ed7d5df`) — `BoostPad` 离散字段隔离与 `frameCursor` / `isDuplicateFrame` 输出
+- **合并方式**：4 路 Octopus Merge（GitHub REST API `git/trees` + `git/commits` + `git/refs`，省略 author/committer 自动签名）
+- **合并结果**：**无冲突自动合并成功**（`src/game/modes/FreeplayMode.ts` 为 `0b` 与 `0c` 唯一共同修改文件，Git 自动三方合并通过）。
+- **已推送 Verified Bot Commit**：
+  - Commit SHA：`256577470a3188242e72362d9db2dbceaa5f548b`
+  - Verification：`verified: true` (`reason: "valid"`, author: `antigravity-fine-grained-token[bot]`)
+  - Parents：`[d69e01c, 3deaedf, 479f742, fa35923, ed7d5df]`
 
-1. **`origin/fix/p2p-interaction-sync` (`b5810fa`) — 优秀**
-   - 将 `processPolledNetworkSnapshot` 正确接入 `handlePollNetRecorder` 与初始化轮询，彻底打通 Interaction ID 自动同步与 429 告警链路。
-   - 为 `publishInteractionToAgy` 补齐 `try/catch` 与可见错误提示，并修复了“未连接时仍将 `interaction.id` 写入 `syncedAgyInteractionIdsRef` 导致后续无法重发”的隐性 Bug。
-   - 将 `LogExportLevel` 移至 `types/emqxBridge.ts`，消除了 P2P 侧唯一的 L0→L1 逆向依赖；清除了 CJK 字面量、多语句行与测试超长行 3 项雷达基线报错。
-
-2. **`origin/refactor/p2p-views-and-router` (`83a327a`) — 良好（已自动拆分细粒度子组件）**
-   - 仅新建文件、零改动 `App.tsx`，完全避免了与分支 1 的合并冲突。
-   - 主动将大面板进一步细分为 `PermissionAutomationBar.tsx` (344L)、`QuotaAlertsBanner.tsx` (88L)、`ManagedWindowSidebar.tsx` (166L)、`AxElementInspector.tsx` (139L)、`DebugConsoleTabs.tsx` (337L)、`DebugConsoleNetworkTab.tsx` (252L)、`emqxCommandRouter.ts` (274L)、`emqxCommandHandlers.ts` (343L)，全部控制在 350 行以内。
-   - **唯一跨分支对齐点**：由于基于合并前的 `a2` 切出，`DebugConsoleTabs.tsx`、`PermissionAutomationBar.tsx`、`emqxCommandHandlers.ts` 仍从 `../utils/logExport` 导入 `LogExportLevel`（已在合入时同步改为 `../types/emqxBridge`）。
-   - **预期状态**：上述新增模块在 Batch B 分支 5 接入 `App.tsx` 前会被雷达标记为 `Orphans=5`（仅审计提示，不阻断）。
-
-3. **`origin/fix/agy-layers-and-baseline` (`c5637a2`) — 优秀**
-   - 彻底解除 AGY 主端 4 处 `utils -> services/stores` 逆向依赖：`rawPromptCopy.ts` 改为 `GithubAuthBlockProvider` 参数注入，`taskExportHydrator.ts` 改为接收只读数据快照参数。
-   - 修复 `githubAuthBlock.ts:9` 超长行，并清理确认无引用的孤立模块 `src/utils/draftRegexEngine.ts`（-558L）。
-
-4. **`origin/refactor/agy-clients-and-utils` (`10167da`) — 优秀**
-   - 将 `tauriBackendClient.ts`（1,120L）按域拆分为 `tauriIpcTransport.ts` (256L)、`credentialsClient.ts` (189L)、`taskIpcClient.ts` (266L)、`lanIpcClient.ts` (109L)、`telemetryIpcClient.ts` (164L)。
-   - 将 `draftRegexDuplicate.ts`（1,137L）拆分为 `draftDuplicateRules.ts` (365L)、`draftRegexEvaluation.ts` (393L)、`draftBatchGenerator.ts` (351L)。
-   - 两个巨石文件直接从硬超标清单清出，且同步消除了 10 个空 `catch` 与 10 个静默 Promise `catch`。
-
----
-
-## 二、Octopus Merge 与棘轮收紧结果
-
-已完成全部 4 条分支向 `a2` 的 **Verified Bot Octopus Merge**，并同步收紧雷达棘轮：
-
-- **Octopus Merge 提交**：`82380d1`（`Merge Batch A branches into a2 (Octopus Merge)`，GitHub Bot 签名 `verified: true`）
-  - 解决 `src/utils/rawPromptCopy.ts` 唯一合并冲突（保留依赖倒置后的无 `services` 导入版本）。
-  - 更新 `src/components/composer/ComposerActionBar.tsx` 导入路径为 `../../services/credentialsClient`。
-  - 更新 P2P 侧 3 个新文件从 `../types/emqxBridge` 导入 `LogExportLevel`。
-- **棘轮收紧提交**：`e95e292`（`chore(radar): tighten Batch A arch-debt and layer ratchets`，GitHub Bot 签名 `verified: true`）
-  - `HARD_LAYER_VIOLATION_LIMIT`: `5 → 0`
-  - `HARD_VOLUME_CEILING_FILES_LIMIT`: `21 → 19`
-  - `HARD_EMPTY_CATCH_LIMIT`: `66 → 56`
-  - `HARD_SILENT_PROMISE_CATCH_LIMIT`: `60 → 50`
-
-### 全量验证结果（基于合并后代码）
-- `pnpm check`（`tsc --noEmit` + `eslint src` + `vitest run`）：**通过**（2 test files, 16 passed）
-- `pnpm p2p:check`（`tsc --noEmit` + `eslint src`）：**通过**（0 errors, 7 pre-existing hook warnings in `App.tsx`）
-- `pnpm --filter p2p-remote-controller test`：**通过**（5 test files, 19 passed）
-- `pnpm radar --audit`：**通过**（203 files, `Cycles=0`, `LayerViolations=0/0`, `HardVolume=19/19`, `SilentCatches=56/56+50/50`, `Orphans=5`）
+### 2. 工具链与门禁验证（在 `2565774` 上实测）
+- **工具链**：容器内已安装 `pnpm@12.21.0` 并完成 `pnpm install --no-frozen-lockfile --ignore-scripts`（2.8s）。
+- **`pnpm run check`**：**PASS (GREEN)**
+  - `1428/1428` TS 文件，0 Engine JS
+  - `tsc --noEmit`  clean
+  - `NameTagScatter=1/1`（已从 15 收敛至仅 `MatchRosterProjection.ts`）
+  - `BoolHotspots=7`（`SimulationStage.ts` 与 `simulationNetworkReconcilePipeline.ts` 已移出热点）
+  - `UnscopedCaches=0`（已从 3 降至 0）
+  - `0 Circular Deps | 0 Value Re-Exports | 0 Upward Imports | Any<=5`
+- **`pnpm run radar:audit`**：**PASS (GREEN)**
+- **`pnpm run test:multiplayer-suite`**：**PASS (24/24 全部通过)**
+- **环境限制项（需目标 Runner）**：
+  - `pnpm run repro:dev-broadcast-v2`：当前容器无 GPU/WebGL 渲染环境，Headless Chrome 无法完成渲染启动（退出清理报 `ENOTEMPTY`）。需在具备 WebGL 渲染能力的 Runner 上执行 E2E。
+  - `cargo` / `rustc`：当前容器未安装 Rust 工具链，C4（`src-tauri/src/lib.rs`）需在具备 Rust 的 CI/本地环境执行 `cargo check` / `pnpm run tauri:build`。
 
 ---
 
-## 三、Batch B 执行规划（可直接并发启动）
+## 二、后续计划优化：Wave 1 / Wave 2 / Wave 3 合并与最大并行化方案
 
-原 Batch B 规划**不需要大改**，3 条分支文件所有权完全零重叠，可立即基于最新 `a2`（`e95e292`）并发开工：
+### 1. 关键发现：Wave 1 已无代码阻塞，不必单线卡住 Wave 2 / Wave 3
+根据当前代码库状态（`2565774`）：
+- **Bug 1（Goal Replay 客户端动态）** 已由 `476b783` 实现并已保留在 Arch-0A 中；
+- **Bug 2（NameTag 与队伍同步）** 已由 `5fbc87d` + Arch-0B（`NameTagScatter=1/1`）彻底收敛；
+- **Bug 5 C1/C2/C3（内存释放）** 已由 `0bc5c69` + Arch-0C（`UnscopedCaches=0`）接入总线；
+- **Bug 5 C4（Tauri 关闭语义）** 已由 `0bc5c69` 修改 `src-tauri/src/lib.rs`。
 
-| 并行分支 | 责任范围（独占文件，零冲突） | 核心任务 | 验收标准 |
+因此，**Wave 1 剩余工作全部是“验收测试”，而不是“代码开发”**，不需要作为前置阻塞阶段单线排队。可以将 Wave 1 的 WebGL E2E 验收直接合并到最终的 `repro:dev-broadcast-v3` 全量回归中，Rust `cargo check` 独立异步执行。
+
+### 2. Wave 2 与 Wave 3 可拆分为 3 路完全无冲突并行开发
+检查 `2565774` 代码边界后，Wave 2（Bug 3）与 Wave 3（Bug 4）的核心文件完全正交，且 Arch-0D 已经在 `ReplicationStateInterpolator.ts` 输出了 `frameCursor` 与 `isDuplicateFrame` 契约，**不需要等 Wave 2 写完再写 Wave 3 代码**：
+
+| 并行轨道 | 目标 | 核心修改文件（彼此无交集） | 依赖 |
 | :--- | :--- | :--- | :--- |
-| **5. `refactor/p2p-hooks-shell`** | `apps/p2p-remote-controller/src/App.tsx` + 新建 `hooks/{useSafariWindowManager,useNetworkRecorder,useEmqxBridge,usePocketDeckBridge}.ts` + 接入 Batch A 的 5 个新模块 | 1. 将 `App.tsx`（3,912L / 90 Hooks）压降至 `<= 350` 行纯编排壳层；<br>2. 接入 `PermissionAutomationBar`、`ManagedWindowSidebar`、`AxElementInspector`、`DebugConsoleTabs`、`emqxCommandRouter`；<br>3. 清理 `App.tsx` 内剩余 32 处静默 `catch`（5 empty + 27 promise）。 | `App.tsx <= 350L`、`Hooks <= 20`、`Orphans` 归零；`pnpm p2p:check`、`p2p test` 与 `pnpm radar` 通过。 |
-| **6. `refactor/agy-stores-slim`** | `src/stores/telemetryStore.ts`（1,103L）、`src/stores/presetStore.ts`（622L）、`src/stores/themeStore.ts`（625L）+ 新建 `src/utils/` 纯计算模块 | 1. 将纯归档/索引/分片计算下沉至 `src/utils/`；<br>2. 清理 `themeStore.ts` 内 18 处空 `catch {}`。 | 3 个 Store 均 `<= 400L`，`SilentCatches` 显著下降，`pnpm check` 与 `pnpm radar` 通过。 |
-| **7. `refactor/agy-ui-hotspots`** | `src/components/drafts/BatchDuplicateConfigPanel.tsx`（835L）、`src/components/layout/AppTopHeader.tsx`（784L）、`src/components/layout/TaskHistorySidebar.tsx`（632L / 26 Hooks）+ 对应子组件 / `src/hooks/` | 按子视图槽位拆分为独立展示组件与 `useTaskSidebar*` Hook。 | 3 个 UI 巨石文件全部退出硬超标清单，`pnpm check` 与 `pnpm radar` 通过。 |
+| **Track W2-A** | Bug 3（2-A）：`SpectateInterpolationBuffer` >= 5 帧前瞻窗口与游标状态机 | `src/network/sync/ReplicationStateInterpolator.ts` | 无（基于 `2565774`） |
+| **Track W2-B** | Bug 3（2-B）：`client-csr-spectate` 开启 `shouldRunLookahead = true` 与本地 WASM 物理前瞻收敛 | `src/game/pipeline/stages/simulationFrameClassifierPipeline.ts`<br>`src/game/pipeline/stages/SimulationStage.ts`<br>`src/game/pipeline/stages/simulationNetworkReconcilePipeline.ts` | 仅依赖 `SpectateInterpolationBuffer` 现有接口 |
+| **Track W3** | Bug 4（3-A/3-B）：利用 Arch-0D 的 `isDuplicateFrame` 与离散 `isActive` 阶跃输出，增加重复帧跳过与冷却微抖阈值保护 | `src/entities/BoostPadSystem.ts`（及 BoostPad 快照同步调用点） | 无（Arch-0D 契约已合入 `2565774`） |
+| **Track V1-Rust**（异步） | Bug 5（C4）：Rust 窗口关闭逻辑编译验证 | 无代码改动（`src-tauri/src/lib.rs`） | 仅需含 `cargo`/`rustc` 环境 |
 
-### Batch B 合入后的下一轮建议（Batch C 预告）
-Batch B 完成后，预计硬超标文件将从 `19` 个降至 `~11` 个，届时可再收紧一轮棘轮（`HardVolume: 19 -> 11`、`ReactHooks: 90 -> 25`、`SilentCatches` 同步下调），并按需开启 Batch C 收尾剩余中大型文件（P2P 侧 `PocketDeckView.tsx` / `aiStudioInit.ts` / `EmqxBridgePanel.tsx`，AGY 侧 `telemetryMessageIngestion.ts` / `taskDiagnosticsExport.ts` / `LanAccessSection.tsx` 等）。
+### 3. 最高效执行拓扑（2 步收官）
+1. **第 1 步（3 路并行开发 + 异步 Rust 检查）**：
+   - 同时拉出 `wave2-lookahead-buffer`（W2-A）、`wave2-lookahead-driver`（W2-B）、`wave3-boostpad-debounce`（W3）三条分支开发，每条分支各自过 `pnpm run check && pnpm run radar:audit && pnpm run test:multiplayer-suite`。
+2. **第 2 步（Octopus Merge + 一次全量收官验收）**：
+   - 将 W2-A、W2-B、W3 **一次 Octopus Merge** 合入 `z/agy/rc/multiplayer-recheck`。
+   - 在具备 **WebGL 渲染能力** 的 Runner 上一次性跑完最终收官门禁：
+     ```bash
+     pnpm run check && pnpm run radar:audit && pnpm run test:multiplayer-suite && pnpm run repro:dev-broadcast-v3
+     ```
+   - 一次性同时验收 **Bug 1、Bug 2、Bug 3、Bug 4、Bug 5 (C1–C3)**（目标 `reproducedCount === 0/5`），无需把 Wave 1 和 Wave 2/3 分成两次串行 E2E。

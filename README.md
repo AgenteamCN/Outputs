@@ -1,32 +1,21 @@
-# Wave 1 Track B — Bug 2 修复报告（`fix/bug-2-replay-nametag-team-sync`）
+# Cloud Agent 最终报告（`Antigravi-ty/agyPreviewInstant` · 分支 `a2`）
 
-## 1. 分支与提交状态
-- **基准分支**：`origin/z/agy/rc/multiplayer-recheck`
-- **新建分支**：`fix/bug-2-replay-nametag-team-sync`
-- **本地提交**：`ba6527e` — `fix(replay-sync): sync 3D nameTags and arena.carTeams on client during Replay Watch Together`
-- **推送状态**：`git push -u origin fix/bug-2-replay-nametag-team-sync` 失败（沙箱环境未配置 GitHub 凭据：`fatal: could not read Username for 'https://github.com': terminal prompts disabled`）。本地分支与提交已就绪，需在具备推送权限的环境中执行 `git push -u origin fix/bug-2-replay-nametag-team-sync`。
+## 1. 纯 AX AI Studio 初始化工作流（`initializeAiStudioWindow`）
+通过 EMQX 实时交互在 Safari 窗口 `#33263` 上完整跑通并验证了纯 AX（零 JS）初始化流程，已封装为 [aiStudioInit.ts](file:///workspace/agyPreviewInstant/apps/p2p-remote-controller/src/services/aiStudioInit.ts) 并接入桌面端 `Init AI Studio` 按钮与远程指令 `initialize_aistudio`：
+1. **页面就绪与超时恢复**：轮询 `scanSafariWindow` 等待 `webAreaLoaded && elements.length > 10`；若超时则自动 `reloadSafariWindow` 并重新等待；若跳转至 `accounts.google.com` 则明确报错提示登录。
+2. **Cookie 弹窗处理**：检测 `No thanks` 按钮后点击并二次扫描确认弹窗消失。
+3. **API Key 状态检查**：检测 `API key selected`（或定位 `Link API key`）。
+4. **Harness 模型切换为 `Gemini 4 Hydrogen`**：点击 `Select Antigravity agent harness model` -> 等待面板出现 `gemini-4-hydrogen` -> 点击选中 -> 确认返回主设置面板。
+5. **Network 规则配置为 `*` 并删除旧版默认规则**：点击 `1 rule` 打开 `Network Configuration` -> 点击 `Add to allowlist` -> `AXRaise` 聚焦后 `set_value` 将 `Domain` 设为 `*` 并校验值 -> 展开 `Gemini API (default)` -> 点击其对应的 `Delete rule` 并校验仅剩 `*` -> 点击 `Save` 并校验弹窗关闭。
 
-## 2. 根因分析
-1. **3D NameTag 未同步**：`src/game/runtime/devSyncChannelHandlers.ts`（`channel.onGlobalWorkspaceBroadcast`）与 `src/game/runtime/onlineSessionEnvironmentPipeline.ts`（`applyClientRoomActivitySwitch`）在收到 Host 下发的 `replaySync` 时，仅更新了 `useReplayViewerStore` 与 `hudStore`，未调用 `setNameTagRuntimeState({ isMultiplayerOrMultiCarMode, carEntries })`，导致客户端 `VehicleNameTagSystem` 仍使用残留的 Freeplay 机器人名牌状态。
-2. **`arena.carTeams` 阵营错位**：
-   - `src/game/runtime/onlineSessionEnvironmentPipeline.ts` 在 `activityId === 'replay'` 切换分支中未同步 `rs.roster` 到 `physics.setCarTeam` 与 `arena.setCarTeam`。
-   - `src/entities/arena/ArenaVehicleFrameStepper.ts` 在客户端首次惰性创建车辆网格（`!arena.cars[carIndex]`）时，直接使用 `carIndex % 2` 作为 `defaultTeam` 调用 `vr.ensureCar(carIndex, defaultTeam, ...)`，覆盖了此前已通过 `arena.setCarTeam(carIndex, team)` 写入的 `vr.carTeams[carIndex]`（例如 `carIndex = 4` 被 `4 % 2 = 0` 覆盖为蓝队）。
+## 2. 手机端 Pocket Deck 布局与 Direct Control 修复
+- **Pending Reply 移到底部**：在 [PocketDeckView.tsx](file:///workspace/agyPreviewInstant/apps/p2p-remote-controller/src/components/PocketDeckView.tsx) Bridge 模式下，将 `Agent Chat` 置于上方滚动区，将 `Pending Reply` 移至底部靠近输入区，符合单手拇指操作习惯。
+- **Direct Control 增强与修复**：
+  - 新增窗口选择下拉框（`select_window`）与 `Open New` 按钮（`open_new_window`）。
+  - 在 [App.tsx](file:///workspace/agyPreviewInstant/apps/p2p-remote-controller/src/App.tsx) 中修复 `perform_action` 查找逻辑：优先从完整 `scanResult.elements` 查找 `nodeId`（再回退到 `filteredElements`），解决“点谁不触发谁”的问题。
 
-## 3. 修改内容
-- [src/game/runtime/devSyncChannelHandlers.ts](file:///workspace/RocketCompanion/src/game/runtime/devSyncChannelHandlers.ts)
-  - 引入 `setNameTagRuntimeState`，在收到 `replaySync.roster` 时同步更新 `setNameTagRuntimeState({ isMultiplayerOrMultiCarMode: replaySync.roster.length > 1, carEntries })`。
-- [src/game/runtime/onlineSessionEnvironmentPipeline.ts](file:///workspace/RocketCompanion/src/game/runtime/onlineSessionEnvironmentPipeline.ts)
-  - 引入 `setNameTagRuntimeState`，在 `applyClientRoomActivitySwitch` 的 `activityId === 'replay'` 分支中，将 `rs.roster` 同步到 `ctx.physics?.setCarTeam`、`ctx.arena?.setCarTeam` 与 `setNameTagRuntimeState`。
-- [src/entities/arena/ArenaVehicleFrameStepper.ts](file:///workspace/RocketCompanion/src/entities/arena/ArenaVehicleFrameStepper.ts)
-  - 惰性创建车辆网格时优先读取 `vr.carTeams[carIndex]`，仅在未设置时回退到 `carIndex === 6 ? 0 : carIndex === 7 ? 1 : carIndex % 2`。
-
-## 4. 验证结果
-- **静态检查（`pnpm run check`）**：通过（`radar` 1425/1425 TS 文件 GREEN，`tsc --noEmit` 0 错误）。
-- **Prettier 格式检查**：修改文件已通过 `prettier --write` 格式化。
-- **E2E 复现套件（`pnpm run repro:dev-broadcast-v3`）**：
-  - `bug-2-replay-nametag-and-team-desync`：**PASS_FIXED (`reproduced === false`)**
-    - `host.arenaCarTeams`: `[0, 0, 0, 1, 1, 1]`
-    - `client.arenaCarTeams`: `[0, 0, 0, 1, 1, 1]`
-    - `teamMismatch`: `false`
-    - `tagTextMismatches`: `[]`
-    - `client.tags`: `[{"carIndex":1,"displayText":"Nexto #5"},{"carIndex":0,"displayText":"Nexto #4"},{"carIndex":2,"displayText":"Nexto #6"}]`
+## 3. 稳定性修复与验证
+- **Pending Approvals 去重**：在 `App.tsx` 的 EMQX `onMessage` 中按 `requestId` 去重，避免 QoS 1 重连重传时出现重复审批卡片。
+- **Chat 净荷验证**：实测新版 Chat 消息已完全不再附带 `recentUserActions`。
+- **测试与构建**：`pnpm --filter p2p-remote-controller test`（11/11 通过）、`check`（`tsc --noEmit` + `eslint src` 0 错误）与 `build` 全部通过。
+- **Verified Bot Commit**：[`b2fec17`](https://github.com/Antigravi-ty/agyPreviewInstant/commit/b2fec1730b8fe1f34f6501d029ead84da0ef279e)（`signature.isValid: true`）。

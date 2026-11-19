@@ -1,27 +1,19 @@
 # Session Summary (agyPreviewInstant / branch `a2`)
 
-## Root Cause of EMQX "No Messages Received"
-- Inspected `agentplayground.maboco-mark.workers.dev/mqtt/rpc` worker script: the endpoint expects `publishMessages` and `subscribeTopics` (not `publish` / `subscribe`).
-- Once switched to `publishMessages` and `subscribeTopics`, bi-directional EMQX chat and `cmd` / `resp` RPC worked (`subacked: true, pubackedCount: 1`).
+## Commits Pushed to `a2` (Verified Bot Commits)
+1. **`135f3bb`**: Block `play.google.com` trackers before sending (`fetch` / `XHR` / `sendBeacon`), extract `v1_...` Interaction IDs directly, and auto-poll Network tab.
+2. **`f040fa5`**: Keep Network recorder polling in the background regardless of active tab, fix `isApiKeySelected` false positive on `"No API key selected"`, and automate the 3-step `Link API Key` modal (`Skip` / `Link API key` -> `Select key`).
+3. **`09033bd`**: Add `dispatch_aistudio_task` EMQX command with 3-point preflight verification (`API key linked`, `gemini-4-hydrogen` model, `Network allowlist = '*'`), prompt entry, `Run` click, and post-submit `networkSnapshot` capture.
+4. **`536d3a0`**: Preserve `prompt`, `networkDomain`, and `autoInitialize` fields when parsing inbound EMQX `RemoteCommandRequest` payloads in `App.tsx`.
 
-## Live AX Probing & Fixes Committed (`f040fa5`)
+## EMQX Command Best Practice
+- Always use `publishMessages` and `subscribeTopics` when calling `https://agentplayground.maboco-mark.workers.dev/mqtt/rpc`.
+- Always include `"message": "..."` inside `cmd` payloads (and/or an accompanying `agy_p2p_v1/chat` message) so the Mac operator can see what each command is doing in real time.
 
-Verified bot commit pushed to `Antigravi-ty/agyPreviewInstant` (`a2`):
-- **Commit**: `f040fa5b7a2f384c38e79f95a66aa944fc43cc3c` (`signature.isValid: true, state: "VALID"`)
-- **Message**: `fix(p2p-remote-controller): poll Network in background and fix Link API Key 3-step modal flow`
-
-### 1. Background Network Auto-Polling (`apps/p2p-remote-controller/src/App.tsx`)
-- Removed `rightTab !== "network"` from the Network auto-poll `useEffect` so silent 2s background polling continues whenever `netRecording` is active, even when viewing Console, EMQX, Timeline, or JSON tabs.
-
-### 2. Automated `Link API Key` Modal Flow (`apps/p2p-remote-controller/src/services/aiStudioInit.ts`)
-- Fixed `isApiKeySelected` false positive: `"No API key selected"` previously matched `/api key selected/i`, causing `initializeAiStudioWindow` to skip linking on fresh pages. Now explicitly excludes `/no api key selected/i` and checks that the `"Link API Key"` button is absent.
-- Handled the 3-step Link API Key modal observed on live Safari window `34202`:
-  - Clicks `"Link API Key"`.
-  - Advances past `"Set up billing"` via `"Skip"` (or `"Link API key"` step button) if `"Select key"` is not yet visible.
-  - Clicks `"Select key"` and waits for the modal to close / main settings panel to return.
-
-### 3. Verified `Domain = *` Input (`apps/p2p-remote-controller/src/services/aiStudioInit.ts`)
-- Verified live on window `34202` that `focus` + `set_value` `"*"` on the `Domain` `AXTextField` updates `AXValue` to `"*"` and triggers AI Studio's `"Adding * grants access to all domains..."` notice (aligned with `focus` + `AXPress` + `set_value` retry in `46a756a`).
+## Live End-to-End Test on Window `34202`
+- Dispatched the Remote Controller Channel bar layout fix task to Safari window `34202` via `dispatch_aistudio_task` (`requestId: req_dispatch_34202_v2`).
+- All 3 preflight checks passed (`apiKeyLinked: true`, `modelVerified: true`, `networkAllowAll: true`), prompt (1816 chars) was entered and verified, `Run` was clicked, and `CreateInteraction` XHR was captured.
+- Post-Run AX scan on `34202` confirmed `AXButton("Stop")` and `AXStaticText("Spinning up remote environment")` / `AXStaticText("Running...")`.
 
 ## Verification
 - `pnpm exec tsc --noEmit` in `apps/p2p-remote-controller`: passed (exit code 0).

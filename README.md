@@ -1,46 +1,40 @@
-# RocketCompanion Multiplayer & Replay Reproduction Report (`z/agy/rc/multiplayer-recheck`)
+# RocketCompanion Multi-Issue Reproduction & Test Suite Update Report
 
-- **Base Commit**: `971ef3d` (`fix(multiplayer): preserve spectate camera focus across kickoff and mode leave in Pure CSR`)
-- **Test Suite Commit**: `943b749cf1c1abbd651c5862d91edecceac360bd` (`verified: true`)
-- **Replay Asset**: `rc-replay-3v3-1-0-2026-11-13T07-26-58.rcreplay` (downloaded from wenshushu)
-- **New E2E Suite**: `scripts/runDevBroadcastReproV3.mjs` (`pnpm run repro:dev-broadcast-v3`)
-- **Result**: **5 / 5 issues reproduced** in Headless Chrome + WebGL + WASM (`reproduced=5/5`).
+- **Repository**: `Antigravi-ty/RocketCompanion`
+- **Branch**: `origin/z/agy/rc/multiplayer-recheck` (`943b749`)
+- **Replay Fixture**: `/tmp/rc-replay-3v3-1-0-2026-11-13T07-26-58.rcreplay` (6,811,237 bytes)
+- **Test Suite Command**: `RC_VITE_ROLE=rc-http pnpm run repro:dev-broadcast-v3` (`scripts/runDevBroadcastReproV3.mjs`)
 
----
+## Verification Summary
+- `pnpm run check` (Radar + `tsc --noEmit`): **GREEN** (1425/1425 TS files)
+- `pnpm run test:multiplayer-suite`: **24/24 PASS**
+- `RC_VITE_ROLE=rc-http pnpm run repro:dev-broadcast-v3`: **5/5 REPRODUCED** (`reproduced=5/5` in `/tmp/dev-broadcast-repro-v3.json`)
 
-## 1. Goal Replay Enters on Client Without Dynamics (`bug-1-goal-replay-client-static-no-dynamics`)
-- **Symptom**: Client enters Goal Replay (`phase: "replay"`, `hudPhase: "replay"`, `camMode: "director"`, `override: true`), but the ball and cars are completely static (`bx: 0, by: 5884.3, bz: 171.6` -> `bx: 0, by: 0, bz: 93.2`, `bufFrames: 1`), and only resync after Goal Replay exits.
+## Reproduced Issues & Root Causes
+
+### 1. Go Replay enters on Client with zero dynamics (static) until exit (`bug-1-goal-replay-client-static-no-dynamics`)
+- **Observed**: Client enters `matchPhase === "replay"` and `hudPhase === "replay"`, but ball position remains static (`[0, 0, 93.2]`, `distinctBallPositions: 1`), `spectateInterpolationBuffer` stays at `bufferedFrames: 1`, and `camMode` remains `"pov"` with `override: true`.
 - **Root Cause**:
-  1. In `src/game/pipeline/stages/SimulationStage.ts`, `stepNetworkReconciliationAndReplayStream` is gated by `!flags.isLocalDirectorPreview`. On the Host during Freeplay Goal Replay, `activeMode.directorPreview.isReplayActive` is `true`, so `server.update()` is skipped completely.
-  2. `HostBroadcastPublisher.publishIfReady` receives `isPaused: flags.shouldHoldAccumulator` (`true` during `isGoalReplay`), while Host `tickCount` remains frozen.
+  1. In `src/game/pipeline/stages/simulationFrameClassifierPipeline.ts`, `isGoalReplay` forces `shouldHoldAccumulator = true`.
+  2. `src/game/pipeline/stages/SimulationStage.ts` passes `isPaused: flags.shouldHoldAccumulator || ...` (`true` during Goal Replay) to `HostBroadcastPublisher.publishIfReady`.
+  3. `src/replay/ReplayFrameInterpolator.ts` (`applyReplayFrameToEngine`) restores historical frames with `{ preserveEngineTick: true }`, so `physics.getHeaderView().tickCount` never changes during Goal Replay.
+  4. `HostBroadcastPublisher.publishIfReady` sees `isPaused && !tickChangedWhilePaused` and returns `false` every frame, sending zero snapshots until Goal Replay exits.
+  5. On Client, `src/game/pipeline/stages/simulationNetworkReconcilePipeline.ts` enters `if (isPureCsrSpectate && !reconciler.replayPlaybackMode && spectateInterpolationBuffer)` and skips the `else if` branch that calls `replayTimelineController.appendStreamedReplayFrame(...)`.
 
-## 2. Replay Watch Together: UI Roster Syncs, 3D NameTags Desynced (`bug-2-replay-nametag-and-team-desync`)
-- **Symptom**: Client syncs HUD scoreboard and 1-6 roster strips, but 3D in-world NameTags do not match Host:
-  - Host tags: `[{0: "Nexto #4"}, {1: "Nexto #5"}, {2: "Nexto #6"}, {4: "Nexto #2"}]`
-  - Client tags: `[{0: "Player2511"}, {1: "Captain Ping"}, {2: "Necto"}]` (fallback preview names).
-- **Root Cause**:
-  - `src/game/runtime/devSyncChannelHandlers.ts` updates `useReplayViewerStore.resolvedRoster` (UI), but never calls `setNameTagRuntimeState({ isMultiplayerOrMultiCarMode: true, carEntries })` on the Client, so `VehicleNameTagSystem` (`vehicleNameTagFramePipeline.ts`) falls back to `config.previewNames`.
+### 2. Replay Watch Together syncs UI roster/scoreboard but not internal 3D NameTags (`bug-2-replay-nametag-and-team-desync`)
+- **Observed**: Host renders 3D NameTags (`Nexto #2`, `Nexto #5`, `Nexto #4`, `Nexto #6`), while Client has `tags: []` despite having 6 cars and synced DOM roster/scoreboard.
+- **Root Cause**: `src/game/runtime/devSyncChannelHandlers.ts` and `src/game/runtime/onlineSessionEnvironmentPipeline.ts` update `replayViewerStore` and `hudStore` on the Client, but never call `setNameTagRuntimeState({ isMultiplayerOrMultiCarMode, carEntries })`, leaving `VehicleNameTagSystem` (`getNameTagRuntimeState().carEntries`) unsynced.
 
-## 3. Choppy/Stuttery Motion Without Deterministic Physics Lookahead (`bug-3-replay-choppy-motion-no-physics-lookahead`)
-- **Symptom**: Client `physics.getHeaderView().tickCount` stays frozen (`distinctTicks: 1`, `tick: 1102`), ball position repeats identically across consecutive `requestAnimationFrame` callbacks (`frozenBallFrames: 16` out of 30), and then teleports (`maxBallStepUu: 2959.6`).
-- **Root Cause**:
-  - `applyReplayFrameToEngine` restores raw snapshots with `{ preserveEngineTick: true }` without stepping deterministic 120Hz physics over a buffered lookahead window (e.g., buffering `>= 5` frames and simulating continuous 120Hz physics between broadcast states).
+### 3. Choppy/stuttery motion & state-only spectate without deterministic physics lookahead (`bug-3-replay-choppy-motion-no-physics-lookahead`)
+- **Observed**: Client spectate/replay motion shows `distinctTicks: 1`, `frozenBallFrames: 20`, and `maxBallStepUu: 2973.1`.
+- **Root Cause**: `SpectateInterpolationBuffer` (`src/network/sync/ReplicationStateInterpolator.ts`) only linearly/slerp-interpolates raw 60Hz snapshots, and `SimulationStage` calls `interpolator.sync(timestamp)` on `isPureCsrClient`. There is no buffer-ahead threshold (e.g. `>= 5` frames) driving deterministic WASM physics simulation across buffered future frames.
 
-## 4. BoostPad Models Flicker Violently Every Frame (`bug-4-boostpad-model-flicker`)
-- **Symptom**: Client `pad.full.visible` toggled `18` times across 30 frames (`maxSinglePadFlips: 2` across 9 pads).
-- **Root Cause**:
-  - Observed on pad 11 during replay: `bufferCooldown` jumped `4 -> 1.91 -> 4 -> 3.12`. In `src/entities/BoostPadSystem.ts`, `respawnedAndCollected` (`!wasActive && !isActive && prevBufferCd > 0 && bufferCooldown > prevBufferCd + 0.5`) repeatedly re-triggers `startCollectAnimation(i)` and toggles `pad.full.visible`.
+### 4. BoostPad Model state flickering violently every frame (`bug-4-boostpad-model-flicker`)
+- **Observed**: Across consecutive frames during Replay Watch Together, Client recorded `totalPadFlips: 20` (`maxSinglePadFlips: 4`, e.g., pads 0..3 each flipping 4 times in a short window).
 
-## 5. High Baseline Memory & Unreleased Resources on Exit/Close (`bug-5-high-memory-and-unreleased-on-exit`)
-- **Measurements** (Headless Chrome with GC forced via `HeapProfiler.collectGarbage`):
-  - **Boot**: `jsUsedMB: 161`, `wasmMB: 259` (256 MB C++ WASM Replay Buffer allocated at startup in `RocketSimArenaBarrierController.ts` / `onlineSessionEnvironmentPipeline.ts`), `geometries: 39`, `textures: 13`.
-  - **After loading `.rcreplay`**: `jsUsedMB: 414` (+253 MB), `wasmMB: 310` (+51 MB), `geometries: 108` (+69).
-  - **After `onReturnToFreeplay()`**: `jsUsedMB: 389` (**+228 MB retained**), `wasmMB: 310` (**+51 MB WASM retained**), `geometries: 104` (**+65 geometries not disposed**).
-- **Tauri Close Behavior**:
-  - In `src-tauri/src/lib.rs`, `WindowEvent::CloseRequested` calls `api.prevent_close(); let _ = window.hide();`, so closing the window hides it without destroying the WebView or releasing memory until Quit.
-
----
-
-## Verification
-- `pnpm run typecheck`: PASS
-- `pnpm run repro:dev-broadcast-v3`: PASS (`reproduced=5/5`, report written to `/tmp/dev-broadcast-repro-v3.json`)
+### 5. High memory footprint & unreleased resources on close/exit (`bug-5-high-memory-and-unreleased-on-exit`)
+- **Observed**:
+  - Post-boot: `jsUsedMB: 161`, `wasmMB: 259`, `geometries: 40`, `textures: 13`.
+  - After loading 3v3 `.rcreplay` (`20107` frames): `jsUsedMB: 415`, `wasmMB: 310` (+51 MB), `geometries: 109` (+69).
+  - After exiting replay: `jsUsedMB: 388` (`retainedJsMB: 227`), `wasmMB: 310` (`retainedWasmMB: 51`), `geometries: 105` (`retainedGeometries: 65`).
+  - Tauri close behavior: `src-tauri/src/lib.rs` intercepts `WindowEvent::CloseRequested` with `api.prevent_close(); window.hide();`, keeping the WebView, Three.js, WASM, and Workers resident until Quit.

@@ -1,40 +1,45 @@
-# Batch B Branch 6 (`refactor/agy-stores-slim`) 完成报告
+# Batch B Branch 5 (`refactor/p2p-hooks-shell`) Completion Report
 
-## 1. 任务与分支信息
-- **目标分支**：`refactor/agy-stores-slim`（基于 `a2` 最新提交 `e95e292`）
-- **Verified Bot Commit**：[`4c72644661e9690c175c66126e8d6b4a9887b6c0`](https://github.com/Antigravi-ty/agyPreviewInstant/commit/4c72644661e9690c175c66126e8d6b4a9887b6c0)（GPG 签名 `VALID`，`isValid: true`）
-- **工具链补齐**：安装 `pnpm@12.21.0`，执行 `pnpm install --frozen-lockfile` 与 `pnpm sync:profile`。
+## 1. Summary & Commit
+- **Repository**: `Antigravi-ty/agyPreviewInstant`
+- **Branch**: `refactor/p2p-hooks-shell` (branched from `a2` @ `e95e292`)
+- **Verified Bot Commit**: [`4a97cc368330db8b04e7833a27414591fd95edf4`](https://github.com/Antigravi-ty/agyPreviewInstant/commit/4a97cc368330db8b04e7833a27414591fd95edf4) (`signature.isValid: true`, `state: VALID`)
+- **Co-authored-by**: `Mark <29165094+MaBoCoMark@users.noreply.github.com>`
 
-## 2. 拆分与重构明细
+## 2. Key Metrics (Before -> After)
+| Metric | Before (`a2`) | After (`refactor/p2p-hooks-shell`) | Target |
+| :--- | :--- | :--- | :--- |
+| `App.tsx` Lines | 3,912 L | **332 L** (331 L without trailing newline) | `<= 350 L` |
+| `App.tsx` Bytes | 142.1 KB | **13.9 KB** | `< 18 KB` |
+| `App.tsx` React Hooks | 90 (S:35 / E:19) | **18** (S:8 / E:2) | `<= 20` |
+| Hard Volume Ratchet (`>800L / >18KB`) | 19 / 19 | **18 / 19** | `<= 19` |
+| Circular Dependencies | 0 | **0** | `0` |
+| Layer Violations | 0 / 0 | **0 / 0** | `0` |
+| Orphans | 5 | **0** (all Batch A Branch 2 modules wired) | `0` |
+| Silent Catches | 56 + 50 | **51 + 23** (all 32 in `App.tsx` eliminated) | `< 56+50` |
+| `pnpm p2p:check` (`tsc` + `eslint`) | 0 errors, 7 warnings | **0 errors, 0 warnings** | Pass |
+| `pnpm p2p:build` (`tsc` + `vite build`) | — | **Pass** (320.00 kB bundle) | Pass |
+| `pnpm radar` (full) | Pass | **Pass** | Pass |
 
-### 2.1 `telemetryStore.ts`（1,103L / 32.4KB → 398L / 15.5KB）
-- **纯计算与快照合并管道** -> `src/utils/telemetrySnapshotMerge.ts`（396L）：
-  - 提取 `normalizeProbeState`、`parseRemoteImportPayload`（消除空 `catch`）、`promotePrefix6Entry`、`mergePrefix6EntriesIntoFullEnvIds`、`buildDispatchedActiveEnvEntry`、`buildGuiRoundStartedUpdate`、`mergeTelemetrySnapshotPatch`、`mergeAllShardsTraces`、`extractDirtyTracesPayload`。
-- **同步/归档/分片/心跳计时子控制器** -> `src/stores/telemetrySyncCoordinator.ts`（300L）：
-  - 封装 `dirtyTraceEnvIds`、`inFlightEnvTelemetryLoads`、`inFlightAllShardsLoad`、`scheduledFlushTimer`、`heartbeatExpirationTimer` 及其 `dispose()` 生命周期，维持 `UnscopedCaches=0`。
-- **Broker 连接与订阅子控制器** -> `src/stores/telemetryBrokerCoordinator.ts`（181L）：
-  - 封装 EMQX Global / EMQX CN / Bemfa SZ 连接生命周期、`lastEnvEmqxPullAtMs` 节流与 `publishRetained` / `dispose()`。
+## 3. Architecture & File Breakdown
+### Orchestration Shell
+- `apps/p2p-remote-controller/src/App.tsx` (332 L / 13.9 KB / 18 Hooks): Pure orchestration shell composing the extracted hooks and wiring all Batch A view components (`PermissionAutomationBar`, `AxElementInspector`, `ManagedWindowSidebar`, `DebugConsoleTabs`, `LanSharingModal`).
 
-### 2.2 `presetStore.ts`（622L / 20.3KB → 343L / 12.6KB）
-- **持久化、通用 CRUD 与默认值解析管道** -> `src/utils/presetPersistence.ts`（275L）：
-  - 提取存储键常量、`loadPresetStorageSnapshot`、`appendAndPersistPreset`、`updateAndPersistPreset`、`removeAndPersistPreset`、`reorderAndPersistPreset` 与各领域 `resolveDefault*` 纯函数，并消除 `readJsonList` 空 `catch`。
+### Extracted Hooks (`apps/p2p-remote-controller/src/hooks/`)
+- `useEmqxBridge.ts` (399 L / 12.8 KB): EMQX WebSocket lifecycle, chat, traffic stats, pending approvals, `publishInteractionToAgy`, and `handleEmqxDecision` delegated to `services/emqxCommandRouter.ts` (`executeEmqxDecision`).
+- `useNetworkRecorder.ts` (485 L / 17.9 KB): Per-window recorder state, auto-inject probes, polling loop, clear/toggle handlers, and `processPolledNetworkSnapshot`.
+- `useQuotaAlerts.ts` (47 L / 1.7 KB): 429 quota alert deduplication and read/expand state.
+- `useSafariWindowManager.ts` (523 L / 18.0 KB): Managed Safari window targets, aliases, open/focus/reload/close/reopen, and `handleInitialize` / `handleInitAiStudio`.
+- `useSafariPermissions.ts` (240 L / 7.8 KB): TCC Accessibility, Safari Automation permission, Safari launch, initial mount sync, and `refreshStatus`.
+- `useAxElementActions.ts` (201 L / 6.9 KB): AX tree scan, element filtering, and AX action dispatch (`press`, `focus`, `set_value`) with stale-path auto-rescan.
+- `useAxObserverSync.ts` (164 L / 5.6 KB): macOS `AXObserver` push event subscription and debounced status/rescan timers.
+- `usePocketDeckBridge.ts` (251 L / 7.4 KB): LAN sharing auto-start, `PocketDeckSnapshot` assembly, `lan:state-sync` broadcast, and `lan:remote-action` dispatch.
 
-### 2.3 `themeStore.ts`（625L / 18.7KB → 338L / <12KB）
-- **本地存储与 DOM 样式应用管道** -> `src/utils/themeStorageAndDom.ts`（283L）：
-  - 统一 `readStorageItem` / `writeThemeStorageItem` 错误日志告警，**彻底清零 `themeStore.ts` 原有的 18 处空 `catch (_) {}`**；
-  - 抽取 `readAllAppearanceSettings`、`persistAppearanceDefaults` 与 `apply*ToDocument` 函数，消除初始状态与 `initTheme` 之间的重复读取逻辑。
+### Extracted Services & Pure Helpers
+- `apps/p2p-remote-controller/src/services/aiStudioInitRunner.ts` (370 L / 12.2 KB): Standalone `runInitializeFlow` with narrow progress/state callbacks.
+- `apps/p2p-remote-controller/src/services/networkRecorderClient.ts` (103 L / 3.1 KB): Stateless Safari JS probe/install/poll/clear/stop RPCs (`probeWithReadyRetries`, etc.).
+- `apps/p2p-remote-controller/src/utils/safariWindowHelpers.ts` (187 L / 5.7 KB): Pure window/AX filtering (`buildVisibleWindows`, `filterAxElements`), URL/error predicates, and `localStorage` persistence.
 
-## 3. 验收与检查结果
-
-| 检查项 | 重构前基线 | 重构后结果 |
-| :--- | :--- | :--- |
-| `telemetryStore.ts` 行数 | 1,103 行 | **398 行**（`<= 400`） |
-| `presetStore.ts` 行数 | 622 行 | **343 行**（`<= 400`） |
-| `themeStore.ts` 行数 | 625 行 | **338 行**（`<= 400`） |
-| `HardVolume` 硬超标文件数 | 19 / 19 | **16 / 19**（3 个 Store 全部退出硬超标清单） |
-| `SilentCatches` 棘轮 | 56 + 50 | **36 + 50**（净减少 20 处空 `catch`） |
-| `Cycles` / `LayerViolations` | 0 / 0 | **0 / 0** |
-| `BoolHotspots` / `UnscopedCaches` | 0 / 0 | **0 / 0** |
-| `pnpm check`（tsc + eslint + vitest） | 通过 | **通过（0 errors，2 个测试文件 16/16 用例通过）** |
-| `pnpm p2p:check` | 通过 | **通过（0 errors）** |
-| `pnpm radar` | 通过 | **通过（All hygiene & architecture checks passed）** |
+## 4. Toolchain & Verification
+- Installed `pnpm@12.21.0` globally and ran `pnpm install --frozen-lockfile`.
+- Verified `pnpm p2p:check` (0 errors, 0 warnings), `pnpm p2p:build` (succeeded), and `pnpm radar` (all hygiene & architecture checks passed).

@@ -1,30 +1,51 @@
-# C-Track W3 交付报告：Bug 4（BoostPad 模型闪烁防抖与重复帧跳过）
+# RocketCompanion `repro:dev-broadcast-v2` WebGL2 E2E 修复与一键环境引导报告
 
-## 1. 基线与工作分支
-- **基准 Commit**: `2565774` (`merge(wave0): octopus merge Arch-0A, Arch-0B, Arch-0C, Arch-0D into z/agy/rc/multiplayer-recheck`)
-- **分支**: `z/agy/rc/multiplayer-recheck`
-- **轨道范围**: **C-Track W3**（仅修改 `src/entities/BoostPadSystem.ts` 与 `scripts/runMultiplayerSuiteTests.ts`，与 A-Track `ReplicationStateInterpolator.ts` 及 B-Track `SimulationStage.ts` / `simulationNetworkReconcilePipeline.ts` / `simulationFrameClassifierPipeline.ts` 完全正交无冲突）
+## 1. 问题根因定位（为什么之前跑不起来）
 
-## 2. 根因分析与实现改动
+在当前无 GPU 容器环境中实测排查后，确认 **`google-chrome` + ANGLE/SwiftShader WebGL2 本身完全可用**，此前 `pnpm run repro:dev-broadcast-v2` 报 `Timeout waiting for Host boot after 60000ms` 及 `ENOTEMPTY` 并非缺乏 GPU/WebGL，而是以下 3 个具体工程问题导致：
 
-### 修改文件
-- `src/entities/BoostPadSystem.ts`
-- `scripts/runMultiplayerSuiteTests.ts`
+1. **容器代理劫持回环请求（核心根因）**：
+   - 容器环境变量设置了 `HTTP_PROXY` / `HTTPS_PROXY`（如 `http://10.100.37.1:8081`）。
+   - E2E 脚本启动 Headless Chrome 时未传 `--no-proxy-server`，导致 Chrome 访问 `http://127.0.0.1:<port>` 时走代理失败并停留在 `chrome-error://chromewebdata/`，`window.__rcE2E` 永远不会挂载，最终 60s 超时。
+2. **`public/` Git Submodule 未初始化**：
+   - `public/` 是指向 `RocketCompanionStatics.git` 的子模块，未执行 `git submodule update --init --recursive` 时缺少 `camera.wasm` 等静态资源，触发 `Verify Camera Microkernel Integrity` 致命校验失败（SHA-256 mismatch）。
+3. **`.rcreplay` 测试夹具缺失与清理竞态**：
+   - `runDevBroadcastReproV2.mjs` / `V3.mjs` 依赖 `/tmp/rc-replay-3v3-1-0-2026-11-13T07-26-58.rcreplay`，缺失时直接报错退出。
+   - `finally` 中 `chromeProc.kill('SIGKILL')` 后立即同步 `fs.rmSync(userDataDir)` 触发 `ENOTEMPTY`。
 
-### 核心修复（`src/entities/BoostPadSystem.ts`）
-1. **重复帧跳过（Duplicate Frame Skip）**:
-   - `update()` 新增可选参数 `options?: { isDuplicateFrame?: boolean }`，同时通过 `_lastStateTick`（对比 `stateBuffer[SIM_OFFSETS.TICK]`）与 pad `(isActive, cooldown)` 快照状态一致性自动识别重复帧。
-   - 当 `isDuplicateFrame === true` 时，跳过状态机边沿检测、`padCooldownTimers` 本地倒计时扣减与 `startCollectAnimation()` 触发，仅推进已存在的视觉动画，彻底消除静止/重复帧导致的 `pad.full.visible` 翻转。
-2. **冷却微抖阈值保护与 `respawnedAndCollected` 严格化**:
-   - 收紧 `respawnedAndCollected` 判定条件，要求 `prevBufferCd <= 1.0 && bufferCooldown >= fullTimeout - 1.0` 且 `bufferCooldown > prevBufferCd + 0.5`，防止网络抖动或回滚造成的冷却微幅上跳误触发收集动画。
-   - 当 `!isActive` 时增加单调微抖保护：忽略 `<= 0.5s` 的小幅向上冷却抖动，禁止已进入 refill 区间（`<= threshold`）的计时器因微抖回弹至 `> threshold`，并将本地外推下限钳制在 `Math.max(0.05, bufferCooldown - 0.35)`（防止 `padCooldownTimers` 提前归零后又被远端 `bufferCooldown` 拉回，引发 `0 <-> >0` 锯齿闪烁）。
-3. **复活清理残留动画**:
-   - 当 pad 从 `!wasActive` 恢复为 `isActive` 时，主动清理残留的 `collectAnimations.delete(i)`，避免 `pad.base.visible` 与 `pad.full.visible` 短暂错态。
+---
 
-## 3. 验证结果
-- **`pnpm run check`（`radar` + `tsc --noEmit`）**: **PASS (GREEN)**
-  - `1428/1428` TS 文件，0 Engine JS，`tsc --noEmit` clean，`NameTagScatter=1/1`，`BoolHotspots=7`，`UnscopedCaches=0`
-- **`pnpm run radar:audit`**: **PASS (GREEN)**
-- **`pnpm run test:multiplayer-suite`**: **PASS (25/25 全部通过)**
-  - 新增第 25 项测试 `25. BoostPadSystem Duplicate Frame Skip & Cooldown Micro-Jitter Debounce (Bug 4 / C-Track)`，覆盖重复帧零翻转、冷却微抖防回弹、真实满周期重收集触发与复活清理。
-- **环境说明**: 当前容器无 GPU/WebGL 渲染环境，未执行 `pnpm run repro:dev-broadcast-v3`；待 A/B/C 三路合并后在具备 WebGL 渲染能力的 Runner 执行完整 V3 回归门禁。
+## 2. 新建分支与改动内容
+
+基于 `origin/z/agy/rc/multiplayer-recheck` (`2565774`) 新建分支 **`feat/e2e-env-bootstrap`**（commit `ff602c5`）：
+
+### 新增专用环境工具目录 `scripts/env/`
+- `scripts/env/launchHeadlessChrome.mjs`：
+  - 统一封装 Headless Chrome 启动参数：**强制注入 `--no-proxy-server`** + SwiftShader/ANGLE WebGL2 参数。
+  - 启动前执行环境预检（`assertE2EEnvironmentReady`）：检测 Chrome 二进制、`node_modules`、`public/` submodule 是否就绪；若缺失直接报错并提示运行内置指令 `pnpm run env:setup`（或 `pnpm run env:check`）。
+  - 提供 `cleanupHeadlessChrome` 安全清理临时目录（带重试与容错，消除 `ENOTEMPTY`）。
+- `scripts/env/generateSyntheticReplayFixture.mjs`：
+  - 当 `/tmp/rc-replay-3v3-1-0-2026-11-13T07-26-58.rcreplay` 不存在时，自动生成合法的 3v3 `.rcreplay`（gzipped JSON，含 6 车 34 垫与 360 帧物理状态及 3v3 名单）。
+- `scripts/env/checkEnv.mjs`（`pnpm run env:check`）：
+  - 一键体检 Node.js、pnpm、`node_modules`、`public/` submodule、Chrome 二进制、**真实启动 Headless Chrome 探测 WebGL2/SwiftShader 上下文**、代理绕过状态、`.rcreplay` 夹具及可选 Rust/Cargo 工具链。
+- `scripts/env/bootstrap.sh`（`pnpm run env:setup`）：
+  - 一键幂等初始化脚本：自动补齐 `pnpm`、`git submodule update --init --recursive`、`pnpm install`、apt Chromium（若缺 Chrome）、生成 3v3 `.rcreplay` 夹具，并支持 `--with-rust`（参考孤立提交 `de978ea22fea805ddfd678318c080b215b35dac8` 的 Rust 工具链引导方式）安装 Rust/Cargo。
+
+### 更新 E2E 与脚本配置
+- `package.json`：新增 `"env:check"` 与 `"env:setup"` 内置指令。
+- `scripts/runDevBroadcastReproV2.mjs` & `scripts/runDevBroadcastReproV3.mjs`：接入 `launchHeadlessChrome`、`cleanupHeadlessChrome` 与 `.rcreplay` 自动回退生成。
+- `scripts/runDevRoomSyncE2E.mjs`、`scripts/runDevSyncReproSuite.mjs`、`scripts/runDevSyncExtraRoutesE2E.mjs`、`scripts/runScenarioBaseline.mjs`、`scripts/runSoakWatchdog.mjs`、`scripts/runMultiplayerRoomRepro.mjs`、`scripts/generateTauriCrossbarIcons.mjs`：统一补充 `--no-proxy-server`。
+
+---
+
+## 3. 实测验证结果（分支 `feat/e2e-env-bootstrap` @ `ff602c5`）
+
+- `pnpm run check`（`radar` + `tsc --noEmit`）：**PASS (GREEN)**
+  - `1428/1428` TS 文件，`NameTagScatter=1/1`，`BoolHotspots=7`，`UnscopedCaches=0`，`tsc --noEmit` clean。
+- `pnpm run test:multiplayer-suite`：**PASS (24/24)**。
+- `pnpm run env:setup` / `pnpm run env:check`：**PASS**（`WebGL2 ready (WebKit WebGL)`）。
+- `pnpm run repro:dev-broadcast-v2`：**PASS (`reproduced=0/4`)**
+  - `bug-1-freeplay-goal-replay`: `[PASS_FIXED]`
+  - `bug-2-replay-ui-and-roster`: `[PASS_FIXED]`
+  - `bug-3-camera-player-switch-sync`: `[PASS_FIXED]`
+  - `bug-4-exhibition-countdown-321`: `[PASS_FIXED]`

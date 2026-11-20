@@ -1,26 +1,31 @@
-# Live Chat Worker Assessment & Codebase Readiness Report
+# Track B（Bug 1）修复报告：`fix/bug1-goal-replay-client-dynamics`
 
-## 1. Live Chat Worker (`/help`) Assessment
-- **Status**: Ready to use (`agentlivechatchannel`, `plan: live-chat-v1`, `authEnabled: true`, `builtInConfig: true`).
-- **Assigned Channel**: `ch_1712e873`
-  - `cmd`: `agy_p2p_v1/cmd/ch_1712e873/<command>`
-  - `resp`: `agy_p2p_v1/resp/ch_1712e873/<requestId>`
-  - `chat`: `agy_p2p_v1/chat/ch_1712e873`
-- **Live Verification**:
-  - `POST /chat/send` succeeded (`connackCode: 0`, `pubackedCount: 1`).
-  - `POST /cmd` (`get_status`, `stream: true`) connected, subscribed (`subacked: true`), published, and streamed NDJSON heartbeats cleanly before timing out at 10s (waiting for remote approval).
-  - `p2p-remote-controller` (`useEmqxConnection.ts`) already subscribes to `${prefix}/cmd/#` and `${prefix}/chat/#`, so it automatically receives messages on `ch_1712e873`.
-- **Minor `/help` Documentation Notes (No Worker Change Required)**:
-  - `/chat/poll` does not explicitly document its max `waitMs` (unlike `/cmd`, which specifies `default 300000, max 300000`).
-  - `/cmd` does not list command-specific optional fields (`nodePath`, `targetRegex`, `targetIndex`, `action`, `value`, `prompt`, `script`, etc.), though pass-through JSON forwarding works.
-  - `GET /help` generates a fresh random `channel` on every call; the agent should call it once and reuse the assigned channel ID.
+## 1. 分支与提交信息
+- **Base Branch**: `origin/z/agy/rc/multiplayer-recheck` (`7252e42`)
+- **Feature Branch**: `fix/bug1-goal-replay-client-dynamics`
+- **Verified Bot Commit**: `4364561030117f4b27981cbf44e908ad303adac8`（GitHub GraphQL `createCommitOnBranch`，`signature.isValid: true, state: "VALID"`，`Co-authored-by: Mark <29165094+MaBoCoMark@users.noreply.github.com>`）
 
-## 2. Repository & Architecture Baseline (`agyPreviewInstant`)
-- `pnpm radar -- --audit` passed (`291 files`, `HardVolume=0/0`, `LayerViolations=0`, `Cycles=0`, `P2P Type/Lint Check: PASS`).
-- **Already Present**:
-  - `apps/p2p-remote-controller/src/utils/p2pSecurity.ts`: AES-GCM E2EE envelope (`E2eeEnvelope`), UUID Access Token, Base32 TOTP secret + `otpauth://` URI + 6-digit TOTP generation/verification.
-  - `apps/p2p-remote-controller/src/components/PocketDeckView.tsx` & `usePocketDeckRemoteSync.ts`: Pocket Deck UI with `bridge` and `direct` tabs, plus recent SW caching commit (`ac11e4f`).
-  - `apps/p2p-remote-controller/src/services/aiStudioWindowState.ts`: `classifyAiStudioWindowState` marks windows `"partial"` when `apiKeyLinked` is true but `modelSelected` or `networkConfigured` (`networkVerified || previous?.networkConfigured`) is false.
-- **Next Steps for Live Chat Collaboration**:
-  1. Connect via Live Chat on channel `ch_1712e873` to inspect live Safari windows, test dynamic carousel/ID-shifting pages with regex/name-based targeting (`targetRegex` / `targetIndex`), and debug the `initialize_aistudio` `partial` network flag.
-  2. Implement mobile-marked windows (`isMobile`), dual-mode LAN -> P2P/E2EE-EMQX fallback, TOTP gating on connection & sensitive actions, and reload/refresh mode enhancements while keeping `pnpm radar -- --audit` green.
+## 2. 根因定位
+1. **Host 端 Goal Replay 阶段驱动策略误判导致停止发包**：
+   - 在 `src/game/pipeline/stages/simulationFrameClassifierPipeline.ts` 的 `resolveSimulationDriveMode` 中，原本先判断 `if (flags.isLocalDirectorPreview || flags.isLocalReplayControllerStepping) return 'local-replay-playback'`，再判断 `if (hasServer)`。
+   - Freeplay Goal Replay 启动时 `flags.isLocalDirectorPreview` 为 `true`，导致广播中的 Host（`hasServer: true, isBroadcastingHost: true`）被错误归类为 `'local-replay-playback'`（`shouldBroadcastSnapshot: false`），而不是 `'host-goal-replay'`（`shouldBroadcastSnapshot: true`）。结果 `SimulationStage` 重置了 `broadcastPublisher` 并停止发送 Goal Replay 快照，Client 侧 `spectateInterpolationBuffer` 始终停留在 `bufFrames: 1`。
+   - 同时 `src/game/pipeline/stages/SimulationStage.ts` 中 `stepNetworkReconciliationAndReplayStream` 被 `&& !flags.isLocalDirectorPreview` 拦截，导致 Host 广播期间 `server.update()` 也被跳过。
+2. **Host 端 `executeSimulationOnly` 节流路径跳过 `GameplayModeStage`**：
+   - 在 `src/game/pipeline/FramePipeline.ts` 中，当 `rAF` 节流或后台运行触发 `executeSimulationOnly(timestamp)` 时，仅执行 `stages[0]`（`InputStage`）与 `stages[1]`（`SimulationStage`），跳过了 `stages[2]`（`GameplayModeStage`）且未更新 `dt` / `lastTimestamp`，导致 `FreeplayMode.update()` 中的 `DirectorPreviewSubController` / `ReplayTimelineController.stepPlayback()` 无法推进回放游标。
+3. **关于 `repro:dev-broadcast-v3` 用例时窗的补充核查**：
+   - `scripts/runDevBroadcastReproV3.mjs` 在启动 Host + Client（约 3.5s 静止在 `(0, 0, 93.2)`）后直接调用 `setBallState({ pos: [0, 4850, 95], vel: [0, 2950, 40] })`，且未触发 `lastTouchTick` 或 `onResetKickoff`。`extractGoalReplayFrames` 按 `lookbackSeconds: 10.0` 提取了约 1351 帧（前 ~1185 帧 Host 自身球也静止在 `(0, 0, 93.2)`），而 `runDevBroadcastReproV3.mjs` 仅在进入 replay 后采样前 `6 * 200ms = 1.2s`。
+   - 修复后实测：未改脚本时 Client `bufFrames` 已由 `1,1,1,1,1,1` 恢复为持续递增 `6 -> 7 -> 22 -> 32 -> 40 -> 51`（说明 Host 持续发包、Client 持续入队并插值）；当将 Host `replayController` 定位到进球动态窗口（`tot - 168`）验证时，`bug-1-goal-replay-client-static-no-dynamics` 立即转为 **`PASS_FIXED`**（`enteredReplay: true, distinctBallPositions: 3`，球位置从 `5387.9 -> 5648.1 -> 5884.3` 连续推进）。
+   - 另外核查了 `simulationNetworkReconcilePipeline.ts` 中的 `hasResetSignal` 与 `drainedReplayPackets`：`reconcilerInboundPacketParser.ts` 解析包未挂载 `.signals` 字段，不会每帧误重置 buffer；`policy.mode === 'client-goal-replay'` 时 `shouldFeedReplayTimeline` 为 `true`，`drainedReplayPackets` 正常驱动 `ReplayTimelineController`。
+
+## 3. 修改文件清单
+- `src/game/pipeline/stages/simulationFrameClassifierPipeline.ts`：调整 `resolveSimulationDriveMode` 顺序，使 `hasServer` 优先于 `isLocalDirectorPreview`（`isLocalReplayControllerStepping && !isLocalDirectorPreview` 仍走 `local-replay-playback`），确保 Host Goal Replay 归类为 `host-goal-replay` 并持续广播。
+- `src/game/pipeline/stages/SimulationStage.ts`：将 `stepNetworkReconciliationAndReplayStream` 入口条件改为 `if (isBroadcastingHost || (reconciler && !flags.isLocalDirectorPreview))`，保证 Host Goal Replay 期间 `server.update()` 持续执行。
+- `src/game/pipeline/FramePipeline.ts`：在 `executeSimulationOnly` 中计算有界 `dt`、更新 `lastTimestamp`，并在 `isGoalReplayActive()` 或 `match.state.phase === 'replay'` 时执行 `GameplayModeStage`（`stages[2]`）。
+- `scripts/runMultiplayerSuiteTests.ts`：新增第 27 项单测 `testHostGoalReplayBroadcastAndSimOnlyStepping`。
+
+## 4. 验证结果
+- `pnpm run check`（`radar` + `tsc --noEmit`）：**GREEN**（1430/1430 TS，0 循环依赖，0 hard errors）。
+- `pnpm run test:multiplayer-suite`：**27/27 PASS**。
+- `pnpm run repro:dev-broadcast-v3`（Headless Chrome + WebGL2 + WASM）：
+  - Client `bufFrames` 恢复为 `6 -> 7 -> 22 -> 32 -> 40 -> 51`（不再卡在 `bufFrames: 1`）。
+  - 定位至进球动态窗口（`tot - 168`）验证：`bug-1-goal-replay-client-static-no-dynamics` 判定 **`PASS_FIXED`**（`enteredReplay: true, distinctBallPositions: 3`）。

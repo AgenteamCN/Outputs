@@ -1,57 +1,76 @@
-# RocketCompanion 交接与深度定位报告（用于新对话 + Live Chatting 协同排障）
+# Automation 日志分析与修复报告
 
-**当前集成基线**：`origin/z/agy/rc/multiplayer-recheck-base`（HEAD: `02adc3d1a404858c8186fee283658b69c2b3b3fa`）  
-**分支清理状态**：所有 `origin/fix/bug*` 历史分支（含已确认丢弃的 `fix/bug5-replay-geometry-leak`）已全部清理完毕（`HTTP 204`）。  
-**环境基线状态**：`bootstrap.sh`（冷启动 ~20s）、`doctor.mjs --auto-restore`（温启动 1.52s）、OverlayFS **29 MB**（预算 <= 100 MB）、Headless WebGL2 均正常可用。  
-**已通过用例**：`pnpm run check`（1430/1430）、`pnpm run test:multiplayer-suite`（28/28）、`bug-4`（BoostPad 闪烁）、`bug-5`（几何体泄漏）。
+Commit: `78ae3820097912c0520f396fb14eff421fa7db70` (branch `a2`, verified bot commit)
 
 ---
 
-## 一、核心结论：你的需求没有矛盾，问题出在“测试夹具耦合 + 架构耦合”
+## 一、问题根因定位（结合本次 Automation 导出日志）
 
-经过对用户澄清的规格与代码实现的逐一核对，**你的产品逻辑本身完全自洽**：
+### 1. 「针对第一个 window 重复设置」的根因
+在排查底层 AX Helper 与前端状态流时，发现两个直接导致「第一个窗口反复被配置」的缺陷：
 
-1. **Bug 2（Replay Watch Together NameTag & 视角）**：
-   - **你的真实规格**：Host 加载 Replay 后全量广播 6 辆车的 roster / loadout / NameTag 数据（`carIndex 0..5`）；Camera / BallCam / Replay Watch Together 采用**边沿触发（Edge-Triggered）**同步——Host 切换时广播给所有 Client 同步切换，长期不切换时 Client 可本地自由切视角。
-   - **为什么测试还报 FAIL**：`scripts/runDevBroadcastReproV3.mjs`（L349-352, L377-387）**没有校验全车 NameTag 数据映射**，而是去比较 `_visibleCards2D + _offscreenIndicators2D`（受屏幕视锥体裁剪）。由于 Host 与 Client 默认镜头角度不同（或未触发一次边沿切换），`host.tags` 只看见 `[1,4,5,3]`、`client.tags` 只看见 `[2]`，导致误报失败。
-   - **待确认/定位方向**：
-     1. 确认 Client 的 `nameTagSystem` 底层是否确实已收到全部 6 辆车的 NameTag 数据与队伍色（`arenaCarTeams` 已一致：`[0,0,0,1,1,1]`）；
-     2. 确认 Replay 刚加载进入 Watch Together 时是否需要补发一次初始视角边沿事件，并修正 `runDevBroadcastReproV3.mjs` 的断言（直接校验 6 车 NameTag 数据，或在测试中触发一次 Host 视角切换来验证边沿同步）。
+1. **Swift AX Helper 标题回退误命中第一个窗口（核心根因）**
+   - 文件：`packages/macos-ax-helper/Sources/MacosAxHelper/AccessibilityEngine.swift` (`findWindowElement`)
+   - 原逻辑在 `_AXUIElementGetWindow(win, &cgId) == targetWindowId` 未命中时（例如窗口位于其他 Space、最小化或刚新建尚未绑定 AX 窗口），会回退到按窗口标题精确匹配：`axWindows.first { title == info.title }`。
+   - 由于所有 AI Studio 窗口的标题都是 `"Google AI Studio"`，**`axWindows.first` 永远会命中第一个窗口**，导致对其他 `windowId`（如日志中 `run-2/3/5/6` 反复出现的 `56122`）执行 `scanWindow`、`focusWindow`、`performAction` 时，实际全部打到了**第一个窗口**上。
+   - **修复**：仅当 `info.title` 非空，且该标题在 `safariWindows` 与 `axWindows` 中**均唯一**时才允许标题回退，否则返回 `nil` 明确报错，杜绝静默误操作第一个窗口。
+   - **注意**：由于当前沙箱为 Linux x86_64 环境，无法本地编译 Swift macOS 二进制，请在 macOS 上重新执行 `pnpm ax-helper:build` 使 Swift 修复生效。
 
-2. **Bug 1（Freeplay Goal Replay 时长与动态性）**：
-   - **你的真实规格**：Goal Replay 环形缓冲上限为 **10 秒**；如果进球过程只有 2 秒就放 2 秒，超过 10 秒就放最后 10 秒，有多少放多少。
-   - **为什么测试还报 FAIL**：`runDevBroadcastReproV3.mjs`（L245-248）为了快速造进球，把球直接瞬移到门前 `y=4850, vel_y=2950`，**0.1 秒就进门了**；叠加 `7147838` 裁剪前置空闲帧后，整段 Goal Replay 只剩 **~0.4 秒**。测试在 `waitFor('Host/Client enters Goal Replay')` 之后才开始每 200ms 采样一次，前 2 帧在 `replay`，第 3 帧就已切回 `playing`（`0, 0, 93.2`），从而触发 `distinctBallPositions <= 2` 报错。
-   - **待确认/定位方向**：
-     1. 检查在 `phase === 'replay'` 的有效帧内，Client 端的球和车是否**真正在连续运动**（排除“Replay 里依然静止”的真 Bug）；
-     2. 如果 Replay 内本身是动态的，则修正测试造球距离（例如从半场 `y=1500` 射门，产生 >= 2 秒自然缓冲）且只统计 `phase === 'replay'` 期间的采样点。
+2. **模型名称正则与界面展示名不匹配，导致 `select_model` 每次都不跳过**
+   - 文件：`apps/p2p-remote-controller/src/services/aiStudioAxHelpers.ts` (`isHarnessModelSelected`)
+   - 默认 `modelRegex` 为 `"gemini-4-hydrogen"`（带连字符），但收起后的模型按钮通常只包含展示名 `"Gemini 4 Hydrogen"`（空格分隔）。因此 `isHarnessModelSelected` 始终返回 `false`，导致每次初始化都会重复点开模型选择器。
+   - **修复**：`buildModelMatcher` 同时支持连字符与空格分隔格式（例如 `gemini-4-hydrogen` 同时匹配 `Gemini 4 Hydrogen`）。
 
-3. **Bug 3（120Hz 物理 vs 变帧率渲染，以及后台 Tab 冻结）**：
-   - **业界标准架构（120Hz 物理 + 144/165/180Hz 渲染）是怎么做的**：
-     - **物理线程/逻辑步进**按固定时间步长 `dt = 1/120s (8.333ms)` 通过 **时间累加器（Accumulator）** 独立推进，**不与渲染帧率 1:1 绑定**。
-     - 当显示器是 144Hz/165Hz/180Hz（甚至未来物理降到 90Hz 或升到 150Hz）时，每次渲染帧根据 `alpha = accumulator / fixedDt ∈ [0, 1)`，对相邻两个物理帧 `prevState` 与 `currState` 做**状态插值（`PhysicsStateInterpolator`）**后送去渲染。这样无论渲染跑 30 FPS 还是 180 FPS，物理始终精确按 120Hz 演算，画面丝滑无跳变。
-   - **为什么当前测试会出现“23 帧冻结 + 单步跳变 1341.8 uu”**：
-     1. **测试环境触发了 Chrome 后台 Tab 降频**：`runDevBroadcastReproV3.mjs`（L326, L400）调用了 `clientCdp.send('Page.bringToFront')`，导致 **Host Tab 退居后台**。因为当前 Host 的 Replay 播放与广播仍挂载在 `requestAnimationFrame` 主循环上（未完全与 `rAF` 解耦），Chrome 对后台 Tab 的 `rAF` 强行降频成 1~4Hz 突发，Host 每次突发直接跨 41~54 ticks。
-     2. **Client 端 Lookahead / 插值在突发间隙没有平滑接管**：在 Host 两次突发之间的 23 个 Client `rAF` 帧里，Client 球坐标完全不动（`dist < 0.01`）。需要排查在 `client-csr-spectate` / Replay Watch Together 模式下：`shouldRunLookahead`（`src/game/pipeline/stages/simulationFrameClassifierPipeline.ts`）与 `SpectateInterpolationBuffer` 为什么没有在等待新快照时平滑推进或插值。
+3. **`resetWindowNetworkConditionRef` 未绑定**
+   - 文件：`apps/p2p-remote-controller/src/hooks/useSafariWindowManager.ts`
+   - `resetWindowNetworkConditionRef` 初始化为空函数但从未绑定 `batchOps.resetWindowNetworkCondition`，导致页面重载或关闭时无法正确清理窗口就绪缓存。已补充 `useEffect` 绑定。
 
 ---
 
-## 二、全局 4.5 分钟（270s）软限制与 Streaming Output 缺口清单
+### 2. 「Load All Keys (Load or Keys) 点不动 / 跳过」的根因
+对应日志中的 `run-7`、`run-8`、`run-9`、`run-10`、`run-11`：
 
-目前仓库**尚未统一**全局软限制（容器硬上限 300s - 30s 安全裕度 = **270s / 270,000ms**）：
-- **仍为 280s（裕度仅 20s）**：`scripts/runMultiplayerSuiteTests.ts`、`scripts/env/bootstrap.sh`
-- **无 Watchdog**：`scripts/runMultiplayerSyncIssuesRepro.ts`（`repro:sync-issues`）
-- **各自硬编码 260s / 270s / 180s**：`runDevBroadcastReproV2/V3`、`runDevSyncReproSuite`、`runDevSyncExtraRoutesE2E`、`runMultiplayerRoomRepro`、`runMultiplayerChaosRepro`、`runScenarioBaseline`、`runDevRoomSyncE2E`、`runSoakWatchdog`
-- **Streaming Output 不一致**：仅部分脚本实时逐行输出，多数脚本在结束时才汇总打印，超时易丢遥测。
-
-**改造目标**：新建统一的 `scripts/lib/softTimeoutWatchdog.mjs`（默认 `RC_SOFT_LIMIT_MS=270000`，支持 `.unref()` + `SIGINT/SIGTERM` 清理 + 逐用例/逐阶段实时 flush），并接入所有 `test:*` / `repro:*` / `bootstrap.sh`。
+1. **有 96 个元素但因 `webAreaLoaded=false` 被直接跳过**
+   - 日志证据：`run-7` 与 `run-8` 中，新建的 4 个窗口（`59388, 59386, 59384, 59382`）和现有窗口均记录 `status=loading (Loading (96 elements))`。页面其实已经渲染出 96 个 AX 元素，但 Safari 的 `AXLoaded` 属性尚未置为 `true`，`linkAllSafariApiKeys` 直接因 `info.status === "loading"` 跳过。
+2. **切窗口后瞬时只扫出 4 个元素未重试**
+   - 日志证据：`run-10` 所有窗口记录 `Loading (4 elements)`，`linkAllSafariApiKeys` 未做短暂停顿重试就直接跳过。
+3. **点击 `AXPress` 使用 `BestEffort` 吞掉异常且不校验结果**
+   - 原代码使用 `performAxActionBestEffort`，即使 `AXPress` 失败也会记为 `outcome: "ok"`；且点击后不检查窗口状态变化。
+   - **修复**（`apps/p2p-remote-controller/src/services/aiStudioBatch.ts`）：
+     - 若首次扫描元素数 `<= 10`，等待 350ms 后重试一次扫描；
+     - 若元素数 `> 10`（即使 `webAreaLoaded=false`），不再盲目跳过，继续检查 `isApiKeySelected` 与 `Link API Key` / `No API key selected` 按钮；
+     - 改用 `performAxAction` 执行 `AXPress`（失败会如实记录 `failed`），并在点击 250ms 后复扫记录 `pre=(...)` 与 `post=(...)` 状态；
+     - 修复 `resolveTargetWindowIds` 在 `explicitIds` 为空数组 `[]` 时错误回退到所有 Safari 窗口的问题。
 
 ---
 
-## 三、新对话 + Live Chatting 建议推进顺序
+## 二、Automation Log 细节增强
 
-1. **并行只读定位（3 路齐发）**：
-   - **路 1（Bug 1）**：实测打点 `phase === 'replay'` 期间每一帧的球/车坐标，确认是“真的静态不动”还是“测试 0.1s 进球太短”。
-   - **路 2（Bug 2）**：核查 Replay Watch Together 下 Client `nameTagSystem` 的 6 车全量数据状态，以及 Host 加载 Replay 时初始视角边沿广播是否缺失。
-   - **路 3（Bug 3）**：核查 Host 后台循环与 `rAF` 解耦方案（如 `MessageChannel`/Worker/`setTimeout` 驱动），以及 Client `SpectateInterpolationBuffer` + `spectatePhysicsLookaheadPipeline.ts` 为何出现 23 帧冻结。
-2. **基础设施收口**：落地 `scripts/lib/softTimeoutWatchdog.mjs`（统一 270s 软限制 + Streaming Output）。
-3. **一次性精准修复 + 全量回归**：修完后跑通 `pnpm run check`、`pnpm run test:multiplayer-suite`、`pnpm run repro:dev-broadcast-v3`（目标 `reproduced=0/5`）。
+为了后续遇到任何 UI/AX 异常时能够直接从导出日志定位，增强了以下细节：
+1. **`summarizeScanForTracker`** (`apps/p2p-remote-controller/src/services/automationTracker.ts`)：
+   - 新增 `url`（pathname）、`skipBtn=true`、`noThanks=true`、`harnessBtn="..."`（模型按钮文本摘要）、`geminiDefault=true`、`saveBtn=enabled|disabled|missing`。
+2. **`init_all` 队列明细** (`apps/p2p-remote-controller/src/services/aiStudioBatchRoundRobin.ts`)：
+   - 为每个进入 `pendingQueue` 的窗口记录 `queue_window` (`started`)，包含 `status`、`apiKey`、`model`、`net` 布尔值与 `detail`，明确说明为何该窗口被重新排队。
+3. **`select_model` 启动日志** (`apps/p2p-remote-controller/src/services/aiStudioAxHelpers.ts`)：
+   - 未跳过模型选择时记录 `select_model` (`started`) 及当前 `harnessBtn` 文本。
+4. **`save_network_modal` 失败复扫** (`apps/p2p-remote-controller/src/services/aiStudioInitSteps.ts`)：
+   - 针对日志 `run-12` 中 `59424` 出现的 `Network Configuration modal did not close after clicking Save`，在失败时自动复扫窗口并记录 `summarizeScanForTracker`（含 `saveBtn=enabled|disabled`、`domains=[...]`）。
+
+---
+
+## 三、验证结果
+
+以下检查均在沙箱中运行并通过：
+- `pnpm run p2p:check`（`tsc --noEmit && eslint src`）：通过，0 错误
+- `pnpm --filter p2p-remote-controller exec vitest run`：10 个测试文件、37 个测试用例全部通过（含新增的 `Gemini 4 Hydrogen` 匹配测试、`summarizeScanForTracker` 测试、`linkAllSafariApiKeys` 在 `webAreaLoaded=false` 且 `elements > 10` 时的点击测试）
+- `pnpm run check`（根目录 `tsc --noEmit && eslint src && vitest run`）：3 个测试文件、19 个测试用例全部通过，0 错误
+
+---
+
+## 四、环境初始化脚本在当前沙箱中的局限性（重要说明）
+
+1. **`/tmp` 在每次独立命令调用间会重置**
+   - 本次通过 `bash scripts/env/bootstrap.sh` 完成初始化后，在下一次独立 shell 调用中 `/tmp/agy-cache/` 已被清空，导致 `apps/p2p-remote-controller/node_modules -> /tmp/agy-cache/p2p-node_modules` 悬空，`tsc --noEmit` 报找不到 `react` 等模块。
+   - 初始化脚本无法跨独立容器调用阻止 `/tmp` 重置；实际执行任何 `pnpm` 检查或测试命令前，必须在**同一条 shell 命令中**串联 `node scripts/env/doctor.mjs --auto-restore && <command>`。
+2. **Rust / Tauri 工具链与 macOS Swift 编译**
+   - `bootstrap.sh` 默认不安装 Rust（`[WARN] Rust/Tauri (optional) not installed`）；且当前沙箱为 Ubuntu 24.04 x86_64，无法编译 `packages/macos-ax-helper` 的 Swift macOS 代码（`AccessibilityEngine.swift` 需在 macOS 本机执行 `pnpm ax-helper:build` 重新打包）。

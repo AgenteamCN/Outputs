@@ -1,68 +1,68 @@
-# 路 2 定位与修复报告：Replay Watch Together NameTag 全量同步 & 边沿触发视角同步（Bug 2）
+# 路 1（Bug 1：Freeplay Goal Replay 时长与动态性）定位与修复报告
 
-## 1. 核心结论（确定性）
+## 1. 核心结论（Deterministic）
 
-1. **Client `nameTagSystem` 底层 6 车 NameTag 数据与队伍色已完整同步，无产品代码 Bug**：
-   - Host 进入 Replay Watch Together 并广播 `replaySync.roster` 后，Client 端通过 `devSyncChannelHandlers.ts`（`applyClientReplayActivitySync` 与 `onGlobalWorkspaceBroadcast`）调用 `syncReplayRosterTeamsAndNameTags` -> `projectMatchRoster`（`src/game/runtime/MatchRosterProjection.ts`），将全部 6 辆车（`carIndex: 0..5`）的 `name`、`username`、`team`、`isBot` 写入 `getNameTagRuntimeState().carEntries`，并同步更新 `physics.setCarTeam` 与 `arena.setCarTeam`（`arena.carTeams === [0, 0, 0, 1, 1, 1]`）。
-   - `VehicleNameTagSystem.update`（`src/entities/arena/VehicleNameTagSystem.ts` L157-160）直接读取 `getNameTagRuntimeState().carEntries` 与 `arena.carTeams` 渲染所有车辆的 NameTag。
-2. **Replay 刚加载进入 Watch Together 时已补发初始视角边沿事件，边沿触发（Edge-Triggered）同步链路完整**：
-   - Host 在 `StandaloneReplayViewerController._initializeLoadedReplaySession`（`src/replay/StandaloneReplayViewerController.ts` L281-294）先调用 `rosterSubController.applyInitialPovToRuntime(this.runtime)`，再调用 `_emitStateTransition(0, true, true, loadedFileName)`。
-   - `syncReplayWorkspaceToOnlineRoom`（`src/replay/replayOnlineSyncHelper.ts` L156-180）在 `opts.switchActivity && opts.active` 时执行 `sharedAuthorityCameraSyncTracker.bumpLocalSeq()`，将递增后的 `cameraSyncSeq` 随 `cameraSync` 广播给 Client。
-   - Client 端 `AuthorityCameraSyncTracker.shouldApplyIncomingCameraSync`（`src/game/pipeline/stages/AuthorityCameraSyncTracker.ts` L110-163）仅在 `(epoch, seq)` 推进或初次收到新 key 时返回 `true`；在 Host 未切换视角期间（即使每 500ms 发送心跳），Client 的本地视角切换不会被 Host 心跳覆盖；一旦 Host 发生新的视角切换（`SimulationStage.ts` L411 `pollLocalCameraChange` 或 `ReplayOnlineHeartbeatTracker.maybeSync`），`cameraSyncSeq` 递增并立即同步给 Client。
-3. **原 `runDevBroadcastReproV3.mjs` 断言耦合问题**：
-   - 原脚本通过比较 `nts._visibleCards2D + nts._offscreenIndicators2D` 校验 NameTag，受 POV 聚焦车排除与屏幕视锥裁剪影响（实测 Host `tagsCount=4`、Client `tagsCount=3`），无法代表底层 6 车全量 NameTag 状态，且未测试边沿触发视角同步。
+**产品逻辑完全正常且在 `phase === 'replay'` 期间具备完整动态性，不存在“Client 进入 Goal Replay 后球/车永久静止”的引擎 Bug。**
+
+原 `scripts/runDevBroadcastReproV3.mjs` 报告 `bug-1-goal-replay-client-static-no-dynamics`（`distinctBallPositions: 1`）是由**测试夹具的三个叠加问题**导致的误报：
+1. **造球距离过近（0.09s 进门）**：原测试在 `y=4850, vel_y=2950` 造球，距球门线（`y=5120`）仅 `270 uu`，约 `0.09s`（~11 ticks）即进门；叠加 `trimLeadingIdleGoalReplayFrames(extractedFrames, 12)` 裁剪前置空闲帧后，进门前有效动态窗口极短。
+2. **`?skipShaderPrewarm=1` 触发 SwiftShader 首次 Goal Replay 着色器编译卡顿（6.6s–13.3s）**：在无头 Chrome SwiftShader 环境下，由于测试 URL 带 `?skipShaderPrewarm=1`，Host 在**第一次**进入 Goal Replay 首帧时会触发一次性的 WebGL 着色器编译卡顿（单 Tab 实测 `dt=6657ms–6839ms`，双 Tab 实测 `dt=8000ms–13292ms`；同一会话第二次 Goal Replay 卡顿完全消失，30 帧丝滑推进）。在此卡顿窗口内 Host 主线程阻塞、暂停广播新快照，Client 停留在已收到的最后一帧（`bufFrames: 3`）。
+3. **固定 `6 × 200ms`（1.2s）轮询窗口全部落入卡顿期且未过滤 `phase === 'replay'`**：原测试在 `Client enters Goal Replay` 后仅采样 `1.2s`，6 个采样点全部落在 Host 首次着色器编译卡顿期间，导致 `bx=0, by=4972.8, bz=96` 连续 6 次完全相同（`distinctBallPositions === 1`）。
 
 ---
 
-## 2. 代码与链路核查明细
+## 2. 实测数据与根因证据链
 
-### 2.1 6 车 NameTag 数据同步链路
-- **Host 广播**：`src/replay/replayOnlineSyncHelper.ts`（L141-153）将 `rvStore.resolvedRoster` 映射为 `replaySync.roster`（含 `carIndex`、`name`、`team`、`isBot`），随 `room_activity_switch` 与 `global_workspace_broadcast` 发送。
-- **Client 接收**：`src/game/runtime/devSyncChannelHandlers.ts`
-  - `applyClientReplayActivitySync`（L130-135）：在 `room_activity_switch` 时调用 `syncReplayRosterTeamsAndNameTags`。
-  - `onGlobalWorkspaceBroadcast`（L283-289）：在 `global_workspace_broadcast` 时调用 `syncReplayRosterTeamsAndNameTags`。
-- **底层状态写入**：`src/game/runtime/MatchRosterProjection.ts`（L36-92）
-  - 对每辆车调用 `physics?.setCarTeam(entry.carIndex, entry.team)` 和 `arena?.setCarTeam(entry.carIndex, entry.team)`。
-  - 调用 `setNameTagRuntimeState({ isMultiplayerOrMultiCarMode: roster.length > 1, carEntries })`，写入完整 6 车 `carEntries`。
+### 2.1 基线复现数据（修改前）
+运行 `pnpm run repro:dev-broadcast-v3`：
+```json
+{
+  "enteredReplay": true,
+  "distinctBallPositions": 1,
+  "replaySamples": [
+    {"phase":"replay","hudPhase":"replay","camMode":"pov","override":true,"bx":0,"by":4972.8,"bz":96,"bufFrames":3},
+    {"phase":"replay","hudPhase":"replay","camMode":"pov","override":true,"bx":0,"by":4972.8,"bz":96,"bufFrames":3},
+    {"phase":"replay","hudPhase":"replay","camMode":"pov","override":true,"bx":0,"by":4972.8,"bz":96,"bufFrames":3},
+    {"phase":"replay","hudPhase":"replay","camMode":"pov","override":true,"bx":0,"by":4972.8,"bz":96,"bufFrames":3},
+    {"phase":"replay","hudPhase":"replay","camMode":"pov","override":true,"bx":0,"by":4972.8,"bz":96,"bufFrames":3},
+    {"phase":"replay","hudPhase":"replay","camMode":"pov","override":true,"bx":0,"by":4972.8,"bz":96,"bufFrames":3}
+  ]
+}
+```
 
-### 2.2 边沿触发视角同步链路
-- **初始进入边沿**：`StandaloneReplayViewerController._initializeLoadedReplaySession` -> `_emitStateTransition(0, true, true, loadedFileName)` -> `syncReplayWorkspaceToOnlineRoom(..., { switchActivity: true })` -> `sharedAuthorityCameraSyncTracker.bumpLocalSeq()`。
-- **运行期边沿检测**：
-  - `SimulationStage.ts`（L411-420）：`sharedAuthorityCameraSyncTracker.pollLocalCameraChange(camera, authEpoch, localPeerId)` 检测 `isFreeCam:ballCam:focusedCarIndex` 变化并发送 `camera_state_sync`。
-  - `ReplayOnlineHeartbeatTracker.maybeSync`（`src/replay/replayOnlineSyncHelper.ts` L202-236）：检测 `cameraChanged` 时同样 `bumpLocalSeq()` 并广播。
-- **Client 非覆盖保证**：`AuthorityCameraSyncTracker.shouldApplyIncomingCameraSync` 记录 `lastAppliedEpoch`、`lastAppliedSeq`、`lastAppliedKey`（均为上一次**已应用**的远端状态而非 Client 本地状态），因此 Host 2Hz 心跳重复发送相同 `(seq, key)` 时返回 `false`，Client 可自由本地切视角。
+### 2.2 页面内打点（100ms `setInterval` + `rAF` 帧耗时）
+- **双 Tab 原参数（`y=4850, vel_y=2950`）打点**：
+  - Host 在 `t=1598ms` 进入 `phase: "replay"`，`t=1801ms` 推进到 `by=5095.5`；随后主线程卡顿 **~7.95s**（`t=1801ms -> t=9749ms`）。
+  - 在此期间 Client 处于 `phase: "replay"`，`lpTick: 12393`、`bufFrames: 2`、`by: 4997.4` 保持不变等待 Host 新帧。
+- **单 Tab 第一轮 vs 第二轮 Goal Replay 对比（`y=1500, vel_y=2000`）**：
+  - **Round 1**：进入 `replay` 首帧后出现 `dt: 6657ms` 卡顿（SwiftShader 首次编译 Goal Replay / Director / Goal Explosion 着色器）。
+  - **Round 2**：**零卡顿**，共记录 30 个 `replay` 帧，球坐标连续推进：`by: 2113.7 -> 2377.3 -> 2967.6 -> 3258.3 -> 4004 -> 4993.2 -> 5043.6 -> 5575.2`。
+- **双 Tab 中场射门（`y=1500, vel_y=2000`）页面内 `rAF` 采样**：
+  - Client 在 `phase === 'replay'` 期间共采集 11 帧（越过一次性着色器编译卡顿后 `bufFrames` 从 10 增长到 51–64），球坐标连续变化：
+    `Distinct positions: ["0,2574.3,106.1", "0,4295.5,93.2", "0,5315.8,93.1", "0,5575.2,101.7"]`（`distinctBallPositions = 4`）。
 
----
-
-## 3. 本次修改与验证
-
-### 3.1 修改文件
-1. `src/game/runtime/RuntimePostprocessingAndSessionBootstrap.ts`
-   - 从 `../runtimeUiPort.ts` 导入 `getNameTagRuntimeState`，在 `window.__rcE2E` 上暴露 `getNameTagState: () => getNameTagRuntimeState()`，便于 E2E 直接核验底层 `carEntries`。
-2. `scripts/runDevBroadcastReproV3.mjs`（Bug 2 用例）
-   - 直接校验 Host 与 Client 的 `getNameTagState().carEntries`（6 辆车 `carIndex: 0..5`、`name`、`team` 全量一致）及 `arena.carTeams === [0, 0, 0, 1, 1, 1]`，同时保留 `tagsCount > 0` 渲染检查。
-   - 新增 3 步边沿触发视角同步 E2E 断言：
-     1. Host 切换 `focusedCarIndex = 2, ballCam = false` -> Client 在 5s 内跟随至 `(2, false)`；
-     2. Client 本地切换 `focusedCarIndex = 4` 并等待 1.2s（Host 保持不动）-> Client 保持在 `4` 不被心跳覆盖；
-     3. Host 再次切换 `focusedCarIndex = 5, ballCam = true` -> Client 在 5s 内切回 `(5, true)`。
-
-### 3.2 实测结果
-- `pnpm run check`（`radar` + `tsc --noEmit`）：**GREEN / PASS**（1430/1430 TS，0 循环依赖，0 类型错误）。
-- `RC_SUITE_WATCHDOG_MS=280000 pnpm run test:multiplayer-suite`：**ALL MULTIPLAYER SUITE TESTS PASSED**。
-- `pnpm run repro:dev-broadcast-v3`（Bug 2 实测输出摘要）：
-  - `host.numCars: 6`, `host.arenaCarTeams: [0,0,0,1,1,1]`, `host.tagsCount: 4`
-  - `client.numCars: 6`, `client.arenaCarTeams: [0,0,0,1,1,1]`, `client.tagsCount: 3`
-  - `host.carEntries` 与 `client.carEntries` 均为完整 6 车（`Ducky_Blue_1..3` team `0`，`Ducky_Orange_1..3` team `1`），`carEntryMismatches: []`, `teamMismatch: false`
-  - `edgeSync`: `edgeSyncOk: true`
-    - `clientAfterHostEdge1`: `{"focusedCarIndex":2,"ballCam":false,"isFreeCam":false}`
-    - `clientAfterLocalSwitch`: `{"focusedCarIndex":4,"ballCam":false,"isFreeCam":false}`
-    - `clientAfterHostEdge2`: `{"focusedCarIndex":5,"ballCam":true,"isFreeCam":false}`
-  - 结果：`[PASS_FIXED] bug-2-replay-nametag-and-team-desync`。
+### 2.3 代码链路核查
+- **Host 侧**：`src/game/modes/freeplay/freeplayGoalReplaySessionPipeline.ts`（L90-104）使用 `lookbackSeconds: 10.0` 提取缓冲并裁剪前 12 个静止帧（`trimLeadingIdleGoalReplayFrames`），由 `FramePipeline.ts`（L235/L264 `Math.min(dt, 0.1)` 钳制步长）驱动 `directorPreviewFrameStepPipeline.ts` 播放并广播快照。
+- **Client 侧**：
+  - `src/game/pipeline/stages/simulationFrameClassifierPipeline.ts`（L243-251）将 `client-goal-replay` 分类为 `shouldRunLookahead: false, shouldFeedReplayTimeline: true`。
+  - `src/game/pipeline/stages/simulationNetworkReconcilePipeline.ts`（L213-312）启用 `spectateInterpolationBuffer`，将 Host 广播帧压入缓冲并在 `applySpectateSampleOrLookahead` 中采样应用至 `physics` 与 `interpolator`。
+  - `src/game/modes/shared/networkStreamedGoalReplayCoordinator.ts`（L122）仅在 `isCustomScrubbing` 时由本地 `applyToEngine`，正常播放时完全由网络插值缓冲平滑驱动，无冲突覆写。
 
 ---
 
-## 4. Git 提交与分支信息
+## 3. 修复与验证结果
 
-- 新建分支：`z/agy/rc/track2-bug2-nametag-edgesync`（基于 `origin/z/agy/rc/multiplayer-recheck-base` @ `02adc3d`）
-- Verified Bot Commit：`826162b5baf63ab34c9c8dbb90d3d56917030da3`（`verified: True`）
-- Commit Message：`test(e2e): verify 6-car NameTag carEntries and edge-triggered camera sync in Replay Watch Together`
+### 3.1 修复内容（已提交新分支）
+- **分支**：`z/agy/rc/track1-bug1-goal-replay-test-fix`（基于 `origin/z/agy/rc/multiplayer-recheck-base`）
+- **Commit**：`0ff3e161b3cb700d636044aa63641181067f8ee7`（Verified Bot Commit，`verified: true, reason: "valid"`）
+- **改动文件**：`scripts/runDevBroadcastReproV3.mjs`（REPRO 1 区块）
+  1. 在 `setBallState` 之前于 Client 注入页面内 `rAF` 采样器，仅收集 `phase === 'replay' || hudPhase === 'replay'` 的帧，避免 `waitFor` 轮询错过早期帧或混入退出后的 `playing` 帧。
+  2. 将造球参数改为中场射门 `pos: [0, 1500, 95], vel: [0, 2000, 200]`（距球门 ~3620 uu，飞行 ~1.8s+，形成 >= 2s 自然缓冲）。
+  3. 等待 Host 完整退出 Goal Replay（超时 30s，覆盖 `?skipShaderPrewarm=1` 下 SwiftShader 首次编译耗时）后再读取 Client 采样结果并统计 `distinctBallPositions`。
+
+### 3.2 回归验证
+1. `pnpm run repro:dev-broadcast-v3`：
+   - `bug-1-goal-replay-client-static-no-dynamics` -> **`PASS_FIXED`**
+   - 输出：`{"enteredReplay":true,"distinctBallPositions":4,"sampleCount":22,...}`
+2. `pnpm run check`（`radar` + `tsc --noEmit`）：
+   - **STATUS: GREEN**（1430/1430 TS files，0 errors）。

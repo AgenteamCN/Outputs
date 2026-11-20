@@ -1,39 +1,25 @@
-# Root Cause & Fix Summary
+# Wave 1 `chore/strip-legacy-spectate` 执行报告
 
-## 原因分析 (Root Cause)
-上个 commit (`1815afa`) 在 `packages/macos-ax-helper/Sources/MacosAxHelper/SafariController.swift` 的 `executeJavaScript` 中引入了如下判断：
+- **基线分支**：`origin/z/agy/rc/multiplayer-recheck-base` (`2fc5fc0`)
+- **目标分支**：`chore/strip-legacy-spectate`
+- **Verified Bot Commit**：[`7c80b445f2953076e5356320c6e91bc04da4bba8`](https://github.com/Antigravi-ty/RocketCompanion/commit/7c80b445f2953076e5356320c6e91bc04da4bba8)（`signature.isValid: true`, `state: "VALID"`）
 
-```swift
-let isBlockStatement = normalized.contains("\n")
-    || normalized.contains(";")
-    || normalized.hasPrefix("return ")
-    ...
-let body = isBlockStatement
-    ? "\(normalized);return 'ok';"
-    : "var __r=(\(normalized));return typeof __r==='string'?__r:(JSON.stringify(__r===undefined?null:__r)||'null');"
-```
+## 变更摘要
 
-`networkRecorderClient.ts` 中的探针、注入、轮询等脚本（如 `buildNetworkRecorderProbeScript()`、`buildNetworkRecorderInstallScript()`、`buildNetworkRecorderPollScript()`）全都是多行 IIFE `(function(){ ... return { ... }; })()`。由于它们内部包含换行 `\n` 和分号 `;`，被误判为 `isBlockStatement = true`，导致执行体变成：
+1. **删除旧观战 Lookahead 管线**：
+   - 删除 `src/network/sync/spectateLookaheadPipeline.ts`
+   - 删除 `src/game/pipeline/stages/spectatePhysicsLookaheadPipeline.ts`
+2. **剥离 `src/network/sync/ReplicationStateInterpolator.ts` 单调 tick / 外推 / Lookahead 耦合**：
+   - 移除 `ReplicationStateInterpolator.pushSample` 中的 `snapshot.tick < last.tick` 清空缓冲逻辑。
+   - 将 `SpectateInterpolationBuffer` 精简为无 Lookahead、无外推、无单调 tick 假设的干净空壳透传缓冲（`pushFrame` / `sample` / `reset` / `getStats`），天然兼容正放、倒放（Rewind）、暂停与跳帧。
+3. **清理仿真驱动分类与网络同步管线旧补丁**：
+   - `src/game/pipeline/stages/simulationFrameClassifierPipeline.ts`：移除 `SimulationDrivePolicy.shouldRunLookahead` 及相关分支判断。
+   - `src/game/pipeline/stages/simulationNetworkReconcilePipeline.ts`：移除 `spectatePhysicsLookaheadPipeline` 引用、`lastAcknowledgedControls` lookahead 状态以及 `applySpectateSampleOrLookahead` 调用；Pure CSR 观战流直接通过 `spectateInterpolationBuffer.sample(now)` + `applyReplayFrameToEngine` 应用帧。
+   - 核查 `src/game/pipeline/stages/SimulationStage.ts` 与 `src/ui-core/stores/hudStore.ts`，确认无残留 Lookahead 观战临时补丁。
+4. **同步更新测试套件**：
+   - `scripts/runMultiplayerSuiteTests.ts`：更新 Section 16（验证 `SpectateInterpolationBuffer` 空壳透传与倒放非单调 tick 兼容性）与 Section 26（验证 Pure CSR 观战不触发本地 WASM 物理 Lookahead 步进）。
 
-```js
-(function(){ ... return { installed: ... }; })();return 'ok';
-```
+## 门禁与测试验证
 
-IIFE 的返回值被直接丢弃，固定返回字符串 `"ok"`，随后 `networkRecorderClient.ts` 执行 `JSON.parse(res.result || "{}")` 时便抛出 `JSON Parse error: Unexpected identifier "ok"`，前端显示 `Injection Failed`。
-
-## 修复内容 (Fix)
-修改 [`SafariController.swift`](file:///workspace/agyPreviewInstant/packages/macos-ax-helper/Sources/MacosAxHelper/SafariController.swift)：
-1. 新增 `isBlockOrMultiStatement(_:)` 词法级扫描器，在忽略字符串（单引号、双引号、模板字符串）和注释（`//`、`/* */`）以及括号嵌套深度（`()`、`{}`、`[]`）后，仅在顶层出现分号或以语句关键字开头时才判定为 block/multi-statement。
-2. 对单表达式（包括多行 IIFE、带尾部分号的表达式等），先剥离末尾多余分号，再通过 `var __r=(\n...\n)` 保留并序列化返回值。
-3. 对真正的 block/multi-statement 脚本，包裹在内层 `(function(){\n...\n})()` 中执行并序列化其返回值，既保留返回值又避免 AppleScript `OSStatus -2753`。
-
-## 验证结果 (Verification)
-- `pnpm run env:check`：通过（OverlayFS 8 MB <= 100 MB）。
-- `pnpm --filter p2p-remote-controller check`（`tsc --noEmit && eslint src`）：通过。
-- `pnpm --filter p2p-remote-controller test`（`vitest run`）：11 个测试文件、42 个用例全部通过。
-- 注：当前沙箱为 Ubuntu 24.04，无 Xcode/Swift 工具链，请在 macOS 上运行 `pnpm ax-helper:build` 重新编译 `macos-ax-helper` 二进制以生效。
-
-## 提交信息 (Commit)
-- 分支：`a2`
-- Commit：`7fd33f2f64a243f87102f6b48664cb4e71f90e46`（Verified Bot Commit，`signature.isValid = true`）
-- 链接：https://github.com/Antigravi-ty/agyPreviewInstant/commit/7fd33f2f64a243f87102f6b48664cb4e71f90e46
+- `pnpm run check`（`radar` + `tsc --noEmit`）：**PASS**（`1428/1428` TS 文件，0 循环依赖，0 类型错误）
+- `RC_SUITE_WATCHDOG_MS=280000 pnpm run test:multiplayer-suite`：**PASS**（28/28 项全部通过）

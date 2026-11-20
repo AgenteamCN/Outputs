@@ -1,65 +1,65 @@
-# Wave 1 (`W1-01`) — `feat/worker-authority-bus` 交付报告
+# W1-07 (`feat/consumer-audio-arena`) Wave 1 交付报告与字段需求清单
 
-- **分支**：`feat/worker-authority-bus`（基于 `origin/z/agy/rc/multiplayer-recheck-base` `7c80b44`）
-- **Verified Bot Commit**：`d46b6746b4333a480b8309f8b5711a0b32237692` (`signature.isValid = true`, `state = VALID`)
-
-## 1. 核心交付内容
-
-1. **`StateFrameSlidingWindow` (`src/network/server/StateFrameSlidingWindow.ts`)**
-   - 实现通道 1 高频 State 流的 **10 帧滑窗**（`DEFAULT_SLIDING_WINDOW_CAPACITY = 10`）。
-   - 每帧分配严格单调递增的 `txSeq`（`uint32`），**完全解耦 `simTick` / `replayFrameIndex`**，确保正放、暂停、倒放（Rewind）、跳帧（Seek）对称一致。
-   - 实现按 Session 裁剪：`getUnackedFramesForSession(lastAckedTxSeq)`（好网仅发 1 帧增量，弱网自动补发滑窗内未确认尾帧），以及全员确认全局裁剪 `pruneAckedByAllSessions(minAckedTxSeq)`。
-
-2. **`WorkerAuthorityBus` (`src/network/server/WorkerAuthorityBus.ts`)**
-   - 统一托管 **Match / Freeplay / Exhibition / Replay** 四大模式的 Worker 侧步进与广播推流循环：
-     - 独立 `setTimeout` 定时器循环（脱离主线程 `requestAnimationFrame`，免疫 Host 切后台/最小化时的 1Hz rAF 节流）。
-     - 固定物理步进（默认 120Hz）+ 可配置通道 1 广播频率（`15Hz / 30Hz / 60Hz / 120Hz`）。
-     - 内置 Replay 游标控制（`playing` / `paused` / `rewinding` / `seeking`、倍速、总帧数、FPS），倒放/跳帧时 `txSeq` 依然严格单调递增。
-   - 每次推流自动写入 `StateFrameSlidingWindow` 并按 `EstablishedSessionManager` 记录的 `lastAckedTxSeq` 分发裁剪后的帧批次（跳过虚拟 Bot 通道）。
-
-3. **`PeerSession` & `EstablishedSessionManager` Ack 追踪**
-   - `src/network/server/PeerSession.ts`：新增 `lastAckedTxSeq` 与单调保护方法 `_recordTxSeqAck(ackedTxSeq)`（乱序旧包不回退）。
-   - `src/network/server/EstablishedSessionManager.ts`：新增 `recordClientTxSeqAck`、`getSessionLastAckedTxSeq`、`getMinHumanAckedTxSeq`（仅统计人类 Session，忽略 `bot` / `bot_*`）。
-
-4. **Worker 协议与路由接入**
-   - `src/network/protocol/HostWorkerProtocol.ts`：新增 `WORKER_BUS_CONFIGURE`、`WORKER_BUS_REPLAY_CONTROL`、`WORKER_BUS_TX_SEQ_ACK`、`CHANNEL1_STATE_FRAME_BATCH`。
-   - `src/network/server/workerActivityAndInputRouter.ts` & `workerReplayAndDiagnosticsRouter.ts`：路由上述 Worker Bus 控制与 `txSeq` Ack 消息。
-   - `src/network/server/AuthoritativeServerWorker.ts`：初始化 `WorkerAuthorityBus`，并在 `tick()` 与 `destroy()` 中接入滑窗记录与生命周期清理。
-
-5. **Wave 1 独立单测 (`scripts/testWorkerAuthorityBus.ts`)**
-   - 覆盖：10 帧滑窗容量与淘汰、好网 1 帧增量/弱网多帧补发、倒放与跳帧 `txSeq` 单调对称性、多 Session 差异化 Ack 裁剪与乱序防回退、Worker `setTimeout` 无 rAF 连续推流、4 模式步进与 Replay 正/倒放/暂停/Seek、Worker 路由集成。
+- **分支**：`feat/consumer-audio-arena`（基于 `z/agy/rc/multiplayer-recheck-base` `7c80b44`）
+- **Verified Bot Commit**：`a12f21f60952e2c697094baa82e4024e81a11130`（GitHub GraphQL `createCommitOnBranch`, `signature.state = VALID`）
 
 ---
 
-## 2. 提交给 Wave 2 (`feat/protocol-schema-alignment`) 的通道 1 数据包字段清单
+## 一、已完成工作摘要
 
-`W1-01`（Worker Authority Bus & 通道 1 滑窗分发）需要通道 1（State Stream）与上行 Ack 包携带以下字段：
+### 1. `GameAudioSubsystem` 消费 `playbackState !== 'playing'` 立即 `silenceAll()`
+- **`src/audio/RemoteEngineAudioLodController.ts`**：新增 `silenceAll()` 方法，立即将所有引擎合成器置为 `dormant = true`、调用 `synth.silence()` 并关闭 `spatialBus`（区别于 `resetAll()`，暂停时不触发重生音效）。
+- **`src/game/pipeline/FramePipeline.ts`**：定义 `VNextPlaybackState = 'playing' | 'paused' | 'ended'`，在 `FrameContext` 与 `FramePipelineRuntimePort` 中新增 `playbackState` 字段，并在 `AudioStage.execute()` 中从 `runtime.playbackState` / `networkReconciler.playbackState` / `match.state.playbackState` 同步写入 `context.playbackState`。
+- **`src/game/subsystems/GameAudioSubsystem.ts`**：
+  - 新增 `silenceAll()` 方法，同时静音 `engineLodController`（全部主/远端引擎合成器）与 `gameAudio`（`ballEngine`、`vehicleManager`、`AudioSlotPool`）。
+  - 在 `update(context)` 入口检测 `playbackState !== 'playing'`，在 **1 帧内**立即执行 `this.silenceAll()` 并更新遥测后提前返回；恢复 `'playing'` 后下一帧自动唤醒引擎与球声更新。
+  - 修复 `updateVehicles` 分支统一使用解析后的 `audio` 门面（`r.options?.gameAudio || gameAudio`）。
 
-### 下行：通道 1 `WorldFrame` 包头与帧语义字段
-| 字段名 | 建议类型 | 字节数 | 说明 |
-|---|---|---|---|
-| `schemaHash` | `uint32` | 4B | 协议结构哈希（HEX，如 `0x57313031` 占位），收包首行校验防静默错位 |
-| `txSeq` | `uint32` | 4B | 严格单调递增传输序号（滑窗裁剪与丢包补发唯一依据） |
-| `metadataHash` | `uint32` | 4B | 当前 `RosterManifest` + 房间上下文哈希，变化时触发通道 2 重拉 |
-| `activityMode` | `uint8` (enum) | 1B | `0=match`, `1=freeplay`, `2=exhibition`, `3=replay` |
-| `playbackState` | `uint8` (enum) | 1B | `0=playing`, `1=paused`, `2=rewinding`, `3=seeking` |
-| `phase` | `uint8` / string | 1B | 房间/比赛阶段（kickoff / active / goal_scored / goal_replay / overtime / ended 等） |
-| `clockSeconds` | `float32` | 4B | 比赛/自由模式时钟秒数 |
-| `simTick` | `uint32` | 4B | 物理仿真 Tick |
-| `replayFrameIndex` | `uint32` | 4B | Replay 模式当前帧索引（非 Replay 模式为 `0`） |
-| `focusedCarIndex` | `uint8` | 1B | 当前相机焦点车号（1~6 车索引） |
-| `timestampMs` | `float64` / `uint32` | 4B~8B | 权威端发包时间戳 |
-| `sectionFlags` | `uint16` | 2B | 位掩码标识本帧包含的 Section（球、1~6 车位姿/速度/Boost、BoostPad Bitmask、相机位姿等） |
-
-### 上行：Client 回报 Ack 字段（可 Piggyback 于输入包或独立心跳包）
-| 字段名 | 建议类型 | 字节数 | 说明 |
-|---|---|---|---|
-| `ackedTxSeq` | `uint32` | 4B | Client 最新收到的通道 1 `txSeq`，供 `EstablishedSessionManager` 反向裁剪滑窗 |
+### 2. `Arena` 消费 `RosterManifest` 动态重建 1~6 车身、配色与 NameTag（含 `ghost` 材质预留）
+- **`src/entities/arena/arenaRosterManifestPipeline.ts`**：定义临时 Wave 1 `RosterManifest` / `RosterManifestCarEntry` / `RosterCarRoleFlag` TS 接口，并实现 `applyRosterManifestToArena(arena, manifest, options)`：
+  - **`metadataHash` 幂等拦截**：当 `manifest.metadataHash === arena.lastRosterMetadataHash` 时直接跳过冗余重建（支持 `options.force` 强制刷新）。
+  - **1~6 车动态重建与换装**：按 `carIndex` 调用 `vehicleRegistry.ensureCar(carIndex, team, visualId)`，自动处理新增槽位、`visualId` 车身模型热切换与阵营同步。
+  - **配色与 Loadout**：支持自定义 `colorHex`（含清空自定义色回退阵营默认色）、`paintFinish`、`boostVisual`、`boostAudio`、`isBot`。
+  - **`ghost` 材质预留（`roleFlag === 'ghost'`）**：自动调用 `vehicleRegistry.setCarGhostOpacity(carIndex, true, ghostOpacity ?? 0.55)` 套用半透明材质并标记 `carRoot.userData.isGhost = true` / `roleFlag = 'ghost'`；切回 `'player'` / `'bot'` 时恢复不透明材质。
+  - **空缺槽位隐藏**：缩容（如 6 车 -> 2 车）时自动隐藏未在清单中的槽位（`visible = false`）。
+  - **NameTag 数据输出**：生成标准 `NameTagCarEntry[]`（`carIndex`、`name`、`team`），通过 `onUpdateNameTags` 回调与返回值 `nameTagEntries` 交由上层 `MatchRosterProjection`（SSOT）写入，保持 `NameTagScatter=1/1` 护栏。
+- **`src/entities/ArenaWorld.ts`**：新增 `carRoleFlags`、`lastRosterMetadataHash` 与 `applyRosterManifest(manifest, options)` 公开方法，并导出相关类型。
 
 ---
 
-## 3. 验证结果
+## 二、测试与门禁验证
 
-- `env -u NODE_OPTIONS node --experimental-strip-types scripts/testWorkerAuthorityBus.ts`：**5/5 全部 PASS**
-- `pnpm run check`（`radar` + `tsc --noEmit`）：**GREEN**（1430/1430 TS，0 循环依赖，0 越界引用）
-- `RC_SUITE_WATCHDOG_MS=280000 pnpm run test:multiplayer-suite`：**28/28 全部 PASS**
+1. **单元测试**：`env -u NODE_OPTIONS node scripts/runTsWithVite.mjs scripts/testConsumerAudioArena.ts`
+   - `[PASS] GameAudioSubsystem immediately silences all synths and gameAudio when playbackState !== playing`
+   - `[PASS] AudioStage propagates runtime.playbackState into FrameContext`
+   - `[PASS] applyRosterManifestToArena rebuilds 1-6 cars, colors, NameTags, ghost materials, and respects metadataHash`
+2. **全量静态门禁**：`pnpm run check`（`radar` + `tsc --noEmit`）
+   - `STATUS: GREEN -- 100% TS, tsc --noEmit clean, hard boundaries & volume caps verified.`
+   - `NameTagScatter=1/1`、`0 Circular Deps`、`0 Value Re-Exports`、`0 Upward Imports`、`Any<=5`。
+
+---
+
+## 三、Wave 2 协议对齐字段需求清单（供 `feat/protocol-schema-alignment` 汇总）
+
+### 通道 1（高频 State 流，每帧头部/语义字段）
+| 字段名 | 类型 / 建议位宽 | 消费方 | 用途说明 |
+|---|---|---|---|
+| `playbackState` | enum (`'playing' \| 'paused' \| 'ended'`, 2 bits) | `GameAudioSubsystem` / `AudioStage` | `!== 'playing'` 时 1 帧内立即触发 `silenceAll()`，恢复 `'playing'` 后无缝恢复引擎与球声 |
+| `metadataHash` | `uint32` (4 Bytes) | `ArenaWorld.applyRosterManifest` | 与本地 `lastRosterMetadataHash` 比对，仅在变化时触发通道 2 `RosterManifest` 异步拉取与重建 |
+| `focusedCarIndex` | `uint8` (3~4 bits, `0..7`) | `VehicleNameTagSystem` / `AudioListener` | 决定主视角引擎合成器（非空间化）与 NameTag 单字符/距焦判断 |
+
+### 通道 2（低频 `RosterManifest` 清单，按 `metadataHash` 变更触发）
+| 字段名 | 类型 | 消费方 | 用途说明 |
+|---|---|---|---|
+| `metadataHash` | `uint32` (4 Bytes) | `ArenaWorld` | 清单版本校验与幂等缓存键 |
+| `cars[].carIndex` | `uint8` (`0..5`, 预留 `0..7`) | `ArenaVehicleRegistry` / `NameTag` | 车辆槽位索引 |
+| `cars[].name` | `string` (UTF-8) | `VehicleNameTagSystem` | 场内 NameTag 展示名 |
+| `cars[].team` | `0 \| 1` (1 bit) | `ArenaVehicleRegistry` / `NameTag` | 阵营（0 蓝 / 1 橙），决定默认车身色与 NameTag 阵营色 |
+| `cars[].visualId` | `string` / `uint8` 枚举 | `ArenaVehicleRegistry` | 车身模型 ID（`fennec`、`octane`、`merc` 等），触发动态建车或热换模型 |
+| `cars[].colorHex` | `uint32` RGB / `null` | `ArenaVehicleLoadoutManager` | 自定义车身配色；为 `null` 时回退阵营默认色 |
+| `cars[].paintFinish` | `'metallic' \| 'matte' \| null` | `ArenaVehicleLoadoutManager` | 漆面质感 |
+| `cars[].decalId` | `string \| null`（预留） | `ArenaVehicleLoadoutManager` | 涂装标识预留 |
+| `cars[].boostVisual` | `string \| null` | `VehicleBoostEmitter` | 氮气粒子外观预设 |
+| `cars[].boostAudio` | `string \| null` | `GameAudioEngineFacade` | 氮气音效变体 |
+| `cars[].roleFlag` | `'player' \| 'bot' \| 'ghost'` (2 bits) | `ArenaWorld` / `ArenaVehicleRegistry` | 角色标识；`'ghost'` 时自动应用半透明幽灵车材质并标记 `isGhost` |
+| `cars[].ghostOpacity` | `float32` / `uint8`（可选，默认 `0.55`） | `ArenaVehicleLoadoutManager` | 幽灵车透明度 |

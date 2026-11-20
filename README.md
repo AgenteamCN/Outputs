@@ -1,48 +1,28 @@
-# AGY Preview Instant — 诊断、分支合并与状态机修复报告
+# 分支 1（Bug 3 Client Lookahead 与缓冲/调度修复）完成报告
 
-## 1. Live Chat 实测诊断结论（频道 `ch_83079527`）
+## 分支与提交信息
+- **基线分支**：`origin/z/agy/rc/multiplayer-recheck-base` (`e8aae572a729b535bae90e74adaba069a4b41524`)
+- **新分支**：`z/agy/rc/fix-bug3-client-lookahead`
+- **Verified Bot Commit**：`22d0160524d9c0609fded6c34265435d8b215762`（`verified: true`, `reason: "valid"`, `antigravity-fine-grained-token[bot]`, `Co-authored-by: Mark <29165094+MaBoCoMark@users.noreply.github.com>`）
 
-通过对 5 个典型 Safari 窗口的实时 `scan_all_windows` 与 `scan_window` 采集，确认了全部异常的根因：
+## 修改文件与修复内容（严格锁定在分支 1 范围内）
+1. `src/network/sync/ReplicationStateInterpolator.ts`
+   - 将 `SpectateInterpolationBuffer` 默认 `maxFrames` 从 `64`（120Hz 下约 0.53s）提升至 `360`（3s 缓冲），防止 SwiftShader 长渲染帧期间数据包堆积淘汰旧帧，进而避免 `sample()` 中 `Math.max(oldestTick, ...)` 引发的单帧大跨度硬切。
+2. `src/game/pipeline/stages/spectatePhysicsLookaheadPipeline.ts`
+   - 将 `applySpectateSampleOrLookahead` 中 lookahead 恢复步长的 `dtMs` 上限从 `50ms` 放宽至 `200ms`，单步 `ticksToStep` 上限从 `4` 放宽至 `24`（同时受剩余 `SPECTATE_LOOKAHEAD_MAX_TICKS - lookaheadTicksActive` 预算约束），避免长帧恢复后外推持续滞后。
+3. `src/game/pipeline/stages/simulationNetworkReconcilePipeline.ts`
+   - 在 `isRemoteReplayWatchTogether` 模式下，新增 `!matchState.paused && !(isRemoteReplayWatchTogether && sampled?.cursorState === 'stalled')` 门控，当 Host 录像暂停或播完停止推进（`cursorState === 'stalled'`）时停止 Client 继续外推 180 ticks，避免触发 `3a-max-la-freeze` 死锁。
+4. `src/game/RenderClockScheduler.ts`
+   - 在 `wake()` 中同步重置 `this.nextSimTime = 0`。
+   - 在 `measureDisplay`（`rAF` 回调）中，当 `this.simulate && this.pending.length >= 2` 且 `now >= this.nextSimTime - 0.1` 时推进一次 `this.simulate(now)`，消除 SwiftShader GPU fence 堆积期间 `SimulationStage` 调度饥饿。
+   - 在 `schedule()` 中将 `nextTargetTime` 对 `this.nextSimTime` 的对齐条件从 `effectiveInterval > SIM_INTERVAL_MS` 放宽为 `this.simulate && this.nextSimTime > 0`，确保任意帧率限制下均不会延迟仿真步进。
 
-| 窗口 ID | 实际状态 | 原判定 | AX 树实测根因 |
-| :--- | :--- | :--- | :--- |
-| `#63133` | `uninitialized` | `partial` | Google AI Studio 新对话默认已选中 `API key selected`，且旧逻辑因 `modelSelected=false` & `network=false` 判为 `partial`；实际上尚未执行初始化，应为 `uninitialized`。 |
-| `#63135` | `ready` | `partial` | 新版 UI 的 `AXButton`（`Select Antigravity agent harness model`）**不暴露**已选模型名称，且 Network 替换默认规则后仍显示 `1 rule`，导致 `modelSelected` 和旧规则数检测全部失效。 |
-| `#63137` | `done` | `partial` | URL 为 `/prompts/<id>`（非 `new_chat`），无 `Build with Agents` 标题，无 `Stop` 按钮；原状态机缺少 `done` 状态。 |
-| `#62597` | `busy` (`Running`) | `busy` | 有 `Stop` 按钮（无 `Run` 按钮）。但 `scanAllSafariWindows` 之前传入了 `markedBusy: prev?.hasActiveTask ?? false`，导致任务结束后仍永久卡在 `busy`。 |
-| `#63170` | 含左侧侧边栏 | `partial` | AX 树中存在 `AXButton` `title="Collapse navigation menu"`（`path=[2]`）。已通过 `perform_action` (`AXPress`) 实测成功收起。 |
-
----
-
-## 2. 已完成的修改（已合并推送至 `origin/a2`，Verified Commit `dd6718a`）
-
-1. **分支合并**：
-   - 将 `origin/feat/llm-ax-regex-and-parallel-approvals` (`e6be509`) 与 `origin/a2` (`96e824b`) 零冲突合并，保留双父节点提交历史（`dd6718a`，GitHub Bot GPG `verified: true`）。
-2. **窗口状态机重构（`aiStudioWindowState.ts`, `aiStudioBatch.ts`, `aiStudioBatchRoundRobin.ts`, `types/ax.ts`）**：
-   - 新增 `done` 状态：非 `busy` 且为 `/prompts/<id>`（非 `new_chat`）时判定为 `done`，`init_all` 轮询队列自动跳过 `done` 窗口。
-   - **修复 `running` (`busy`) 卡死**：移除 `scanAllSafariWindows` 中错误的 `markedBusy: prev?.hasActiveTask ?? false`，仅以实时 AX 树 `Stop` 按钮为准。
-   - **改用 `networkConditionAdjusted` 标志位判 `ready`**：不再依赖 `AXButton.title` 中的模型名或 Network `1 rule`/`2 rules` 数量；初始化完成后置 `true`，进入 `running` / 非 `new_chat` URL 时清空；未初始化的新窗口统一归为 `uninitialized`。
-3. **初始化流程加固（`aiStudioInit.ts`, `aiStudioInitSteps.ts`）**：
-   - 新增 `collapseNavigationSidebar`：初始化时如检测到 `Collapse navigation menu` 按钮则自动点击收起左侧侧边栏。
-   - **修复 `Link API Key modal did not appear` -> `Element path out of bounds` 级联报错**：将等待弹窗超时从 `8s` 延长至 `18s`（适配 lazy loading），并在失败时直接重扫校验或抛错终止，不再把过期的旧 `scan` 传给 `selectHarnessModel`。
-   - **加固 Network Allowlist 弹窗**：等待 `Add to allowlist` 与 `Save`/`Cancel` 按钮同时渲染完成（`12s`）再操作，避免 `saveBtn=missing` 时误点击，并增加一次 `Add to allowlist` 自动重试。
-4. **UI 与可观测性改进**：
-   - **删除旧版纯 `Initialize` 按钮**：仅保留 `Init AI Studio` 与 `Init All`（`SafariControlStrip.tsx`, `PermissionAutomationBar.tsx`, `App.tsx`, `useSafariBatchOperations.ts`）。
-   - **修复 `[Recent]` 标签被截断问题**：在 `ManagedWindowSidebar.tsx` 中将 `[Recent]` 与 `[Auto]` 紧跟在 `#{windowId}` 之后显示，不再放在长标题末尾。
-   - **新增 `Observation` 窗口判定日志 & `Developer Tools` 收拢**：在 `automationTracker.ts` 中记录每次窗口状态判定的完整信号（`apiKey`, `netFlag`, `running`, `promptUrl`, `buildWithAgents`, `sidebarOpen`, `elementCount`, `url`），并在 `DebugConsoleTabs.tsx` 中收拢至 `Developer Tools` 栏下（`Observation`, `Automation`, `Timeline`, `Raw JSON`, `Console`）。
-
----
-
-## 3. 关于 Worker 与控制命令架构的说明
-
-- **控制命令不需要改 Worker**：`agentlivechatchannel` Worker 仅负责透传 MQTT JSON 载荷（`agy_p2p_v1/cmd/<channel>/<command>` -> `agy_p2p_v1/resp/<channel>/<requestId>`）及提供 `/help` 列表；所有命令解析、裁剪参数（如 `level`, `regexFilter`, `maxChars`）和响应格式均在客户端 `p2p-remote-controller` 的 `emqxCommandRouter.ts` / `emqxCommandHandlers.ts` 中自行定义与处理。后续如需增加简短输出或新控制指令，直接改客户端即可，无需改动 Worker 架构。
-
----
-
-## 4. 验证结果
-
-- `pnpm --filter p2p-remote-controller test -- --run`：**11 个测试文件、41 项测试全部通过**。
-- `pnpm --filter p2p-remote-controller build` (`tsc && vite build`)：**通过**。
-- `pnpm --filter p2p-remote-controller exec eslint src`：**0 errors, 0 warnings**。
-- `pnpm run lint`（根目录）：**0 errors**。
-- `pnpm run env:check`：OverlayFS 占用 `8 MB`（预算 `<= 100 MB`）。
+## 校验结果
+- `pnpm run check`：**GREEN**（`1430/1430` TS 100%，`tsc --noEmit` 0 errors，硬边界与体积门禁全部通过）。
+- `RC_SUITE_WATCHDOG_MS=120000 pnpm run test:multiplayer-suite`：**28/28 PASS**（EXIT=0）。
+- `pnpm run repro:dev-broadcast-v3`（仅含分支 1 改动，尚未合入分支 2 的 `runDevBroadcastReproV3.mjs` 判定调整）：
+  - `bug-1`: `PASS_FIXED`（`bufFrames` 正常缓冲至 89–141，未再因 64 帧上限淘汰）
+  - `bug-2`: `PASS_FIXED`
+  - `bug-3` 实测变化：
+    - 修复前：`distinctTicks: 8`, `frozenBallFrames: 24`, `maxBallStepUu: 3607.3`，播放途中即出现帧冻结与 +451 tick 硬切（`1545 -> 1545`）。
+    - 修复后：`distinctTicks: 14`, `frozenBallFrames: 16`, `maxBallStepUu: 1127.2`，`sampleSlice` 前 12 帧（`1012 -> 1023 -> 1064 -> 1164 -> 1169 -> 1271 -> 1369 -> 1464 -> 1560 -> 1572 -> 1664 -> 1767`）**连续推进无冻结帧**，直至第 14 帧触达 1800 帧录像末尾后稳定停住。

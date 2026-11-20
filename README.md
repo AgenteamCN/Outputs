@@ -1,79 +1,74 @@
-# 小队 C 排查报告：Bug 1 & Bug 2 在 Headless SwiftShader 下的测试稳定性与超时阈值
+# 小队 D 排查报告：Bug 4 & Bug 5 残留边界复核
 
-**基线 Commit**：`7af0003476afc0b275e34e7abebfd08df018d990`（`origin/z/agy/rc/multiplayer-recheck-base`）  
-**修复分支**：`z/agy/rc/track-c-bug1-bug2-stability`（Verified Bot Commit: `43e1fc42c9a437ea1708c2901e9be8bb8258fec7`, `signature.isValid: true`）  
-**类型检查**：`pnpm run check` GREEN（`1430/1430 TS`, `0 errors`）
-
----
-
-## 一、核心结论摘要
-
-1. **Bug 1（`Timeout waiting for Host enters Freeplay Goal Replay after 20000ms` 与 `sampleCount: 3`）**：
-   - 根因是 **双窗口 SwiftShader CPU 抢占 + `dt <= 0.1s` 物理步长钳位 + `?skipShaderPrewarm=1` 首次进球着色器懒编译** 共同导致的时序瓶颈，而非 Goal Replay 物理/同步逻辑回退。
-   - 球从 `y=1500` 以 `vel_y=2000` 射入球门（`y=5120`）需 `217 ticks`（`1.81s`），加上 `POST_GOAL_CELEBRATION_TICKS = 150`（`1.25s`，`src/game/modes/freeplay/FreeplayGoalAndTouchSubController.ts:45`），共需 **367 ticks** 才能进入 `isGoalReplayActive()`。由于 `src/game/pipeline/FramePipeline.ts:235,264` 将每帧 `dt` 钳位在 `0.1s`（最多 `12 ticks/frame`），Host 至少需要 **31 个完整渲染帧**。在双窗口 SwiftShader 仅 1.5–4 FPS 且首个进球触发 Goal Explosion 着色器编译时，很容易超过 `20_000ms`。
-   - `sampleCount: 3`（偶发 `distinctBallPositions <= 2`）则是因为 `hostCdp.send('Page.bringToFront')` 让 Host 持续占满前台 SwiftShader 渲染，而 Client 仅在 `requestAnimationFrame` 中采样，~3s Goal Replay 期间 Client 仅获 3–8 次 rAF 回调。
-2. **Bug 2（`clientAfterHostEdge2: null`，5s 超时）**：
-   - 检查 `src/game/pipeline/stages/SimulationStage.ts:402-421` 与 `src/game/pipeline/stages/AuthorityCameraSyncTracker.ts:68-163`：**不存在低 FPS 漏发边沿同步的逻辑缺陷**。`pollLocalCameraChange()` 基于状态键 `isFree:ballCam:focusedCarIndex` 做 diff，只要 `camera` 停留在新状态，无论 FPS 多低，下一次 `SimulationStage.execute()` 必发；接收端 `shouldApplyIncomingCameraSync()` 亦基于单调 `(authorityEpoch, cameraSyncSeq)` 严格幂等。
-   - 偶发 `5_000ms` 超时是因为 `Target.createTarget({ newWindow: true })` 使 Host 与 Client 两扇窗口的 `document.hidden` 均为 `false`（实测 `hostBeforeEdge2.docHidden === false`），6 车 + 6 NameTags 并发 SwiftShader 渲染导致 Host `SimulationStage.execute()` 与 Client `Runtime.evaluate` 轮询延迟突破 `5_000ms`。
-3. **额外发现（全局耗时瓶颈）**：
-   - 在 `7af0003` 上实测 `Client boot` 耗时高达 **95.8s – 100.7s**（其中单次 `clientCdp.eval` 阻塞达 85.5s–92s），因为 Host 已在 Window 1 全速渲染 3D WebGL 时，Client 在 Window 2 并发启动 WASM/Three.js 并编译着色器。这直接消耗了 270s watchdog 超过 1/3 的预算，建议后续可考虑在 Client 启动期间暂停/降频 Host 渲染或分阶段超时。
+- **基线分支**：`origin/z/agy/rc/multiplayer-recheck-base`（`7af0003476afc0b275e34e7abebfd08df018d990`）
+- **排查范围**：
+  - Bug 4：`src/entities/BoostPadSystem.ts`、`src/entities/arena/BoostPadShadersAndMeshes.ts`、`scripts/runDevBroadcastReproV3.mjs`
+  - Bug 5：`src/game/runtime/RuntimeResourceRegistry.ts`、`src/game/modes/freeplay/freeplayKickoffAndArenaResetPipeline.ts`、`src/entities/vehicle/supersonic-trail/SupersonicWheelTrailSystem.ts`、`scripts/runDevBroadcastReproV3.mjs`
 
 ---
 
-## 二、实测打点数据（基线 `7af0003` vs 修复后 `43e1fc4`）
+## 一、实测基线数据（`7af0003`）
 
-### 1. 基线 `7af0003` 实测（含细粒度打点）
-- **Run A（默认配置）**：
-  - `Host boot`: `23.1s`，`Client boot`: **`100.7s`**（`poll 41` 后单次 `eval` 阻塞 `92s`）
-  - `Host enters Freeplay Goal Replay`: **在 `20,000ms` 超时失败**（`poll 1..81` 每 20 次轮询耗时 `3.6s–8.1s`，约 400ms/poll）
-- **Run B（临时放宽 Bug 1 超时至 45s 复测 Bug 1 + Bug 2）**：
-  - `Host boot`: `26.1s`，`Client boot`: **`95.8s`**
-  - `Host enters Freeplay Goal Replay`: **`8,192ms`**
-  - `Client enters Goal Replay`: **`10,540ms`**（已超过原 `10_000ms` `.catch(()=>{})` 上限！）
-  - `Host exits Freeplay Goal Replay`: `2,909ms`
-  - Bug 1 结果：`PASS_FIXED`，`sampleCount: 8, distinctBallPositions: 3`（位置 `3513.3` x3, `4762.3` x2, `5575.2` x3，处于失败边缘）
-  - Bug 2 结果：`REPRODUCED_BUG`：
-    - `clientAfterHostEdge1`（car 2, `ballCam=false`）：**`112ms`** 成功
-    - `clientAfterLocalSwitch`：`focusedCarIndex: 4` 成功
-    - **`clientAfterHostEdge2`（car 5, `ballCam=true`）：`null`（`5,000ms` 超时）**
-- **Run C（隔离跳过 Bug 1 单独测 Bug 2）**：
-  - `hostBeforeEdge2`: `{"tick":77,"camFocused":5,"camBall":true,"docHidden":false}`
-  - `edgeSyncOk: true`，`clientAfterHostEdge2`: `{"focusedCarIndex":5,"ballCam":true,"isFreeCam":false}`
-  - 证实协议与 `SimulationStage` 逻辑完全正常，`5_000ms` 在前面跑完 Bug 1 后处于 SwiftShader 抖动临界点。
-
-### 2. 代码与机制根因定位
-
-#### (1) `?skipShaderPrewarm=1` 与 Bug 1 首次 Goal Replay
-- `src/game/runtime/RuntimeBloomOcclusion.ts:87-95`：当 URL 含 `?skipShaderPrewarm=1` 时，直接跳过 `prewarmSceneShaders()`、boost/exhaust emitter 预加载与 `renderBloom()`。因此测试中**第一次进球**（Goal Explosion 粒子/光效 + Goal Replay 切换）必然触发首次着色器懒编译峰值。
-- `src/game/modes/freeplay/FreeplayGoalAndTouchSubController.ts:45,326`：`POST_GOAL_CELEBRATION_TICKS = 150`（1.25s @ 120Hz）。结合 `y=1500, vel=2000` 射门（`~217 ticks`），进入 `isGoalReplayActive()` 至少需要 `367 ticks`。
-- `src/game/pipeline/FramePipeline.ts:235,264`：`const dt = Math.min(..., 0.1)`，每帧最多推进 `12 ticks`，即至少需要 **31 个完整渲染帧**。在 SwiftShader 2 FPS 下即需 `15.5s+`，叠加首次着色器编译即突破 `20s`。
-- **为何不建议缩短射门距离**：`src/game/modes/freeplay/freeplayGoalReplaySessionPipeline.ts:102-104` 会对无触球进球执行 `trimLeadingIdleGoalReplayFrames(extractedFrames, 12)`。若改为近门射门（如 `y=4200`），回放总帧数会从 ~367 帧腰斩至 ~194 帧（~1.6s），反而加剧 Client `sampleCount` 不足。
-
-#### (2) `SimulationStage.ts` 与 Bug 2 边沿同步
-- `src/game/pipeline/stages/SimulationStage.ts:402-421`：每次 `SimulationStage.execute()` 都会调用 `sharedAuthorityCameraSyncTracker.pollLocalCameraChange(camera, authEpoch, localPeerId)`。
-- `src/game/pipeline/stages/AuthorityCameraSyncTracker.ts:68-108`：以 `computeCameraKey`（`${isFree}:${ballCam}:${focused}`）做状态对比，仅当状态变化时递增 `localSeq` 并广播 `camera_state_sync`。低 FPS 不会导致状态变更被“跳过”或“漏发”。
-- `src/game/runtime/RenderClockScheduler.ts:201-210` & `scripts/runDevBroadcastReproV3.mjs:229-232`：因 `Target.createTarget({ newWindow: true })` 创建独立窗口，Host 与 Client 的 `document.hidden` 均为 `false`，双端同时以 `frameInterval=0` 抢占 SwiftShader CPU，导致 `5_000ms` 轮询窗口在 6 车渲染压力下偶发超时。
+在当前沙盒环境中运行 `pnpm run repro:dev-broadcast-v3`（Headless Chrome + SwiftShader）：
+- **Bug 4 (`bug-4-boostpad-model-flicker`)**：`PASS_FIXED`
+  - `totalPadFlips: 4`, `maxSinglePadFlips: 1`, `padFlips: [0,...,1,...,1,...,1,...,1,0,...]`
+  - 采样明细中可见：`tick: 905`（从 `836` 跳变 `+69` ticks）单帧触发 `flipsThisFrame: 3`，4 帧后（仍停留在 `tick: 905`）触发 `flipsThisFrame: 1`（300ms 收集动画自然结束）。
+- **Bug 5 (`bug-5-high-memory-and-unreleased-on-exit`)**：`REPRODUCED_BUG`
+  - `bootMem`: `jsUsedMB: 163, wasmMB: 64, geometries: 37, textures: 13`
+  - `loadedMem`: `jsUsedMB: 223, wasmMB: 64, rvFrames: 720, geometries: 73, textures: 17`
+  - `afterExitMem`: `jsUsedMB: 218, wasmMB: 64, rvFrames: 0, geometries: 39, textures: 17`
+  - `retainedWasmMB: 0, retainedJsMB: 55, retainedGeometries: 2, tauriCloseHidesWindow: false`
 
 ---
 
-## 三、已提交的确定性修复（Branch: `z/agy/rc/track-c-bug1-bug2-stability`）
+## 二、Bug 4 定位结论：`maxSinglePadFlips: 2` 属正常物理/动画状态转换，非闪烁 Bug
 
-已在 `scripts/runDevBroadcastReproV3.mjs` 提交 Verified Bot Commit `43e1fc4`（仅改测试脚本，不改引擎逻辑）：
-1. **Bug 1 超时与前台采样优化**：
-   - `Host enters Freeplay Goal Replay` 超时由 `20_000ms` 放宽至 `40_000ms`。
-   - `Client enters Goal Replay` 超时由 `10_000ms` 放宽至 `20_000ms`。
-   - 在 Host 确认进入 Goal Replay 后立即执行 `await clientCdp.send('Page.bringToFront')`，避免 Host 独占前台 SwiftShader 导致 Client `rAF` 采样被饿死（消除 `sampleCount: 3` 误报）。
-2. **Bug 2 边沿同步超时放宽**：
-   - `clientAfterHostEdge1` 与 `clientAfterHostEdge2` 的 `waitFor` 超时由 `5_000ms` 放宽至 `15_000ms`（保持 `100ms` 轮询间隔，正常情况仍 ~112ms 返回）。
+### 1. 源码机制核查（`src/entities/BoostPadSystem.ts`）
+`runDevBroadcastReproV3.mjs` 通过统计 30 帧 `rAF` 内 `pad.full.visible` 的跳变次数判定 Bug 4（`maxSinglePadFlips >= 2 || totalPadFlips >= 8`）。
+而 `BoostPadSystem.update()`（第 442–493 行）中，`pad.full.visible` 在以下 **3 种状态** 下为 `true`：
+1. `isRefilling`：`cooldownTimer <= threshold && cooldownTimer > 0`（小 pad 阈值 `1.0s` / 总冷却 `4.0s`；大 pad 阈值 `3.0s` / 总冷却 `10.0s`）-> `pad.full.visible = true`
+2. `isActive && animProgress >= 1.0`（可拾取状态）-> `pad.full.visible = true`
+3. 刚被吃掉后的收集动画期（`collectDuration = 300ms`）：`anim !== undefined` -> `pad.full.visible = true`；300ms 结束后 `collectAnimations.delete(i)` -> `pad.full.visible = false`。
 
-### 修复后实测验证（`pnpm run repro:dev-broadcast-v3`）
-- **`bug-1-goal-replay-client-static-no-dynamics`**: **`PASS_FIXED`** (`enteredReplay: true, distinctBallPositions: 3, sampleCount: 5`)
-- **`bug-2-replay-nametag-and-team-desync`**: **`PASS_FIXED`** (`edgeSyncOk: true`, `clientAfterHostEdge1: {2, false}`, `clientAfterLocalSwitch: {4, false}`, `clientAfterHostEdge2: {5, true}`)
-- **`bug-4-boostpad-model-flicker`**: **`PASS_FIXED`** (`totalPadFlips: 6, maxSinglePadFlips: 1`)
-- （注：`bug-3` 与 `bug-5` 仍按预期处于 `REPRODUCED_BUG`，分别由小队 A/B 与小队 D 负责。）
+### 2. 为什么单帧跳 110 ticks 会出现 `maxSinglePadFlips: 2`？
+在 SwiftShader 并发渲染下，30 帧 `rAF` 窗口往往跨越 **2–4 秒**真实时间，且单帧跳 **110 ticks**（约 `0.917s` 游戏时间）时，**单个小 pad（4s 冷却，1s 充能阈值）在 30 帧窗口内会自然经历 2 次可见性翻转**：
+- **路径 A**：pad 被吃掉（保持 `visible = true` 300ms）-> 动画结束变为 `false`（**Flip #1**）-> 经过约 2.7s（或若干次大 tick 跳变）进入 `cooldownTimer <= 1.0` 充能阶段变为 `true`（**Flip #2**）。
+- **路径 B**：pad 处于隐藏期（`false`）-> 进入 `isRefilling`（`true`，**Flip #1**）-> 充能完成并在 3v3 混战中被车吃掉且 300ms 动画结束（`false`，**Flip #2**）。
+
+此外，核查 `BoostPadSystem.ts` 第 281–378 行确认：
+- 已具备 `isDuplicateFrame` 去重；
+- 已具备 `isSmallUpwardJitter` / `isUpwardJitter` / `wouldExitRefill` 防抖守卫，防止冷却抖动导致 `isRefilling` 来回闪烁；
+- 当单帧跳变 110 ticks（`0.917s`）时，虽然 `safeDt` 被 clamp 到 `0.25s`，但 `bufferCooldown < nextTimer` 且差值 `> 0.5s`，会直接单调对齐到 `bufferCooldown`（第 353–367 行），不会产生反向回跳闪烁。
+
+### 3. 建议
+- **结论**：`maxSinglePadFlips: 2` 在大 tick 跳变/长采样窗口下属于**正常物理生命周期**，并非模型闪烁。
+- **测试端修正建议**：在 `scripts/runDevBroadcastReproV3.mjs` 中，将 Bug 4 阈值调整为 `maxSinglePadFlips >= 3`（或记录翻转时间戳，仅当同一 pad 在 `< 400ms` 内发生 `>= 2` 次翻转时判定为闪烁）。
 
 ---
 
-## 四、给汇总合并的后续建议
-1. 若需进一步压降 `repro:dev-broadcast-v3` 总耗时（避免接近 270s watchdog），建议在 `Client boot`（95–100s）期间临时节流 Host 渲染或分步初始化，而非仅靠 `?skipShaderPrewarm=1`。
-2. `z/agy/rc/track-c-bug1-bug2-stability`（`43e1fc4`）可直接合入最终修复分支，与小队 A/B/D 的修复无文件冲突。
+## 三、Bug 5 定位结论：`retainedGeometries` 波动（0 / 2 / 10）与 Track 2 `focusedCarIndex` 切换无关
+
+### 1. 排除 Track 2 `focusedCarIndex` 切换嫌疑（真实打点验证）
+构造独立 CDP 探针脚本（`/tmp/probe_bug5_focused.mjs`），在 Host 挂载 `THREE.BufferGeometry.prototype.addEventListener('dispose')` 与 `dispose()` 实时追踪集合，执行与 Track 2 完全一致的流程（加载 3v3 合成录像 -> 依次切换 `focusedCarIndex: 0 -> 1 -> 2 -> 3 -> 4 -> 5 -> 0` -> 调用 `onReturnToFreeplay()`）：
+- `[BOOT]`：`renderer.info.memory.geometries = 37`
+- `[REPLAY_3V3_LOADED]`：`renderer.info.memory.geometries = 71`（新上传 34 个）
+- `[EXIT_500MS]`：`renderer.info.memory.geometries = 37`（仅保留 11 个本地车体/轮毂几何体：`scenegltf_1..7` + 4x `solid-cylinder-wheel`，与 Boot 完全一致）
+- `[EXIT_2000MS]`：`renderer.info.memory.geometries = 37`（`retainedGeometries = 0`）
+
+**结论明确**：Track 2 的 `focusedCarIndex` 切换**不会**产生任何未清理几何体。
+
+### 2. `retainedGeometries` 出现 `0 / 2 / 10` 的真正根因（两点叠加）
+1. **根因 1：预分配持久化池几何体的“惰性 GPU 上传”统计偏差（主因）**
+   - `ArenaWorld` 在 Boot 时预创建了持久化特效对象，其中包括 `SupersonicWheelTrailSystem`（为全部 6 辆车预分配 `carTrails`，每车左右轮 2 条 `SupersonicWheelRibbon` = **2 个 `BufferGeometry`/车**，共 12 个）、`ballSpeedTrail`（**1 个 `BufferGeometry`**）及 `carDemolitions[0]`（**1 个 `PlaneGeometry`**）。
+   - 在 `bootMem` 采样时（Freeplay 静止开球），这些对象均处于 `visible = false`，`WebGLRenderer` **尚未将其上传至 GPU**，因此不计入 `bootMem.geometries`（37）。
+   - 在 Bug 1（Goal Replay）与 Bug 2/3（3v3 Replay）运行期间，只要有车进入超音速（例如 **1 辆车 = +2 个几何体**；**5 辆车 = +10 个几何体**！）或球速达标，对应 `BufferGeometry` 首次被渲染并计入 `renderer.info.memory.geometries`。
+   - 退出调用 `onReturnToFreeplay()` -> `resetFreeplayExtraCarsAndArenaToSingleCar()`（`src/game/modes/freeplay/freeplayKickoffAndArenaResetPipeline.ts:141-149`）时，仅调用 `supersonicWheelTrailSystem.resetCar(i)` 与 `ballSpeedTrail.reset()`（隐藏 `visible = false` 并清空顶点计数），**并未也不应销毁持久化池几何体**。因此 `afterExitMem.geometries - bootMem.geometries` 会固定多出 **2**（1 车超音速）或 **10**（5 车超音速），而无任何超音速触发时则为 **0**。
+2. **根因 2：`onReturnToFreeplay()` 异步换车与 500ms 固定等待竞态**
+   - `FreeplayMode.resetToCleanFreeplay()` 会异步触发 `restoreLocalPlayerFreeplayLoadout(0)`（重加载本地车模型，销毁旧车 11 个几何体后再异步挂载新车 11 个几何体），且 `void runtimeResourceRegistry.disposeScopes(['replay', 'ai', 'session'])` 未被 `await`。
+   - 探针实测中曾观察到 `EXIT_500MS` 时 `rendererGeoms` 瞬时跌至 `34`（旧车已销毁、新车未渲染完），`EXIT_2000MS` 恢复为 `45`（`37 + 8`）。
+
+### 3. 建议
+- **定位结论**：`retainedGeometries: 2` / `10` 不是内存泄漏，而是 `bootMem` 在冷启动未渲染任何超音速/拖尾几何体时采样，与 `afterExitMem`（已触发过持久化特效池首次 GPU 上传）直接做差值导致的基准不可比。
+- **修复方向**：
+  1. 若需严格清零：可在 `SupersonicWheelTrailSystem` 中对 `carIndex >= 1` 按需创建/在 `resetFreeplayExtraCarsAndArenaToSingleCar` 中销毁非本地车槽位的 ribbon，或在 `ArenaWorld` 预热阶段对持久化特效几何体执行一次 0-alpha 预上传，使 `bootMem.geometries` 包含固定池基线；
+  2. 测试端 `onReturnToFreeplay()` 后应等待 `runtimeResourceRegistry` 清理与本地车 loadout 恢复完成，再采样 `afterExitMem`。

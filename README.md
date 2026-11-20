@@ -1,94 +1,57 @@
-# RocketCompanion 审查、环境实测与三连修未决 Bug 根因及后续协同计划
+# RocketCompanion 交接与深度定位报告（用于新对话 + Live Chatting 协同排障）
 
-**目标分支**：`origin/z/agy/rc/multiplayer-recheck-base`（HEAD: `02adc3d1a404858c8186fee283658b69c2b3b3fa`）  
-**执行内容**：双 Commit 审查、已合并分支清理、冷/温启动环境脚本实测、全局 270s 软超时与流式输出审查、`bug-1/2/3` 屡修未过根因诊断与下一步计划。
-
----
-
-## 1. 两个新增 Commit 的审查结论
-
-| Commit SHA | 所在分支 | 审查结论 | 原因说明 |
-| :--- | :--- | :--- | :--- |
-| `02adc3d1a404858c8186fee283658b69c2b3b3fa` | 已在 `z/agy/rc/multiplayer-recheck-base` (HEAD) | **保留（Keep）** | 修复了跨模式切换（Goal Replay `numCars=1` -> 3v3 Replay `numCars=6`）或向后 seek > 12 ticks 时未重置 `SpectateLookaheadState` 导致拒绝新快照的问题，且首帧不再被旧 `monotonicFloor` 卡住。逻辑干净、必要。 |
-| `6889b8627d69c5f240334f6db6533ba7d2b9db83` | `origin/fix/bug5-replay-geometry-leak`（基于旧基线 `7252e42`） | **不建议合并 / 丢弃（Discard）** | 1. 当前基线 `02adc3d` 上 `bug-5` 已 `PASS_FIXED`（`retainedGeometries: -3`），无需此补丁。<br>2. **存在副作用风险**：其中 `disposeArenaHiddenEffectGeometries` 会遍历 `arena.cars[0]`、`carDemolitions[0]`、`carBoosts[0]`、`SpeedTrail_PS-ribbon`、`GoalBarrierSurface`、`ball-locator-arrow` 等对象，**只要节点当前 `visible === false` 就直接 `geometry.dispose()`**。这些属于对象池/复用特效，退回 Freeplay 后再次触发进球或加速时会因几何体已被销毁而出现 WebGL 报错或特效消失。 |
+**当前集成基线**：`origin/z/agy/rc/multiplayer-recheck-base`（HEAD: `02adc3d1a404858c8186fee283658b69c2b3b3fa`）  
+**分支清理状态**：所有 `origin/fix/bug*` 历史分支（含已确认丢弃的 `fix/bug5-replay-geometry-leak`）已全部清理完毕（`HTTP 204`）。  
+**环境基线状态**：`bootstrap.sh`（冷启动 ~20s）、`doctor.mjs --auto-restore`（温启动 1.52s）、OverlayFS **29 MB**（预算 <= 100 MB）、Headless WebGL2 均正常可用。  
+**已通过用例**：`pnpm run check`（1430/1430）、`pnpm run test:multiplayer-suite`（28/28）、`bug-4`（BoostPad 闪烁）、`bug-5`（几何体泄漏）。
 
 ---
 
-## 2. 已合并远端分支清理结果
+## 一、核心结论：你的需求没有矛盾，问题出在“测试夹具耦合 + 架构耦合”
 
-已通过 GitHub REST API 删除 `origin` 上 **10 个已合入 `z/agy/rc/multiplayer-recheck-base` 的 `fix/bug*` 分支**（全部返回 `HTTP 204`）：
-- `fix/bug-1-goal-replay-client-dynamics`
-- `fix/bug-2-replay-nametag-team-sync`
-- `fix/bug-5-memory-release-and-tauri-close`
-- `fix/bug1-goal-replay-client-dynamics`
-- `fix/bug1-goal-replay-snapshot-stream`
-- `fix/bug2-nametag-render-stability`
-- `fix/bug3-lookahead-monotonic-tick`
-- `fix/bug3-lookahead-wiring`
-- `fix/bug3-replay-buffer-cadence`
-- `fix/bug5-remaining-geometry-leak`
+经过对用户澄清的规格与代码实现的逐一核对，**你的产品逻辑本身完全自洽**：
 
-> 注：`origin/fix/bug5-replay-geometry-leak`（`6889b86`）暂未删除，待你确认丢弃后可一并清理。
+1. **Bug 2（Replay Watch Together NameTag & 视角）**：
+   - **你的真实规格**：Host 加载 Replay 后全量广播 6 辆车的 roster / loadout / NameTag 数据（`carIndex 0..5`）；Camera / BallCam / Replay Watch Together 采用**边沿触发（Edge-Triggered）**同步——Host 切换时广播给所有 Client 同步切换，长期不切换时 Client 可本地自由切视角。
+   - **为什么测试还报 FAIL**：`scripts/runDevBroadcastReproV3.mjs`（L349-352, L377-387）**没有校验全车 NameTag 数据映射**，而是去比较 `_visibleCards2D + _offscreenIndicators2D`（受屏幕视锥体裁剪）。由于 Host 与 Client 默认镜头角度不同（或未触发一次边沿切换），`host.tags` 只看见 `[1,4,5,3]`、`client.tags` 只看见 `[2]`，导致误报失败。
+   - **待确认/定位方向**：
+     1. 确认 Client 的 `nameTagSystem` 底层是否确实已收到全部 6 辆车的 NameTag 数据与队伍色（`arenaCarTeams` 已一致：`[0,0,0,1,1,1]`）；
+     2. 确认 Replay 刚加载进入 Watch Together 时是否需要补发一次初始视角边沿事件，并修正 `runDevBroadcastReproV3.mjs` 的断言（直接校验 6 车 NameTag 数据，或在测试中触发一次 Host 视角切换来验证边沿同步）。
 
----
+2. **Bug 1（Freeplay Goal Replay 时长与动态性）**：
+   - **你的真实规格**：Goal Replay 环形缓冲上限为 **10 秒**；如果进球过程只有 2 秒就放 2 秒，超过 10 秒就放最后 10 秒，有多少放多少。
+   - **为什么测试还报 FAIL**：`runDevBroadcastReproV3.mjs`（L245-248）为了快速造进球，把球直接瞬移到门前 `y=4850, vel_y=2950`，**0.1 秒就进门了**；叠加 `7147838` 裁剪前置空闲帧后，整段 Goal Replay 只剩 **~0.4 秒**。测试在 `waitFor('Host/Client enters Goal Replay')` 之后才开始每 200ms 采样一次，前 2 帧在 `replay`，第 3 帧就已切回 `playing`（`0, 0, 93.2`），从而触发 `distinctBallPositions <= 2` 报错。
+   - **待确认/定位方向**：
+     1. 检查在 `phase === 'replay'` 的有效帧内，Client 端的球和车是否**真正在连续运动**（排除“Replay 里依然静止”的真 Bug）；
+     2. 如果 Replay 内本身是动态的，则修正测试造球距离（例如从半场 `y=1500` 射门，产生 >= 2 秒自然缓冲）且只统计 `phase === 'replay'` 期间的采样点。
 
-## 3. 环境脚本实测结果（当前容器 `/tmp` 为空场景）
-
-1. **冷启动 `bash scripts/env/bootstrap.sh`**：**通过**
-   - 自动完成 `pnpm@10.28.2` 安装、`public/` 单次直拉（`e66c0523`）、`pnpm install`（9.9s）、3v3 `.rcreplay` 生成（281ms）及探针校验。
-   - OverlayFS 占用：**29 MB**（预算 <= 100 MB），Headless WebGL2（`WebKit WebGL`）正常。
-2. **温启动 `node scripts/env/doctor.mjs --auto-restore`**：**通过（耗时 1.52s）**。
-3. **`pnpm run env:help`**：**正常输出**，自愈说明与命令对齐。
-
----
-
-## 4. 全局 4.5 分钟（270s）软限制与 Streaming Output 审查
-
-**现状结论：尚未统一！** 目前各脚本各自硬编码超时，缺少统一的全局软限制工具与一致的流式输出：
-
-| 类别 | 当前实现情况 | 风险 / 缺口 |
-| :--- | :--- | :--- |
-| **270s（4.5m）** | `runScenarioBaseline.mjs`、`runMultiplayerRoomRepro.mjs`、`runMultiplayerChaosRepro.ts` | 符合“5 分钟上限 - 30s 安全裕度 = 270s”要求 |
-| **260s** | `runDevBroadcastReproV3.mjs`、`runDevBroadcastReproV2.mjs`、`runDevSyncReproSuite.mjs`、`runDevSyncExtraRoutesE2E.mjs` | 略保守但可用，未统一 |
-| **180s** | `runDevRoomSyncE2E.mjs`、`runSoakWatchdog.mjs` | 短任务阈值 |
-| **280s（裕度不足）** | `runMultiplayerSuiteTests.ts`、`scripts/env/bootstrap.sh` | 仅留 20s 裕度（低于要求的 30s 安全裕度） |
-| **缺失 Watchdog** | `scripts/runMultiplayerSyncIssuesRepro.ts`（`repro:sync-issues`） | 无软超时保护，可能触及 300s 硬截断 |
-| **Streaming Output** | 仅部分脚本（如 `runMultiplayerChaosRepro.ts`）有实时流式事件输出 | 多数脚本在末尾汇总打印，一旦超时容易丢失中间遥测 |
-
-**建议**：抽取统一的 `scripts/lib/softTimeoutWatchdog.mjs`（默认 `RC_SOFT_LIMIT_MS=270000`，支持环境变量覆盖、`.unref()` 定时器、逐阶段/逐用例立即 `stdout` flush），覆盖全部 `test:*`、`repro:*` 与 `bootstrap.sh`。
+3. **Bug 3（120Hz 物理 vs 变帧率渲染，以及后台 Tab 冻结）**：
+   - **业界标准架构（120Hz 物理 + 144/165/180Hz 渲染）是怎么做的**：
+     - **物理线程/逻辑步进**按固定时间步长 `dt = 1/120s (8.333ms)` 通过 **时间累加器（Accumulator）** 独立推进，**不与渲染帧率 1:1 绑定**。
+     - 当显示器是 144Hz/165Hz/180Hz（甚至未来物理降到 90Hz 或升到 150Hz）时，每次渲染帧根据 `alpha = accumulator / fixedDt ∈ [0, 1)`，对相邻两个物理帧 `prevState` 与 `currState` 做**状态插值（`PhysicsStateInterpolator`）**后送去渲染。这样无论渲染跑 30 FPS 还是 180 FPS，物理始终精确按 120Hz 演算，画面丝滑无跳变。
+   - **为什么当前测试会出现“23 帧冻结 + 单步跳变 1341.8 uu”**：
+     1. **测试环境触发了 Chrome 后台 Tab 降频**：`runDevBroadcastReproV3.mjs`（L326, L400）调用了 `clientCdp.send('Page.bringToFront')`，导致 **Host Tab 退居后台**。因为当前 Host 的 Replay 播放与广播仍挂载在 `requestAnimationFrame` 主循环上（未完全与 `rAF` 解耦），Chrome 对后台 Tab 的 `rAF` 强行降频成 1~4Hz 突发，Host 每次突发直接跨 41~54 ticks。
+     2. **Client 端 Lookahead / 插值在突发间隙没有平滑接管**：在 Host 两次突发之间的 23 个 Client `rAF` 帧里，Client 球坐标完全不动（`dist < 0.01`）。需要排查在 `client-csr-spectate` / Replay Watch Together 模式下：`shouldRunLookahead`（`src/game/pipeline/stages/simulationFrameClassifierPipeline.ts`）与 `SpectateInterpolationBuffer` 为什么没有在等待新快照时平滑推进或插值。
 
 ---
 
-## 5. 为什么 `bug-1 / bug-2 / bug-3` 修了三轮仍未全过？根因拆解
+## 二、全局 4.5 分钟（270s）软限制与 Streaming Output 缺口清单
 
-基于对 `scripts/runDevBroadcastReproV3.mjs` 与 `src/game/pipeline/stages/spectatePhysicsLookaheadPipeline.ts` 的代码走查，这 3 个问题**并非同一个原因**，而是**需求不明确 + 测试夹具副作用 + 局部状态机边界**交织所致：
+目前仓库**尚未统一**全局软限制（容器硬上限 300s - 30s 安全裕度 = **270s / 270,000ms**）：
+- **仍为 280s（裕度仅 20s）**：`scripts/runMultiplayerSuiteTests.ts`、`scripts/env/bootstrap.sh`
+- **无 Watchdog**：`scripts/runMultiplayerSyncIssuesRepro.ts`（`repro:sync-issues`）
+- **各自硬编码 260s / 270s / 180s**：`runDevBroadcastReproV2/V3`、`runDevSyncReproSuite`、`runDevSyncExtraRoutesE2E`、`runMultiplayerRoomRepro`、`runMultiplayerChaosRepro`、`runScenarioBaseline`、`runDevRoomSyncE2E`、`runSoakWatchdog`
+- **Streaming Output 不一致**：仅部分脚本实时逐行输出，多数脚本在结束时才汇总打印，超时易丢遥测。
 
-1. **`bug-1-goal-replay-client-static-no-dynamics`（修复引入的时长压缩 + 测试窗口错位）**
-   - `7147838` 裁剪了 Freeplay Goal Replay 前置空闲帧，导致从发球到进球的 Replay 总时长被压缩到仅 ~1 秒。
-   - 测试中 `waitFor('Client enters Goal Replay')` 完成后再间隔 200ms 采样 6 次（共 1.2s），前 2 帧在 `phase: "replay"`，第 3 帧已经结束并切回 `phase: "playing"`（`0, 0, 93.2`），导致 `distinctBallPositions` 只有 `2`（要求 `> 2`）。
-   - **本质**：需先明确 Goal Replay 最小有效播放时长（或测试采样逻辑是否应只统计 `phase === 'replay'` 期间，还是需要确认在 `replay` 期间球确实在连续运动）。
-
-2. **`bug-2-replay-nametag-and-team-desync`（需求不明确 + 测试断言与视角耦合）**
-   - 数据层面 `arenaCarTeams` 已经完全一致（`[0,0,0,1,1,1]`）。
-   - 失败原因是 `runDevBroadcastReproV3.mjs` 比较的是 `_visibleCards2D + _offscreenIndicators2D`，但 Host 与 Client 此时处于**不同摄像机视角**（`host.tags: [1,4,5,3]`，而 `client.tags: [2]`）。视锥体外的车辆本就不会出现在 `_visibleCards2D` 中。
-   - **本质**：**需求未定义清楚**——Replay Watch Together 到底要求“NameTag **数据/阵营文本**同步（测试应对齐双方视角或直接校验全车 NameTag 数据）”，还是要求“Client **相机视角/POV** 也强制同步 Host”？
-
-3. **`bug-3-replay-choppy-motion-no-physics-lookahead`（Chrome 后台 Tab 限频 + Lookahead 未接管冻结帧）**
-   - 测试在采样前执行了 `await clientCdp.send('Page.bringToFront')`，导致 **Host Tab 退居后台**，Chrome 自动对后台 Tab 的 `requestAnimationFrame` 降频（Host 变成 1Hz~4Hz 突发性发送，单次跳变 41~54 ticks）。
-   - 更关键的是：在 Host 突发的间隙，Client 连续 `23/29` 个 rAF 帧球位置完全冻结（`dist < 0.01`），说明 **Client 在 Replay Watch Together 模式下并没有通过 `spectatePhysicsLookaheadPipeline.ts` 持续步进补帧**（可能是 `simulationFrameClassifierPipeline` 中该模式下 `shouldRunLookahead` 为 `false`，或 `SpectateInterpolationBuffer` 处于等待/阻塞状态）。
+**改造目标**：新建统一的 `scripts/lib/softTimeoutWatchdog.mjs`（默认 `RC_SOFT_LIMIT_MS=270000`，支持 `.unref()` + `SIGINT/SIGTERM` 清理 + 逐用例/逐阶段实时 flush），并接入所有 `test:*` / `repro:*` / `bootstrap.sh`。
 
 ---
 
-## 6. 建议的下一步执行计划（支持边扫描边 Real-Time Chatting）
+## 三、新对话 + Live Chatting 建议推进顺序
 
-1. **第一阶段：并行只读扫描（3 组并行，快速出精准证据，不盲目改代码）**
-   - **Scan Team A（Bug 1）**：追踪 Freeplay Goal Replay 裁剪后的实际帧数/播放时长，以及 Client 在 `phase === 'replay'` 期间每帧球坐标是否真正在变。
-   - **Scan Team B（Bug 2）**：盘点 Replay Watch Together 的相机控制权与 `VehicleNameTagSystem` 全车数据来源，明确是改测试视角对齐还是改相机同步。
-   - **Scan Team C（Bug 3 + Watchdog）**：追踪 Replay Watch Together 下 `shouldRunLookahead` 实际取值、Chrome 后台 Tab 降频影响，以及全仓库脚本统一接入 `270s` 软超时 + 流式输出清单。
-2. **第二阶段：Real-Time Chatting 需求对齐（等你拍板以下 4 个问题）**
-   - **Q1（Bug 2 验收标准）**：Replay Watch Together 时，Client 是否允许自由切视角（只同步各车 NameTag 数据与队伍色），还是必须跟随 Host 视角？
-   - **Q2（Bug 1 验收标准）**：Freeplay 极短进球（如开球 1 秒内进球）时，Goal Replay 是否应有保底播放时长（例如 >= 2.5s），还是只要求“只要处于 replay 阶段就必须动态播放”？
-   - **Q3（Bug 3 预期范围）**：Replay Watch Together（非实时对战）在 Host 掉帧/后台限频时，Client 应该开启 WASM 物理 Lookahead 外推，还是走平滑插值缓冲？
-   - **Q4（分支清理）**：是否确认直接删除 `origin/fix/bug5-replay-geometry-leak`（`6889b86`）？
-3. **第三阶段：一次性收敛修复 + 统一 270s Watchdog 落地**
-   - 在规格对齐后，再按模块拆分并行修复 + 统一接入 `270s` 全局软超时与流式输出，避免继续“猜需求”式返工。
+1. **并行只读定位（3 路齐发）**：
+   - **路 1（Bug 1）**：实测打点 `phase === 'replay'` 期间每一帧的球/车坐标，确认是“真的静态不动”还是“测试 0.1s 进球太短”。
+   - **路 2（Bug 2）**：核查 Replay Watch Together 下 Client `nameTagSystem` 的 6 车全量数据状态，以及 Host 加载 Replay 时初始视角边沿广播是否缺失。
+   - **路 3（Bug 3）**：核查 Host 后台循环与 `rAF` 解耦方案（如 `MessageChannel`/Worker/`setTimeout` 驱动），以及 Client `SpectateInterpolationBuffer` + `spectatePhysicsLookaheadPipeline.ts` 为何出现 23 帧冻结。
+2. **基础设施收口**：落地 `scripts/lib/softTimeoutWatchdog.mjs`（统一 270s 软限制 + Streaming Output）。
+3. **一次性精准修复 + 全量回归**：修完后跑通 `pnpm run check`、`pnpm run test:multiplayer-suite`、`pnpm run repro:dev-broadcast-v3`（目标 `reproduced=0/5`）。

@@ -1,60 +1,30 @@
-# agyPreviewInstant <= 100 MB OverlayFS 存储优化与自愈环境工具链实现报告
+# AA-Track A-1 完成报告：Lookahead 单调 Tick 与平滑收敛修复
 
-已参考 `RocketCompanion`（commit `743573520e45ed4b1de47d300ca68fc48c89c2fb` 及其 `scripts/env/` 体系）完成可行性评估并直接落地实现。`agyPreviewInstant` 完全支持该 <= 100 MB OverlayFS 预算方案，并已通过 Verified Bot Commit 合入主分支 `a2`。
+## 1. 分支与提交信息
+- **基线分支**：`origin/z/agy/rc/multiplayer-recheck-base` (`7435735`)
+- **目标分支**：`fix/bug3-lookahead-monotonic-tick`
+- **Verified Bot Commit**：`a657c4920f82bde403ee08fe837b3d7660ddb5af`（`verified: true`，含 `Co-authored-by: Mark <29165094+MaBoCoMark@users.noreply.github.com>`）
+- **独占修改文件**：`src/game/pipeline/stages/spectatePhysicsLookaheadPipeline.ts`
 
-- **Commit SHA**: `4689b20eac4a685c388f9efa9d48c757e833a936` (`verified: true`, `antigravity-fine-grained-token[bot]`)
-- **OverlayFS 实测占用**: 安装全部 workspace 依赖、运行 `radar` / `check` / `build` 后仍保持 **8 MB**（baseline: 8 MB，budget: <= 100 MB）
+## 2. 核心改造内容
+1. **禁止 stale / 低 tick 快照回退已推进的 lookahead `tickCount`**：
+   - 在 `SpectateLookaheadState` 中新增 `lastAppliedTick` 与 `lastSampledTick`（在 `resetSpectateLookaheadState` 时同步清零）。
+   - 对 `sampled.renderTick + 0.5 < state.lastSampledTick` 的乱序过期样本直接拒绝，不覆盖本地状态。
+   - 新增 `enforceMonotonicTick` 与 `getCurrentEngineTick`，在非 lookahead 快照分支及回退分支中均以 `Math.max(16, currentEngineTick, state.lastAppliedTick, rawSampledTick)` 作为单调下界，防止 `applyReplayFrameToEngine` 或 `sampled.renderTick` 将已推进的 `SIM_OFFSETS.TICK` 拉回低值。
+   - 在 lookahead 步进分支中，基于 `Math.max(16, getCurrentEngineTick(physics), state.lastAppliedTick)` 推进 `nextTick` 并同步更新 `lastAppliedTick`。
+2. **平滑收敛而非直接覆写回弹**：
+   - 当 `rawSampledTick < monotonicFloor`（网络快照滞后于本地 lookahead 进度）时，采用更温和的收敛系数 `SPECTATE_CONVERGENCE_BEHIND_ALPHA = 0.2`（正常追上时为 `SPECTATE_CONVERGENCE_ALPHA = 0.3`），避免向旧 tick 位置剧烈回拉。
+   - 将 `SPECTATE_CONVERGENCE_DIST_SQ` 从 `900^2` 放宽至 `1800^2`，减少高速球运动下的硬切回弹。
+   - 收敛帧的 `converged[SIM_OFFSETS.TICK]` 同步锁定为 `monotonicTick`。
+3. **放宽 `SPECTATE_LOOKAHEAD_MAX_TICKS` 与分段衰减，避免 26 帧冻结**：
+   - 将 `SPECTATE_LOOKAHEAD_MAX_TICKS` 从 `30`（250ms）放宽至 `180`（1.5s @ 120Hz），避免短时断流/抖动触顶后 `return false` 导致连续 26 帧冻结。
+   - 新鲜帧到达时对 `lookaheadTicksActive` 进行分段快速衰减（追上时直接减半/归零，滞后时 `- 4` 替代 `- 2`），防止长期贴近上限。
 
-## 1. 差异适配与架构设计
-
-结合 `agyPreviewInstant` 的 pnpm workspace 单仓结构与架构雷达（`scripts/radar.ts`）约束，做了针对性适配：
-
-1. **Monorepo 多目录 tmpfs 软链卸载**（`scripts/env/tmpfsLayout.mjs`）
-   - 将所有大体积产物目录通过软链卸载到 `/tmp/agy-cache`（不占用 `/` OverlayFS），并自动写入 `.git/info/exclude`：
-     - `node_modules`、`node_modules/.vite`、`.vite`、`dist`、`.cache`、`src-tauri/target`
-     - `apps/p2p-remote-controller/node_modules`、`apps/p2p-remote-controller/node_modules/.vite`、`apps/p2p-remote-controller/.vite`、`apps/p2p-remote-controller/dist`、`apps/p2p-remote-controller/src-tauri/target`
-     - `packages/shared-config/node_modules`、`packages/macos-ax-helper/node_modules`
-   - `public/` 在本仓库中是 100 KB 的普通 tracked 静态资源（非 git submodule），无需 submodule 同步逻辑。
-
-2. **模块拆分满足 Radar 体积护栏**
-   - `agyPreviewInstant` 的 `scripts/radar.ts` 对 `scripts/*.mjs` 强制执行 `18 KB` 硬上限与 `12 KB` 软上限。因此将 `tmpfsGuard` 拆分为单职责小模块：`tmpfsLayout.mjs`、`tmpfsPnpm.mjs`、`tmpfsGuard.mjs`。
-
-3. **自愈 `pnpm` 包装器与 `/tmp` 快照重置检测**（`scripts/env/tmpfsPnpm.mjs`、`scripts/env/tmpfsGuard.mjs`）
-   - 将 `pnpm@10.28.2` 安装到 `/tmp/agy-cache/pnpm-global`，并在 `/usr/local/bin/pnpm` 写入自愈 wrapper：
-     - `/tmp` 被容器快照重置后，运行任意 `pnpm ...` 会自动重装 `pnpm` 到 tmpfs 并重建基础软链；若 `node_modules/.modules.yaml` 缺失，则提示一键修复命令。
-     - 通过 `/tmp/.agy-env-sentinel` 与 `.git/agy-overlay-baseline.json` 自动检测悬空软链与 `/tmp` 重置。
-   - `bootstrap.sh` 与 `doctor.mjs --auto-restore` 会自动补齐 `src/config/resolvedProfile.json`（调用 `scripts/syncPrivateProfile.mjs`），确保全新环境可直接通过 `tsc --noEmit` 与 `pnpm run check`。
-
-## 2. 新增文件与命令
-
-- 新增文件：
-  - `scripts/env/tmpfsLayout.mjs`
-  - `scripts/env/tmpfsPnpm.mjs`
-  - `scripts/env/tmpfsGuard.mjs`
-  - `scripts/env/bootstrap.sh`
-  - `scripts/env/checkEnv.mjs`
-  - `scripts/env/doctor.mjs`
-  - `scripts/env/help.mjs`
-  - `scripts/env/README.md`
-- `package.json` 新增脚本：
-  - `pnpm run env:help` — 查看环境与自愈命令速查表
-  - `pnpm run env:check` — 快速状态检查（OverlayFS 体积、tmpfs sentinel、workspace 依赖）
-  - `pnpm run env:doctor` — 完整诊断（支持 `--auto-restore`、`--require-rust`）
-  - `pnpm run env:setup` — 一键初始化/修复（pnpm + workspace `node_modules` 卸载至 tmpfs）
-  - `pnpm run env:setup:rust` — 同上 + 安装 Rust/Cargo 及 Tauri Linux C 构建依赖至 tmpfs
-
-## 3. 验证结果
-
-- `pnpm run env:help`：正常输出命令速查表。
-- `pnpm run env:check` / `pnpm run env:doctor`：Node.js v22.23.5、pnpm 10.28.2、root & p2p `node_modules` (tmpfs)、`/tmp/.agy-env-sentinel` 全部 `[OK]`；OverlayFS footprint **8 MB / <= 100 MB**。
-- `pnpm run radar`：297 个文件全部通过（`Hard=800L/18KB (0/0 ratchet)`，`Cycles=0`，`P2P Type/Lint Check : PASS`）。
-- `pnpm run check`：`tsc --noEmit`、`eslint src`、`vitest run`（2 test files, 16 passed）全部通过。
-- `pnpm run build`：Vite 构建成功，产物写入 `/tmp/agy-cache/dist`，OverlayFS 占用仍为 **8 MB**。
-
-## 4. 配套提示词（可直接复用）
-
-```text
-若环境未初始化或 /tmp 快照重置：无 pnpm 时跑 bash scripts/env/bootstrap.sh，有异常时跑 node scripts/env/doctor.mjs --auto-restore（含 Rust 需求加 --require-rust）。
-
-随时可运行 pnpm run env:help 查看环境命令，或 pnpm run env:check 检查状态与 OverlayFS 预算（<= 100 MB）。
-```
+## 3. 门禁与验证结果
+- `pnpm run check`：**PASS**（TS 类型检查与循环依赖检查通过）
+- `pnpm run test:multiplayer-suite`：**PASS**（含 Test 26 `client-csr-spectate Physics Lookahead & Convergence` 与 Test 27 `W2-A isLookahead WASM lookahead wiring` 全部通过）
+- AA-Track A-1 专项不变量验证：
+  - 连续 40 帧 lookahead 步进（> 30 ticks）无冻结，持续推进；
+  - 推进至高位 tick 后收到低 `renderTick`（719）快照不发生 `tickCount` 回退；
+  - 乱序退步 `renderTick`（718 < 719）被拒绝；
+  - `resetSpectateLookaheadState` 后可正常从初始 tick（16）重新开始。

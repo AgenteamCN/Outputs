@@ -1,61 +1,41 @@
-# RocketCompanion 团队环境与 tmpfs 自愈使用指南（Track D 交付说明）
+# Live Chat 验证与移动端 E2EE / Pocket Deck 架构评估报告
 
-> **远程分支**：`origin/feat/env-tmpfs-restore-guard`（Verified Bot Commit `9b0401dd7d6c5a03d57ee6509b64ddf0b047c856`）
+## 1. Live Chat Worker (`agentlivechatchannel`) 评估与实测
 
----
+- **`/help` 与 `/version` 审查结论**：协议设计完整、规范，无需修改 Worker，可直接投入使用。
+  - 自动分配隔离频道：`ch_897a432c`
+  - Topic 规范：`agy_p2p_v1/cmd/ch_897a432c/<command>`、`agy_p2p_v1/resp/ch_897a432c/<requestId>`、`agy_p2p_v1/chat/ch_897a432c`
+  - 端点完备：`/help`、`/version`、`/cmd`（支持 `stream: true` NDJSON 心跳流，最长 `waitMs: 300000`）、`/chat/send`、`/chat/poll`、`/mqtt/rpc`
+  - `supportedCommands` 覆盖 23 个核心指令（`ping`、`get_status`、`scan_window`、`perform_action`、`execute_javascript`、`initialize_aistudio`、`ask_user` 等）。
+- **连通性实测**：
+  - `POST /chat/send` 成功发送问候消息（`ok: true`, `connackCode: 0`, `pubackedCount: 1`, 耗时 895ms）。
+  - `POST /cmd`（`ping`, `stream: true`）成功建连、订阅响应 Topic 并持续输出心跳流（15s 内未收到响应是因为 Mac 端尚未在 `ch_897a432c` 审批/应答）。
 
-## 一、回答核心问题：是不是“任何指令失败都会自动检测并全恢复”？
+## 2. 仓库现状盘点（`Antigravi-ty/agyPreviewInstant`）
 
-**不是无条件全自动拦截所有 shell 命令，而是分层级设计（避免每次命令都产生额外耗时或隐藏真实业务报错）：**
+已运行 `pnpm radar -- --audit`（291 files，Cycles=0，LayerViolations=0，全部通过）。
 
-### 1. 哪些是“静默自动检测 + 自动自愈”的？
-1. **调用 `pnpm ...`（通过 `/usr/local/bin/pnpm` 包装器）**：
-   - 每次执行 `pnpm` 时，若检测到 `/tmp` 被容器快照重置（`/tmp/rc-cache/pnpm-global/bin/pnpm` 丢失），包装器会**自动通过 `npm` 在 ~3 秒内将 `pnpm@10.28.2` 重装到 tmpfs**，并自动调用 `node scripts/env/tmpfsGuard.mjs --ensure` 重建 `/tmp/rc-cache/*` 目录与基础软链接（`node_modules`、`dist`、`.vite`、`src-tauri/target`）。
-   - **注意**：`pnpm` 包装器为了不拖慢常规命令，**不会**在每次运行 `pnpm` 时自动重新克隆 `public/` 或重新跑 `pnpm install` / 重新生成 `.rcreplay`。
+### 已具备能力
+1. **Pocket Deck 离线外壳缓存**：`apps/p2p-remote-controller/public/sw.js` 已实现壳资源与同源静态资产预缓存、导航离线回退，以及 `MANUAL_REFRESH_CACHE` 手动刷新。
+2. **移动端指令与正则匹配**：`PocketDeckDirectTab.tsx` 已包含 `Open New (Mobile)`、`Focus Window`、`Refresh Page`、`Reload Default`、`Scan AX`、`Press Regex`（`targetRegex`）及 URL 预设；`emqxCommandHandlers.ts` 与 `usePocketDeckBridge.ts` 已支持 `targetRegex` + `targetIndex` 匹配。
 
-### 2. 哪些是“自动检测 + 明确打印 `try ... first` 恢复指令”的？
-1. **`pnpm run env:check`（`scripts/env/checkEnv.mjs`）**
-2. **`pnpm run env:doctor`（`scripts/env/doctor.mjs`）**
-   - 当检测到以下任意 `/tmp` 重置信号时：
-     - 存在悬空软链接（dangling symlinks，如 `public` 或 `node_modules` 指向已清空的 `/tmp/rc-cache/...`）
-     - `.git/rc-overlay-baseline.json` 存在但 `/tmp/.rc-env-sentinel` 丢失
-     - sentinel 中记录为存在的 `viteCacheDir`、`CARGO_TARGET_DIR` 或 `.rcreplay` fixture 丢失
-   - 均会打印醒目的 `[tmpfsGuard] /tmp (tmpfs) RESET DETECTED!` 诊断横幅，并直接给出可复制执行的恢复命令：
-     ```bash
-     node scripts/env/doctor.mjs --auto-restore
-     pnpm run env:setup
-     pnpm run env:setup:rust
-     pnpm run replay:generate-ducky
-     ```
-3. **E2E 脚本前置检查（`scripts/env/reproPreflight.mjs` / `launchHeadlessChrome.mjs`）**：
-   - 当 `public/` 或 `node_modules` 或 Chrome 缺失时，会抛出带提示的错误，引导执行 `pnpm run env:setup` 或 `pnpm run env:doctor`（不会静默超时卡死在 60s boot timeout）。
+### 待补齐的核心缺口
+1. **外网/蜂窝网络回落链路**：`usePocketDeckRemoteSync.ts` 与 `dispatchPocketDeckAction` 目前仅访问局域网 `/api/state`、`/api/action` 与 `ws://host/ws`，外网环境下只能读取 `localStorage` 缓存快照，尚无 WebRTC P2P 或 EMQX Relay 连接能力。
+2. **E2EE 与双向鉴权（UUID Token + TOTP）**：目前 EMQX 载荷为明文 JSON，缺少端到端加密、UUID Access Token 鉴权以及连接/操作级 TOTP 校验。
+3. **AI Studio `partial` 状态回退**：`aiStudioWindowState.ts` 中 `networkConfigured = networkVerified || (previous?.networkConfigured ?? false)` 依赖内存态 `previous`；当 network 面板在 AX Tree 中仅显示单行且发生重扫/状态重置时，会退回 `partial`。
 
-### 3. 一键全量恢复指令（`--auto-restore`）
-当你看到上述任何提示、或怀疑容器快照恢复清空了 `/tmp`、或刚执行过 `git reset --hard`（注意：`git reset --hard` 会把 `public` 软链接还原为空目录）时，只需执行以下**任意一条**即可全量恢复（`pnpm` + `public/` + `node_modules` + `.vite` + `6-Ducky .rcreplay` + `/tmp/.rc-env-sentinel`）：
-```bash
-node scripts/env/doctor.mjs --auto-restore
-# 或（当 pnpm 还在时）：
-pnpm run env:setup
-# 若容器内连 pnpm 都还没有（首次初始化）：
-bash scripts/env/bootstrap.sh
-```
-（若需 Rust / Tauri C4 验证，追加 `--with-rust` 或运行 `pnpm run env:setup:rust`。）
+## 3. 技术方案评估与建议
 
----
+1. **P2P vs Rust UDP vs EMQX Relay**：
+   - **优先 WebRTC DataChannel**：iOS Safari 原生支持，自带 DTLS-SRTP 加密，低频十几 KB 数据能耗极低；比自研带 ACK 的 UDP 或 Rust UPnP 更省事且兼容蜂窝网络。
+   - **降级 EMQX E2EE Relay**：当严格 NAT 导致 ICE 打洞失败时，自动回落到 EMQX 中转，并在应用层使用 AES-256-GCM 加密载荷（Broker 不可见明文）。
+2. **ICE Token 防篡改与 TOTP 鉴权**：
+   - 浏览器端无法直接访问 HTTPS 证书私钥，因此不建议用 HTTPS 证书做应用层签名。
+   - 推荐在局域网首次配对时，由 Mac 端下发 **UUID Access Token + TOTP Secret + E2EE 主密钥/ECDH 公钥指纹** 至 iOS 端持久化；外网建连时通过 **ECDH 临时密钥交换 + HKDF** 派生会话密钥，并对 ICE 信令及每次操作（`perform_action`、`execute_javascript` 等）强制校验 **TOTP**；只读状态拉取可限定在 `source: "mobile"` 创建的窗口内免 TOTP。
+3. **轮播图动态 ID 与 AI Studio `partial` 调试**：
+   - 轮播图按钮可继续强化 `targetRegex` + `role` + 父容器锚点定位。
+   - `initialize_aistudio` 成功调整 network 后，应在 Mac 端按 `windowId` 记录 `networkConfigured` 标志（页面 reload 时清除），并可通过 Live Chat 用 `execute_javascript` 实测直接读取 network 面板实际状态。
 
-## 二、后续给仓库各团队 / Agent 的标准 Input 模板
+## 4. 下一步建议
 
-建议在后续所有 Track（A / B / C / E 及集成验证）的 Prompt / Input 中统一附带以下环境约定段落：
-
-```markdown
-### 环境与 tmpfs 自愈约定（RocketCompanion 容器规范）
-1. **首次初始化或 `/tmp` 快照重置后**：
-   - 若 `pnpm` 不存在：先运行 `bash scripts/env/bootstrap.sh`（仅装 pnpm 可用 `bash scripts/env/bootstrap.sh --pnpm-only`）。
-   - 若遇到环境异常、悬空软链接、`public/` 缺失、或 E2E 报 preflight 失败：先运行
-     `node scripts/env/doctor.mjs --auto-restore`（需 Rust/Tauri 时加 `--require-rust`）。
-2. **禁止在 OverlayFS 长期落盘大体积产物**：
-   - `node_modules`、`public/`、`.vite`、`dist`、`src-tauri/target`、`.rcreplay` 均已通过 `scripts/env/tmpfsGuard.mjs` 分流到 `/tmp/rc-cache/`。
-   - 保持仓库 OverlayFS 占用 `<= 100 MB`（可通过 `pnpm run env:check` 查看基线与当前占用）。
-3. **执行 `git reset --hard` / `git checkout -f` 后**：
-   - 若 `public/` 软链接被还原为空目录，执行 `node scripts/env/tmpfsGuard.mjs --sync-public` 或 `node scripts/env/doctor.mjs --auto-restore` 即可恢复且保持 `git status` 干净。
-```
+- 专属 Live Chat 频道 `ch_897a432c` 已就绪。若你准备就绪，我们可以直接在 `p2p-remote-controller` 中通过 Live Chat 联调带轮播图的页面操作与 AI Studio `partial` 探测；如需为手机端隔离新建 EMQX 账号与 Topic 权限，也可随时提供新凭据继续开发。

@@ -1,56 +1,77 @@
-# Wave 1 (`W1-02` / `feat/timeline-frame-buffer`) 交付报告
+# W1-05 (`feat/mode-replay-watch-together`) 交付报告 & 字段清单
 
-- **分支**：`feat/timeline-frame-buffer`（基于 `origin/z/agy/rc/multiplayer-recheck-base` `7c80b445`）
-- **已验证 Bot Commit**：[`54f17b463224e262436e1bda0c17cfb6a456a658`](https://github.com/Antigravi-ty/RocketCompanion/commit/54f17b463224e262436e1bda0c17cfb6a456a658)（`signature.isValid = true`, `state = VALID`）
-
----
-
-## 一、核心实现内容
-
-1. **`src/network/sync/TimelineFrameBuffer.ts`**
-   - 实现 `TimelineFrameBuffer`（零稳态 GC 预分配环形缓冲，默认容量 32 帧）：
-     - **60Hz+ 直通模式（Pass-through）**：通过到达间隔 EMA（`avgIntervalMs <= 22ms`，即 `>= ~45Hz`）自动识别高帧率流，直接返回最新帧（`mode: 'passthrough'`，`interpolationDelayMs = 0`）。
-     - **15Hz / 30Hz 接收时间轴双帧插值（Arrival-Timeline Interpolation）**：以客户端接收时间 `arrivalMs` 为唯一时间轴（`renderTimeMs = nowMs - clamp(avgIntervalMs + jitterMarginMs, 25, 120)`），在相邻到达帧 `[slotA, slotB]` 间插值；**零 Lookahead 外推、零单调 `tick` 假设**，正放、慢放（0.25x/0.5x）、暂停（停在最新帧不漂移）、倒放（Rewind，`tick` 递减）行为 100% 对称一致。
-     - **`txSeq` 乱序/重复包丢弃**：单调递增 `txSeq > 0` 过滤乱序或重复包，统计 `droppedOutOfOrder`。
-     - **断层与瞬移护栏**：支持 `discontinuity` 标记（如进球重置/开球）整帧瞬切，以及单实体超距（`maxTeleportDistanceUu = 450`，如 Demo 重生）单车瞬切而其余实体继续平滑插值。
-     - **动态切频自适应**：60Hz <-> 30Hz <-> 15Hz 切换时自动在直通与插值之间平滑切换。
-
-2. **`src/network/sync/TimelineFrameMath.ts`**
-   - 实现 `basisToQuat`（与 `RLRCQuaternionTrajectoryInterpolator.quatToBasisVectors` 精确互逆）和 `interpolateSnapshotPair`：
-     - 球与 1~8 辆车位置、线速度、角速度、Boost、轮速/地面法线做线性插值；
-     - 球与车辆 3x3 正交基旋转矩阵通过 `basisToQuat` -> `slerpShortestArcQuat` -> `quatToBasisVectors` 做最短弧四元数 SLERP；
-     - 离散标志位（`GOAL`、`ON_GROUND`、`SUPERSONIC`、`DEMOED`、`IS_BOOSTING`、`IS_FLIPPING`、`BOOST_PAD` 激活状态）按 `alpha >= 0.5` 切换。
-
-3. **`src/network/sync/ReplicationStateInterpolator.ts` & `scripts/runMultiplayerSuiteTests.ts`**
-   - 将 `SpectateInterpolationBuffer` 接入 `TimelineFrameBuffer`，保持既有公开接口兼容；更新 `testSpectateInterpolationBufferReverseDelay` 中的 `bufferedFrames` 断言（环形保留 3 帧）。
-
-4. **单元测试 `scripts/testTimelineFrameBuffer.ts`**
-   - 覆盖 `basisToQuat` 往返精度、60Hz 直通、30Hz/15Hz 正放插值与四元数 SLERP、倒放（非单调递减 tick）、慢放与暂停零外推、`txSeq` 乱序丢弃与 `discontinuity` 瞬切、单实体 Teleport 瞬切、以及 60Hz <-> 30Hz 动态切频。
+- **分支**：`feat/mode-replay-watch-together`
+- **基线**：`origin/z/agy/rc/multiplayer-recheck-base` (`7c80b445f2953076e5356320c6e91bc04da4bba8`)
+- **Verified Bot Commit**：`83a591ab2fd1f3a93daf5f8411bff94e03bf6627`（GitHub GraphQL `createCommitOnBranch`，`signature.isValid = true`, `state = VALID`）
 
 ---
 
-## 二、Wave 2 协议汇总：通道 1（`WorldFrame`）字段需求清单
+## 一、W1-05 核心交付物
 
-供 Wave 2 `feat/protocol-schema-alignment` 设计二进制包头与 `WorldFrame` 时对齐：
+1. **Wave 1 临时 TS 协议契约**：`src/replay/watch-together/ReplayWatchTogetherTypes.ts`
+   - 定义 `ReplayWatchPlaybackState`（`idle | paused | playing | rewinding | forwarding`）、`ReplayWatchPlaybackCommand`、`ReplayWatchRosterManifest`、`ReplayWatchFrameStreamPacket`、`ReplayWatchCursorStatus`。
+2. **1~6 车 RosterManifest 与确定性 4B `metadataHash`**：`src/replay/watch-together/ReplayWatchRosterManifest.ts`
+   - `buildReplayWatchRosterManifest()`：归一化 1~6 号车的 `carIndex`、`slotKey`、`team`（0/1 固定阵营，杜绝 4/5/6 切焦点跳边）、`roleFlag`（`player | bot | ghost`）、`visualId`、`hitboxId`、`colorSlot`、`colorHex`、`paintFinish`、`boostVisual`、`boostAudio`、`decalId`。
+   - `computeReplayMetadataHash()`：基于 FNV-1a 计算 32-bit `metadataHash`（及 `0xXXXXXXXX` 格式化），任何车身、配色、阵营或录像变更即触发新 Hash。
+3. **Worker 游标与帧流引擎**：`src/replay/watch-together/ReplayWatchCursorEngine.ts`
+   - 纯 Worker 无 DOM/无 rAF 驱动，支持 `load_replay`、`play`、`pause`、`rewind`、`fast_forward`、`seek`、`set_speed`（0.25x / 0.5x / 1.0x / 2.0x 等）、`set_focus`（1~6 视角与自由相机位姿）、`unload`。
+   - 无论正放、倒放（Rewind）、暂停或跳帧（Seek），`txSeq` **严格单调递增**，满足 `EstablishedSession` 滑窗反向裁剪与 `TimelineFrameBuffer` 时间轴插值对称性。
+   - 自动提取球体状态、1~6 辆车状态、34 个 BoostPad Bitmask（Lo 32b + Hi 2b）、计分板/时钟/加时状态与按 `signalId` 去重的 Channel 3 信号事件（仅正放/Seek 触发，倒放/暂停不误播）。
+4. **Worker ActivityKernel 接入**：`src/network/server/activities/ActivityKernel.ts`
+   - `ReplayActivityKernel` 挂载 `ReplayWatchCursorEngine`，处理 `replay_watch_command` / `replay_watch_step` 控制消息，并在 `getStateSummary()` 输出 `replayWatch`、`rosterManifest`、`lastFramePacket`。
+5. **单元测试与集成测试**：`scripts/testReplayWatchTogether.ts`
 
-| 字段 | 类型 / 位宽建议 | 用途说明 |
+---
+
+## 二、验证结果
+
+- `node --experimental-strip-types scripts/testReplayWatchTogether.ts`：**PASS**（覆盖 6 车外观与 `metadataHash` 校验、正放/倍速/倒放/暂停/跳帧、`txSeq` 单调性、4/5/6 焦点阵营锁定、34 BoostPad Bitmask、`RoomActivityOrchestrator` + `ReplayActivityKernel` 集成）。
+- `pnpm run check`（`radar` + `tsc --noEmit`）：**GREEN**（1431/1431 TS，0 循环依赖，0 越层引用，0 错误）。
+- `RC_SUITE_WATCHDOG_MS=280000 pnpm run test:multiplayer-suite`：**28/28 PASS**。
+
+---
+
+## 三、Replay Watch Together 数据包字段清单（供 Wave 2 `feat/protocol-schema-alignment` 汇总）
+
+### 通道 1：高频 State 流（Unreliable，15/30/60Hz）
+| 字段名 | 类型/位宽建议 | 说明 |
 |---|---|---|
-| `txSeq` | `uint32` | 通道 1 严格单调发送序号，用于乱序/重复包丢弃与滑窗裁剪（不可用 `tick` 替代） |
-| `tick` | `uint32` | 物理/录像帧号（允许倒放递减、暂停不变或跳帧） |
-| `playbackState` | `uint8` enum (`playing \| paused \| rewinding \| fast_forward \| seeking`) | 驱动客户端渲染缓冲与音频静音策略 |
-| `flags / discontinuity` | `uint8` bitmask (含 `discontinuity` 位) | 标识开球重置、Seek 跳帧、模式切换等不可跨帧插值的边界 |
-| `phase` | `uint8` enum | 房间/比赛阶段 |
-| `clockSeconds` | `float32` | 比赛/回放时钟 |
-| `focusedCarIndex` | `int8` / `uint8` | 当前观战焦点车号 |
-| `cameraPose` (可选) | `vec3` pos + `quat` rot + `float32` fov | Goal Replay / Director 电影机位（当本帧含相机位姿标志时存在） |
-| `ball` | `pos(vec3)` + `rot(quat/basis)` + `vel(vec3)` + `angVel(vec3)` | 球刚体状态 |
-| `cars[0..N-1]` | `pos(vec3)` + `rot(quat/basis)` + `vel(vec3)` + `angVel(vec3)` + `boost(float32)` + `stateFlags(uint8)` + `wheels` | 车辆状态与离散标志（`onGround`/`supersonic`/`demoed`/`isBoosting`/`isFlipping`） |
-| `boostPadMask` | `uint64` / bitmask + cooldown | 34 个 Boost Pad 状态 |
+| `schemaHash` | `uint32` (4B HEX) | 协议结构校验指纹 |
+| `txSeq` | `uint32` (4B) | 严格单调递增发包序列号（正/倒放/暂停/跳帧均递增，用于滑窗 ACK 裁剪） |
+| `metadataHash` | `uint32` (4B) | 当前 `RosterManifest` 哈希；Client 不一致时异步重拉通道 2 |
+| `replayFrame` | `uint32` (4B) | 当前整数帧游标 (`0 .. totalFrames - 1`) |
+| `fractionalFrame` | `float32` (4B) | 精确浮点游标（用于慢放/倍速子帧对齐） |
+| `playbackState` | `uint8` (枚举) | `0=idle, 1=paused, 2=playing, 3=rewinding, 4=forwarding`（`!== playing` 时 Client 音频立即 `silenceAll()`） |
+| `playbackSpeed` | `float32` / `uint16` Q8.8 | 倍速（如 `0.25, 0.5, 1.0, 2.0`） |
+| `playbackDirection` | `int8` | `-1=倒放, 0=暂停, 1=正放` |
+| `focusedCarIndex` | `int8` | `0..5`（`-1` 为自由视角），驱动 Client 顶部 1~6 HUD 高亮与视角切换 |
+| `cameraMode` | `uint8` | `0=car, 1=free, 2=ball` |
+| `cameraPose` | `6 * float32` (可选 bit) | `eyeThreeJs[3] + targetThreeJs[3]`（FreeCam / Director Cam 时携带） |
+| `matchPhase` | `uint8` (枚举) | `playing / kickoff / goal_replay / overtime / ended` |
+| `blueScore` / `orangeScore` | `uint8` + `uint8` | 蓝/橙比分 |
+| `remainingSeconds` / `overtimeSeconds` | `uint16` + `bool` | 倒计时秒数与加时标记 |
+| `ball` | `pos(3f)+vel(3f)+angVel(3f)+rot(quat/mat)` | 球位姿与速度 |
+| `cars[0..5]` | `carIndex(u8)+pos(3f)+vel(3f)+angVel(3f)+rot+boost(u8)+flags(u8)` | 1~6 车位姿、Boost 与 `onGround/supersonic/demoed/isBoosting/isFlipping` 位掩码 |
+| `boostPadBitmaskLo/Hi` | `uint32 + uint8` (34 bits) | 34 个 BoostPad 激活状态位掩码 |
 
----
+### 通道 2：低频 Metadata 清单（Reliable 异步推送 / 按 `metadataHash` 按需补拉）
+| 字段名 | 类型 | 说明 |
+|---|---|---|
+| `metadataHash` | `uint32` (4B) | 整个 `RosterManifest` 的 FNV-1a 校验哈希 |
+| `replayId` | `string` | 录像文件名 / ID |
+| `totalFrames` | `uint32` | 录像总帧数 |
+| `tickRateHz` | `uint16` | 录像采样率（默认 `120`） |
+| `arenaPreset` | `uint8` | 球场预设（Standard / Throwback 等） |
+| `telestratorPermission` | `uint8` | `host_only / everyone` |
+| `cars[0..5]` | Array (1~6) | 每辆车：`carIndex (0..5)`, `slotKey (1..6)`, `name`, `team (0\|1)`, `roleFlag (player\|bot\|ghost)`, `isBot`, `visualId`, `hitboxId`, `colorSlot`, `colorHex`, `paintFinish`, `boostVisual`, `boostAudio`, `decalId` |
 
-## 三、验证结果
+### 通道 3：瞬时 Signal / Incident（Reliable，按 `signalId` 去重 + ACK）
+| 字段名 | 类型 | 说明 |
+|---|---|---|
+| `signalId` | `uint32` | 唯一信号 ID（去重防重放） |
+| `signalType` | `uint16` | 进球、扑救、爆破、触球音效、倒计时滴声、Telestrator 事件 |
+| `frameIndex` | `uint32` | 触发帧号 |
+| `param1` / `param2` | `int32` / `int32` | 附加参数（如触球车号、得分阵营） |
 
-- `env -u NODE_OPTIONS node --experimental-strip-types scripts/testTimelineFrameBuffer.ts`：**9/9 单元测试全部通过**
-- `pnpm run check`（`radar` + `tsc --noEmit`）：**GREEN**（1430/1430 TS，0 边界/体积违规，0 类型错误）
-- `RC_SUITE_WATCHDOG_MS=280000 pnpm run test:multiplayer-suite`：**28/28 套件测试全部通过**
+### 通道 4：Bulk / Asset 大文件流（低优先级独立通道，后期可选）
+- 可选 `.rcreplay` 文件预分发（`replayId`, `fileHash`, `totalBytes`, `chunkIndex`），开启后通道 1 仅需同步 `replayFrame` + `playbackState` + `focusedCarIndex` + `cameraPose`。

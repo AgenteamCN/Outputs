@@ -1,34 +1,60 @@
-# Task Summary & Delivery Report
+# agyPreviewInstant <= 100 MB OverlayFS 存储优化与自愈环境工具链实现报告
 
-## 1. Cloudflare Worker (`agentlivechatchannel`) Timeout Enforcement
-- Updated `agentlivechatchannel` (`worker.mjs`) and deployed to Cloudflare account `ed9fbe2769b04c3a5a27021fb8536a79`:
-  - Enforced `FORCED_WAIT_MS = 270000` (4 minutes 30 seconds) across `/cmd`, `/chat/poll`, and `/mqtt/rpc`.
-  - Disallowed/ignored caller `waitMs` overrides (`clampWaitMs()` always returns `270000`).
-  - Updated `/version` (`forcedWaitMs: 270000`, `waitMsOverridable: false`) and `/help` documentation.
-  - Verified live via `GET /version`.
-- **Analysis of 4m30s timeout**:
-  - `runMqttSession` uses `returnOnFirstMessage: true`, so responses/approvals/chat messages still return immediately on arrival; it only waits up to 270s when waiting for human input.
-  - 270s sits safely under the 300s sandbox bash timeout, preventing premature tool kills and duplicate/missed retries caused by short `waitMs` values.
+已参考 `RocketCompanion`（commit `743573520e45ed4b1de47d300ca68fc48c89c2fb` 及其 `scripts/env/` 体系）完成可行性评估并直接落地实现。`agyPreviewInstant` 完全支持该 <= 100 MB OverlayFS 预算方案，并已通过 Verified Bot Commit 合入主分支 `a2`。
 
-## 2. Preparatory Architecture Splits (`pnpm radar -- --audit` Green Zone)
-- Extracted `apps/p2p-remote-controller/src/hooks/useSafariWindowActions.ts` from `useSafariWindowManager.ts` (brought `useSafariWindowManager.ts` down from 518L/17.1KB/26 hooks to 284L/8.6KB/19 hooks).
-- Extracted `apps/p2p-remote-controller/src/hooks/useNetworkRecorderPolling.ts` from `useNetworkRecorder.ts` (brought `useNetworkRecorder.ts` down from 486L/18.3KB to green zone).
+- **Commit SHA**: `4689b20eac4a685c388f9efa9d48c757e833a936` (`verified: true`, `antigravity-fine-grained-token[bot]`)
+- **OverlayFS 实测占用**: 安装全部 workspace 依赖、运行 `radar` / `check` / `build` 后仍保持 **8 MB**（baseline: 8 MB，budget: <= 100 MB）
 
-## 3. AI Studio `networkConditionAdjusted` Lifecycle Fix
-- Updated `WindowReadinessInfo` (`apps/p2p-remote-controller/src/types/ax.ts`) and `classifyAiStudioWindowState` (`apps/p2p-remote-controller/src/services/aiStudioWindowState.ts`):
-  - Added `networkConditionAdjusted` (kept `networkConfigured` synced), `hasInteractionId`, and `lastUrl`.
-  - `isAiStudioTaskRunning` now requires a `Stop`/`Cancel`/`Interrupt` button **without** a `Run` button.
-  - `networkConditionAdjusted` is set to `true` only after `initializeAiStudioWindow` (`networkVerified: true`), and automatically resets to `false` when an `interactionId` is detected (via `useNetworkRecorderPolling` -> `onInteractionDetected` -> `applyInteractionDetectedToReadiness` or prompt URL `/prompts/<id>`), when a task is running (`Stop` without `Run`), when the URL changes, or when the page reloads/closes.
-- Added unit tests in `apps/p2p-remote-controller/src/services/aiStudioWindowState.test.ts`.
+## 1. 差异适配与架构设计
 
-## 4. EMQX Bridge Channel Bar & Clickable Channel IDs
-- **No vertical scroll**: Set `overflowY: "hidden"` and `flexShrink: 0` on `.emqx-channel-scroll` and `.emqx-channel-bar` in `EmqxBridgeChannelBar.tsx` and `PocketDeckBridgeTab.tsx`.
-- **Fixed unread / all-green bug**: Initialized `lastViewedCountByChannel` in `EmqxBridgePanel.tsx` from initial `chatMessages`, and updated viewed counts for both previous and target channels inside `handleSelectChannel` (avoiding `setState` in `useEffect`).
-- **Clickable channel IDs**: Rendered `ch_xxx` tokens in chat messages and `#channel` badges in `EmqxChatSection.tsx` (and `PocketDeckBridgeTab.tsx`) as clickable buttons that switch directly to that channel.
+结合 `agyPreviewInstant` 的 pnpm workspace 单仓结构与架构雷达（`scripts/radar.ts`）约束，做了针对性适配：
 
-## 5. Verification & Commit
-- `pnpm radar -- --audit`: PASS (Cycles=0, LayerViolations=0/0, P2P Type/Lint Check: PASS)
-- `pnpm p2p:check`: PASS
-- `pnpm --filter p2p-remote-controller test`: 7 files, 29 tests passed
-- `pnpm test` (root): 2 files, 16 tests passed
-- Verified bot commit on `a2`: `2c22c3b73662c689ea5695bdd3fa8a479771ebc4` (`signature.isValid: true`, `state: "VALID"`, `Co-authored-by: Mark <29165094+MaBoCoMark@users.noreply.github.com>`).
+1. **Monorepo 多目录 tmpfs 软链卸载**（`scripts/env/tmpfsLayout.mjs`）
+   - 将所有大体积产物目录通过软链卸载到 `/tmp/agy-cache`（不占用 `/` OverlayFS），并自动写入 `.git/info/exclude`：
+     - `node_modules`、`node_modules/.vite`、`.vite`、`dist`、`.cache`、`src-tauri/target`
+     - `apps/p2p-remote-controller/node_modules`、`apps/p2p-remote-controller/node_modules/.vite`、`apps/p2p-remote-controller/.vite`、`apps/p2p-remote-controller/dist`、`apps/p2p-remote-controller/src-tauri/target`
+     - `packages/shared-config/node_modules`、`packages/macos-ax-helper/node_modules`
+   - `public/` 在本仓库中是 100 KB 的普通 tracked 静态资源（非 git submodule），无需 submodule 同步逻辑。
+
+2. **模块拆分满足 Radar 体积护栏**
+   - `agyPreviewInstant` 的 `scripts/radar.ts` 对 `scripts/*.mjs` 强制执行 `18 KB` 硬上限与 `12 KB` 软上限。因此将 `tmpfsGuard` 拆分为单职责小模块：`tmpfsLayout.mjs`、`tmpfsPnpm.mjs`、`tmpfsGuard.mjs`。
+
+3. **自愈 `pnpm` 包装器与 `/tmp` 快照重置检测**（`scripts/env/tmpfsPnpm.mjs`、`scripts/env/tmpfsGuard.mjs`）
+   - 将 `pnpm@10.28.2` 安装到 `/tmp/agy-cache/pnpm-global`，并在 `/usr/local/bin/pnpm` 写入自愈 wrapper：
+     - `/tmp` 被容器快照重置后，运行任意 `pnpm ...` 会自动重装 `pnpm` 到 tmpfs 并重建基础软链；若 `node_modules/.modules.yaml` 缺失，则提示一键修复命令。
+     - 通过 `/tmp/.agy-env-sentinel` 与 `.git/agy-overlay-baseline.json` 自动检测悬空软链与 `/tmp` 重置。
+   - `bootstrap.sh` 与 `doctor.mjs --auto-restore` 会自动补齐 `src/config/resolvedProfile.json`（调用 `scripts/syncPrivateProfile.mjs`），确保全新环境可直接通过 `tsc --noEmit` 与 `pnpm run check`。
+
+## 2. 新增文件与命令
+
+- 新增文件：
+  - `scripts/env/tmpfsLayout.mjs`
+  - `scripts/env/tmpfsPnpm.mjs`
+  - `scripts/env/tmpfsGuard.mjs`
+  - `scripts/env/bootstrap.sh`
+  - `scripts/env/checkEnv.mjs`
+  - `scripts/env/doctor.mjs`
+  - `scripts/env/help.mjs`
+  - `scripts/env/README.md`
+- `package.json` 新增脚本：
+  - `pnpm run env:help` — 查看环境与自愈命令速查表
+  - `pnpm run env:check` — 快速状态检查（OverlayFS 体积、tmpfs sentinel、workspace 依赖）
+  - `pnpm run env:doctor` — 完整诊断（支持 `--auto-restore`、`--require-rust`）
+  - `pnpm run env:setup` — 一键初始化/修复（pnpm + workspace `node_modules` 卸载至 tmpfs）
+  - `pnpm run env:setup:rust` — 同上 + 安装 Rust/Cargo 及 Tauri Linux C 构建依赖至 tmpfs
+
+## 3. 验证结果
+
+- `pnpm run env:help`：正常输出命令速查表。
+- `pnpm run env:check` / `pnpm run env:doctor`：Node.js v22.23.5、pnpm 10.28.2、root & p2p `node_modules` (tmpfs)、`/tmp/.agy-env-sentinel` 全部 `[OK]`；OverlayFS footprint **8 MB / <= 100 MB**。
+- `pnpm run radar`：297 个文件全部通过（`Hard=800L/18KB (0/0 ratchet)`，`Cycles=0`，`P2P Type/Lint Check : PASS`）。
+- `pnpm run check`：`tsc --noEmit`、`eslint src`、`vitest run`（2 test files, 16 passed）全部通过。
+- `pnpm run build`：Vite 构建成功，产物写入 `/tmp/agy-cache/dist`，OverlayFS 占用仍为 **8 MB**。
+
+## 4. 配套提示词（可直接复用）
+
+```text
+若环境未初始化或 /tmp 快照重置：无 pnpm 时跑 bash scripts/env/bootstrap.sh，有异常时跑 node scripts/env/doctor.mjs --auto-restore（含 Rust 需求加 --require-rust）。
+
+随时可运行 pnpm run env:help 查看环境命令，或 pnpm run env:check 检查状态与 OverlayFS 预算（<= 100 MB）。
+```

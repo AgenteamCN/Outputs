@@ -1,30 +1,59 @@
-# AA-Track A-1 完成报告：Lookahead 单调 Tick 与平滑收敛修复
+# Timeline 诊断分析、自动化修复与 Automation Tracker 实现报告
 
-## 1. 分支与提交信息
-- **基线分支**：`origin/z/agy/rc/multiplayer-recheck-base` (`7435735`)
-- **目标分支**：`fix/bug3-lookahead-monotonic-tick`
-- **Verified Bot Commit**：`a657c4920f82bde403ee08fe837b3d7660ddb5af`（`verified: true`，含 `Co-authored-by: Mark <29165094+MaBoCoMark@users.noreply.github.com>`）
-- **独占修改文件**：`src/game/pipeline/stages/spectatePhysicsLookaheadPipeline.ts`
+## 1. Timeline Tracking 诊断结论
 
-## 2. 核心改造内容
-1. **禁止 stale / 低 tick 快照回退已推进的 lookahead `tickCount`**：
-   - 在 `SpectateLookaheadState` 中新增 `lastAppliedTick` 与 `lastSampledTick`（在 `resetSpectateLookaheadState` 时同步清零）。
-   - 对 `sampled.renderTick + 0.5 < state.lastSampledTick` 的乱序过期样本直接拒绝，不覆盖本地状态。
-   - 新增 `enforceMonotonicTick` 与 `getCurrentEngineTick`，在非 lookahead 快照分支及回退分支中均以 `Math.max(16, currentEngineTick, state.lastAppliedTick, rawSampledTick)` 作为单调下界，防止 `applyReplayFrameToEngine` 或 `sampled.renderTick` 将已推进的 `SIM_OFFSETS.TICK` 拉回低值。
-   - 在 lookahead 步进分支中，基于 `Math.max(16, getCurrentEngineTick(physics), state.lastAppliedTick)` 推进 `nextTick` 并同步更新 `lastAppliedTick`。
-2. **平滑收敛而非直接覆写回弹**：
-   - 当 `rawSampledTick < monotonicFloor`（网络快照滞后于本地 lookahead 进度）时，采用更温和的收敛系数 `SPECTATE_CONVERGENCE_BEHIND_ALPHA = 0.2`（正常追上时为 `SPECTATE_CONVERGENCE_ALPHA = 0.3`），避免向旧 tick 位置剧烈回拉。
-   - 将 `SPECTATE_CONVERGENCE_DIST_SQ` 从 `900^2` 放宽至 `1800^2`，减少高速球运动下的硬切回弹。
-   - 收敛帧的 `converged[SIM_OFFSETS.TICK]` 同步锁定为 `monotonicTick`。
-3. **放宽 `SPECTATE_LOOKAHEAD_MAX_TICKS` 与分段衰减，避免 26 帧冻结**：
-   - 将 `SPECTATE_LOOKAHEAD_MAX_TICKS` 从 `30`（250ms）放宽至 `180`（1.5s @ 120Hz），避免短时断流/抖动触顶后 `return false` 导致连续 26 帧冻结。
-   - 新鲜帧到达时对 `lookaheadTicksActive` 进行分段快速衰减（追上时直接减半/归零，滞后时 `- 4` 替代 `- 2`），防止长期贴近上限。
+从你导出的 `compact` Timeline JSON 可以看出外层窗口切换与耗时异常，但**无法直接看到每一步自动化操作与失败原因**：
 
-## 3. 门禁与验证结果
-- `pnpm run check`：**PASS**（TS 类型检查与循环依赖检查通过）
-- `pnpm run test:multiplayer-suite`：**PASS**（含 Test 26 `client-csr-spectate Physics Lookahead & Convergence` 与 Test 27 `W2-A isLookahead WASM lookahead wiring` 全部通过）
-- AA-Track A-1 专项不变量验证：
-  - 连续 40 帧 lookahead 步进（> 30 ticks）无冻结，持续推进；
-  - 推进至高位 tick 后收到低 `renderTick`（719）快照不发生 `tickCount` 回退；
-  - 乱序退步 `renderTick`（718 < 719）被拒绝；
-  - `resetSpectateLookaheadState` 后可正常从初始 tick（16）重新开始。
+1. **可观测到的现象**：
+   - 5 个新窗口（`52905`, `52907`, `52909`, `52912`, `52915`）加上已有 4 个窗口共 9 个。
+   - `07:29:21.895Z`：`link_all_api_keys` 汇总 `total=9, triggered=5, alreadyLinked=0, skipped=3, failed=1`。
+   - `initialize_all_windows` 期间，第 1 个新窗口 `52905`（`07:29:33.596Z`）到第 2 个窗口 `52907`（`07:29:49.055Z`）耗时 **15.46 秒**，而后续 `52907 -> 52909 -> 52912 -> 52915` 每个仅耗时 **2.7s ~ 2.9s**；且 `07:30:01.227Z` 又切回 `52905`，最终 `initialize_all_windows` 汇总 `initialized=6, failed=3`。
+2. **原有 Timeline 的盲区**：
+   - `auto_rescan` 仅针对当前选中的 `selectedWindowId=52915`。
+   - `aiStudioBatchRoundRobin`、`aiStudioInitSteps`、`aiStudioInit`、`aiStudioAxHelpers` 内部没有任何 step 级事件上报，只记录了最后一条总结日志，无法得知具体哪 3 个窗口失败、卡在哪个步骤、以及 AX 树拿到了什么状态。
+
+---
+
+## 2. 根因定位与自动化逻辑修复
+
+排查 `aiStudioInitSteps.ts`、`aiStudioBatchRoundRobin.ts`、`aiStudioAxHelpers.ts` 后，定位到以下导致首个窗口异常/重复添加网络规则并失败的问题：
+
+1. **首个窗口激活 Safari 的 Focus Settle 竞态**：
+   - `runRoundRobinInitializeAll` 与 `linkAllSafariApiKeys` 仅在 `focusWindowBestEffort` 后等待 `120ms`。当 Safari 从后台被激活时，首个窗口（`52905`）的窗口提升与 WebKit 响应链尚未稳定就触发 `AXPress` / `set_value`，导致后续步骤失败，而 Safari 已在前台后的第 2~5 个窗口全部正常。
+   - **修复**：新增 `focusWindowAndSettle`（`apps/p2p-remote-controller/src/services/aiStudioAxHelpers.ts`），首个窗口等待 `280ms`（batch init）/ `240ms`（link keys / single init），后续窗口切换等待 `160ms` / `140ms`。
+2. **`configureNetworkAllowlist` 重复添加规则与条件误判**（`apps/p2p-remote-controller/src/services/aiStudioInitSteps.ts`）：
+   - 原 `waitForScanCondition` 使用 `fields.length > initialDomainCount || fields.length > 0`，当弹窗内已存在 Domain 输入框时，`fields.length > 0` 立即成立，导致抓到旧输入框或重复点击 `Add to allowlist`。
+   - 未检查目标域名（`*`）是否已配置、未复用已有的空 Domain 输入框。
+   - **修复**：
+     - 若检测到目标域名已存在且无 `Gemini API (default)`，直接关闭弹窗跳过，避免重复添加规则。
+     - 若存在空的 Domain 输入框，直接复用而不再点击 `Add to allowlist`。
+     - 点击 `Add to allowlist` 后严格等待 `fields.length > initialDomainCount`。
+     - `set_value` 重试前先调用 `focusWindowAndSettle(windowId, 180)` 重新稳固窗口焦点。
+     - 为所有 `waitForScanCondition` 补齐 `signal` 透传，确保 Emergency Stop 可立即中断。
+3. **`tryAdvanceApiKeyNonBlocking` 提前误判**（`apps/p2p-remote-controller/src/services/aiStudioBatchRoundRobin.ts`）：
+   - 确认 `Select key` 后改为严格等待 `isApiKeySelected(s)`，避免弹窗关闭动画期间背景 `Network` 标题提前触发条件。
+
+---
+
+## 3. 新增 Automation Tracker（全链路可观测）
+
+1. **核心服务**：`apps/p2p-remote-controller/src/services/automationTracker.ts`
+   - 提供 `createAutomationRun(workflow)`、`recordAutomationTrace(...)`、`summarizeScanForTracker(scan)`。
+   - 记录每次自动化运行的 `runId`、`workflow`、`windowId`、`pass`、`step`、`outcome`（`started | ok | retry | skipped | failed`）、`observedState` 与 `error`。
+   - 同步向 `Timeline` 写入 `source: "automation"` 事件，确保即便在 `compact` 导出级别下也能完整看到自动化路径与失败详情。
+2. **全流程埋点**：
+   - 已接入 `aiStudioBatch.ts`、`aiStudioBatchRoundRobin.ts`、`aiStudioInit.ts`、`aiStudioInitSteps.ts`、`aiStudioAxHelpers.ts`。
+3. **UI 与导出集成**：
+   - `DebugConsoleTabs.tsx` 新增 **Automation** 标签页（支持 `Issues Only` 过滤、一键复制 Trace、清空）。
+   - `logExport.ts` 与 `useLogExportActions.ts` 将 `automation` 事件及 `automationTraces` / `automationIssues` 纳入 `Quick Copy` 与 `Export Timeline JSON`。
+
+---
+
+## 4. 工具链与验证结果
+
+- 工具链：已全局安装 `pnpm`（v12.21.0）并完成依赖安装（`pnpm install --frozen-lockfile`）。
+- 检查与构建：
+  - `pnpm p2p:check`（`tsc --noEmit && eslint src`）：通过
+  - `pnpm --filter p2p-remote-controller test`：9 个测试文件、33 个测试全部通过（含新增 `automationTracker.test.ts` 与 `aiStudioInitSteps.test.ts`）
+  - `pnpm p2p:build`：通过
+- 已通过 GitHub GraphQL `createCommitOnBranch` 提交已签名 Verified Bot Commit 到 `a2` 分支：`58a8ef95e6914fb88bc1270cc005acf45954bfd5`。

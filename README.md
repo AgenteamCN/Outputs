@@ -1,88 +1,68 @@
-# Wave 1 Branch `W1-03` (`feat/mode-match-exhibition`) 交付报告
+# W1-03 (`feat/mode-match-exhibition`) 交付报告与协议字段清单
 
 - **分支**：`feat/mode-match-exhibition`
 - **基线提交**：`7c80b445f2953076e5356320c6e91bc04da4bba8` (`origin/z/agy/rc/multiplayer-recheck-base`)
-- **交付提交**：`b288c51808673617c24c8749a9af79ff7a38af55` (`verified: true`, `state: VALID`)
+- **已推送 Verified Bot Commit**：`c5f8a4da0c48b2501ab0205150e95518dc571813` (`verified: true`)
 
 ---
 
-## 一、核心改动与交付物
+## 一、核心交付物摘要
 
-1. **Exhibition (`exp-multi-bots`) 纳入统一 Activity 架构**
-   - `src/network/protocol/ReplicationBusProtocol.ts`：新增 `ACTIVITY_IDS.EXHIBITION = 'exhibition'`、默认数据包标志位 `ACTIVITY_DEFAULT_PACKET_FLAGS[ACTIVITY_IDS.EXHIBITION]`（含 `STATE_SNAPSHOT | USER_INPUT | CLOCK_AND_SCORE | FOLLOW_HOST_CAMERA`），以及 `normalizeActivityId()`（将 `'exp-multi-bots'` 自动归一化为 `'exhibition'`）。
-   - `src/network/server/activities/ActivityKernel.ts`：新增并注册 `ExhibitionActivityKernel`，在 `createDefaultActivityKernelRegistry()` 中注册 `ACTIVITY_IDS.EXHIBITION`。
-   - `src/network/server/RoomActivityOrchestrator.ts` & `src/network/sync/SyncAuthorityRouter.ts`：`switchActivity()` 自动归一化 `'exp-multi-bots'`，并在 `SyncAuthorityRouter` 中将 `EXHIBITION` 的球权威归属设为 `HOST`。
+1. **Exhibition (`exp-multi-bots`) 纳入统一协议与活动内核**
+   - `src/network/protocol/ReplicationBusProtocol.ts`：在 `ACTIVITY_IDS` 中补齐 `EXHIBITION: 'exp-multi-bots'`，并在 `ACTIVITY_DEFAULT_PACKET_FLAGS` 中配置 `STATE_SNAPSHOT | USER_INPUT | CLOCK_AND_SCORE | FOLLOW_HOST_CAMERA`。
+   - `src/network/server/activities/ActivityKernel.ts`：新增 `ExhibitionActivityKernel` 并注册到 `createDefaultActivityKernelRegistry()`。
+   - `src/network/sync/SyncAuthorityRouter.ts`：`applyActivitySwitch` 纳入 `ACTIVITY_IDS.EXHIBITION` 的权威路由。
 
-2. **Wave 1 临时 TS 契约与 6 人 `RosterManifest` 构建器**
-   - `src/game/modes/shared/matchExhibitionVNextContract.ts`：定义 `RosterManifest`、`RosterManifestCarEntry`（含 `roleFlag: 'player' | 'bot' | 'ghost'`、`visualId`、`colorHex`、`paintFinish`、`boostVisual`、`boostAudio`、`anthemId` 等）、`GoalReplayStateOutput`、`CameraPoseOutput` 及 `MatchExhibitionFrameHeader`。
-   - 实现 FNV-1a 32-bit `computeRosterManifestHash()` 与 `formatMetadataHashHex()`，以及 `buildExhibitionRosterManifest()` / `buildMatchRosterManifest()`。
-   - `src/game/modes/experimental-multi-bots/ExperimentalMultiBotsRosterController.ts`：新增 `latestRosterManifest` 与 `getRosterManifest()`，并在 `publishSpawnedCarsTelemetry()` 中同步生成 6 人 `RosterManifest`，补齐 `projectRosterCarEntries()` 的 `isBot` 与 `isLocalPlayer` 字段。
+2. **Exhibition 与 Match 共用 6 人 `RosterManifest`（通道 2）**
+   - 新增 `src/network/protocol/MatchExhibitionRosterManifest.ts`：
+     - 定义 `MatchExhibitionRosterManifest` 与 `RosterManifestEntry`（含 `roleFlag: 'player' | 'bot' | 'ghost'` 幽灵车预留位、`visualId`、`hitboxId`、`colorSlot`、`colorHex`、`paintFinish`、`boostVisual`、`boostAudio`、`anthemId`）。
+     - 实现确定性 32-bit FNV-1a `computeRosterMetadataHash`（4 字节 `metadataHash`），任何 1~6 号车变更或模式上下文变化均会触发 Hash 更新。
+     - 提供 `buildExhibitionRosterManifest` 与 `buildMatchRosterManifest`。
+   - 接入 `ExperimentalMultiBotsRosterController.ts`（`getRosterManifest()`）与 `MatchRosterSubController.ts`（`getRosterManifest()`）。
 
-3. **`Match` 与 `Exhibition` 共用 `GoalReplay` 状态机与电影机位输出**
-   - `src/game/modes/shared/GoalReplayStateMachine.ts`：实现统一状态机 `GoalReplayStateMachine`（`idle` -> `goal_scored` -> `goal_replay` -> `idle`）与 `extractGoalReplayCameraPose()`（自动将 `DirectorCameraRuntimeState` 的 Unreal 坐标 `(eyeX, eyeY, eyeZ)` 转换为 Three.js `(eyeX, eyeZ, eyeY)`，并兼容 POV 模式从 `cameraManager.camera` 提取机位）。
-   - `src/game/modes/experimental-multi-bots/ExperimentalMultiBotsReplayController.ts` & `src/game/modes/ExperimentalMultiBotsMode.ts`：接入 `GoalReplayStateMachine`，并暴露 `getRosterManifest()`、`getGoalReplayState()`、`getFrameHeader()`。
-   - `src/game/modes/BotMatchMode.ts`：接入同一 `GoalReplayStateMachine`，在 `replay` 阶段同步推进并暴露 `getGoalReplayState()`。
+3. **Match 与 Exhibition 共用 `GoalReplay` 状态机与电影机位输出**
+   - 新增 `src/replay/UnifiedGoalReplayStateMachine.ts`：
+     - 统一 `GoalReplayPhase`（`'idle' | 'active' | 'finished'`）、`playbackState`（`'playing' | 'paused'`）、触球时间轴分析、戏剧性慢放（`computeDramaticSlowMoFactor`）与导演/POV 双模式相机输出 `GoalReplayCameraPoseOutput`（`mode`, `eye`, `target`, `up`, `fovDeg`, `focusedCarIndex`）。
+   - 接入 `ExperimentalMultiBotsReplayController.ts` 与 `MatchGoalReplaySubController.ts`，统一通过 `getGoalReplayFrameOutput()` 输出标准化的 `GoalReplayStreamFrameOutput`。
 
----
-
-## 二、Wave 2 协议汇总字段清单（`W1-03` 诉求）
-
-供 `feat/protocol-schema-alignment` 汇总进最终二进制协议：
-
-### 通道 1（高频 State 流帧语义头）
-- `activityId`: `enum` (`match` | `exhibition` | ...)
-- `metadataHash`: `uint32` (4B，用于触发客户端按需重拉 `RosterManifest`)
-- `phase`: `enum` (`kickoff` | `playing` | `goal_scored` | `goal_replay` | `podium` | `ended`)
-- `playbackState`: `enum` (`playing` | `paused` | `rewinding` | `fast_forward`)
-- `clockSecondsRemaining`: `float32` / `uint16`
-- `isOvertime`: `bitflag` (`1 bit`)
-- `blueScore`: `uint8`
-- `orangeScore`: `uint8`
-- `focusedCarIndex`: `uint8` (`0..5`)
-- `goalReplay`:
-  - `active`: `bitflag` (`1 bit`)
-  - `cameraMode`: `enum` (`director` | `pov`)
-  - `povCarIndex`: `int8` (`-1` 表示无 / Director)
-  - `scoringTeam`: `uint8` (`0 | 1`)
-  - `scorerCarIndex`: `uint8`
-  - `progress`: `float32` (`0..1`)
-  - `frameIndex`: `uint32`
-  - `totalFrames`: `uint32`
-- `cameraPose`（电影机位 / POV 机位统一输出，Three.js 世界坐标）：
-  - `valid`: `bitflag` (`1 bit`)
-  - `eye`: `float32[3]`
-  - `target`: `float32[3]`
-  - `up`: `float32[3]`
-  - `fovDeg`: `float32`
-
-### 通道 2（低频 `RosterManifest` 清单）
-- `metadataHash`: `uint32`
-- `activityId`: `string / enum`
-- `modeId`: `string` (`match` | `exp-multi-bots`)
-- `arenaId`: `string`
-- `matchDurationSec`: `uint16`
-- `telestratorPermission`: `enum` (`host_only` | `everyone`)
-- `cars[1..6]`:
-  - `carIndex`: `uint8`
-  - `keyNumber`: `uint8`
-  - `name`: `string`
-  - `team`: `uint8` (`0 | 1`)
-  - `teamSlotIndex`: `uint8`
-  - `roleFlag`: `enum` (`player` | `bot` | `ghost`)
-  - `isBot`: `boolean`
-  - `botType`: `string`
-  - `visualId`: `string`
-  - `hitboxId`: `string`
-  - `colorSlot`: `uint8`
-  - `colorHex`: `string`
-  - `paintFinish`: `string`
-  - `boostVisual`: `string`
-  - `boostAudio`: `string`
-  - `anthemId`: `string | null`
+4. **自动化单测与架构门禁验证**
+   - 新增 `scripts/testMatchExhibitionUnified.ts`：`env -u NODE_OPTIONS node --experimental-strip-types scripts/testMatchExhibitionUnified.ts` -> `[testMatchExhibitionUnified] PASS`。
+   - `pnpm run check`（`radar` + `tsc --noEmit`）：1430/1430 TS 文件通过，0 循环依赖，0 越层引用，全绿通过。
 
 ---
 
-## 三、验证结果
+## 二、Wave 2 协议汇总字段清单（W1-03 诉求）
 
-- `env -u NODE_OPTIONS node --experimental-strip-types scripts/tests/testModeMatchExhibitionW1_03.ts`：PASS（覆盖 `EXHIBITION` Activity 注册与路由、`exp-multi-bots` 归一化、6 人 `RosterManifest` 与确定性 `metadataHash`、`GoalReplayStateMachine` 与 `cameraPose` 坐标转换）
-- `pnpm run check`（`radar` + `tsc --noEmit`）：GREEN（1430/1430 TS，0 错误，0 循环依赖，0 越界导入）
+### 通道 1（高频 State 流）
+| 字段名 | 类型 / 字节建议 | 说明 |
+|---|---|---|
+| `metadataHash` | `uint32` (4B) | 由 `MatchExhibitionRosterManifest` 计算，用于 Client 检测中途换人 / Bot 替补 / 切模式并触发通道 2 补拉 |
+| `phase` | `uint8` / enum | 比赛阶段：`lobby \| prepare \| kickoff \| playing \| goal_scored \| replay \| paused \| ended \| podium` |
+| `playbackState` | `uint8` / enum | `playing \| paused`（Goal Replay 暂停时供音频子系统 1 帧静音） |
+| `clockSecondsRemaining` | `float32` / `int16` | 比赛倒计时秒数（含加时标记 `isOvertime`） |
+| `blueScore` / `orangeScore` | `uint8` + `uint8` | 蓝队 / 橙队比分 |
+| `focusedCarIndex` | `int8` | 当前相机聚焦车号（0~5） |
+| `cameraMode` | `uint8` (1bit) | `0 = director`（电影机位）/ `1 = pov`（第一/跟随视角） |
+| `cameraPose.eye` | `float32[3]` (12B) | Goal Replay 电影机位 / POV 相机位置（Unreal Units） |
+| `cameraPose.target` | `float32[3]` (12B) | Goal Replay 相机注视目标点 |
+| `cameraPose.fovDeg` | `float32` (4B) | 相机视场角（默认 Director FOV 或 POV 110°） |
+| `goalReplayProgress` | `uint16` / `float32` | Goal Replay 当前进度 `[0, 1]` 与 `slowMoFactor` |
+
+### 通道 2（低频 Metadata 清单：`RosterManifest`）
+| 字段名 | 类型 | 说明 |
+|---|---|---|
+| `manifestVersion` | `uint32` | 单调递增清单版本号 |
+| `metadataHash` | `uint32` | 清单内容 32-bit FNV-1a 校验哈希 |
+| `activityId` | `string` / enum | `'match' \| 'exp-multi-bots'` |
+| `arenaPreset` | `string` | 球场预设名 |
+| `matchDurationSeconds` | `uint16` | 比赛时长配置 |
+| `telestratorAllowed` | `boolean` | 是否允许画笔标注 |
+| `entries[0..5]` | `RosterManifestEntry[]` | 1~6 号车：`carIndex`, `keyNumber`, `team(0\|1)`, `teamSlotIndex`, `name`, `roleFlag('player'\|'bot'\|'ghost')`, `isBot`, `botType`, `visualId`, `hitboxId`, `colorSlot`, `colorHex`, `paintFinish`, `boostVisual`, `boostAudio`, `anthemId` |
+
+### 通道 3（瞬时 Signal / Incident）
+| 信号 | 参数 | 说明 |
+|---|---|---|
+| `GOAL_REPLAY_WILL_START` | `scoringTeam`, `scorerCarIndex` | 进球回放即将开始 |
+| `GOAL_REPLAY_START` | `replayTicks`, `packedMeta` | 进球回放开始（携带得分队、进球者、球速） |
+| `GOAL_REPLAY_END` | `0`, `0` | 进球回放结束，切回 Kickoff 或 Podium |
+| `SCORE_UPDATED` / `ROUND_STARTED` | `blueScore`, `orangeScore` | 比分与回合同步 |

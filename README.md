@@ -1,68 +1,65 @@
-# W1-03 (`feat/mode-match-exhibition`) 交付报告与协议字段清单
+# Wave 1 深度核查评估 & Wave 2 协议对齐落地报告
 
-- **分支**：`feat/mode-match-exhibition`
-- **基线提交**：`7c80b445f2953076e5356320c6e91bc04da4bba8` (`origin/z/agy/rc/multiplayer-recheck-base`)
-- **已推送 Verified Bot Commit**：`c5f8a4da0c48b2501ab0205150e95518dc571813` (`verified: true`)
+## 一、Wave 1 全分支 Commit 深度核查结论
 
----
+对 `origin/z/agy/rc/multiplayer-recheck-base` (`7c80b44`) 上的 10 条 Wave 1 分支逐一核查 `git log` / `git diff --stat` / 关键接口源码后，结论如下：
 
-## 一、核心交付物摘要
+1. **整体代码质量评估：无需推倒大改版**
+   - `W1-00` (`chore/strip-legacy-spectate`) 已合入基线 `7c80b44`。
+   - `W1-01` ~ `W1-09` 全部干净基于 `7c80b44` 分出，职责边界清晰，均配有独立单元测试脚本（`scripts/test*.ts`）。
+   - **唯一明显瑕疵在 `W1-09` (`feat/bulk-asset-channel`)**：存在两次提交（`e697bca` 与 `283b3af`）。第二次提交新建了 `src/network/transport/BulkAssetChannel.ts` 并重写了 `BulkAssetProtocol.ts`，但遗留了首次提交的 `src/network/transport/webrtc/BulkAssetChannel.ts` 与 `src/network/transport/webrtc/bulkAssetAssemblyPipeline.ts` 两个废弃文件，Wave 3 对齐时需顺手删除。
 
-1. **Exhibition (`exp-multi-bots`) 纳入统一协议与活动内核**
-   - `src/network/protocol/ReplicationBusProtocol.ts`：在 `ACTIVITY_IDS` 中补齐 `EXHIBITION: 'exp-multi-bots'`，并在 `ACTIVITY_DEFAULT_PACKET_FLAGS` 中配置 `STATE_SNAPSHOT | USER_INPUT | CLOCK_AND_SCORE | FOLLOW_HOST_CAMERA`。
-   - `src/network/server/activities/ActivityKernel.ts`：新增 `ExhibitionActivityKernel` 并注册到 `createDefaultActivityKernelRegistry()`。
-   - `src/network/sync/SyncAuthorityRouter.ts`：`applyActivitySwitch` 纳入 `ACTIVITY_IDS.EXHIBITION` 的权威路由。
-
-2. **Exhibition 与 Match 共用 6 人 `RosterManifest`（通道 2）**
-   - 新增 `src/network/protocol/MatchExhibitionRosterManifest.ts`：
-     - 定义 `MatchExhibitionRosterManifest` 与 `RosterManifestEntry`（含 `roleFlag: 'player' | 'bot' | 'ghost'` 幽灵车预留位、`visualId`、`hitboxId`、`colorSlot`、`colorHex`、`paintFinish`、`boostVisual`、`boostAudio`、`anthemId`）。
-     - 实现确定性 32-bit FNV-1a `computeRosterMetadataHash`（4 字节 `metadataHash`），任何 1~6 号车变更或模式上下文变化均会触发 Hash 更新。
-     - 提供 `buildExhibitionRosterManifest` 与 `buildMatchRosterManifest`。
-   - 接入 `ExperimentalMultiBotsRosterController.ts`（`getRosterManifest()`）与 `MatchRosterSubController.ts`（`getRosterManifest()`）。
-
-3. **Match 与 Exhibition 共用 `GoalReplay` 状态机与电影机位输出**
-   - 新增 `src/replay/UnifiedGoalReplayStateMachine.ts`：
-     - 统一 `GoalReplayPhase`（`'idle' | 'active' | 'finished'`）、`playbackState`（`'playing' | 'paused'`）、触球时间轴分析、戏剧性慢放（`computeDramaticSlowMoFactor`）与导演/POV 双模式相机输出 `GoalReplayCameraPoseOutput`（`mode`, `eye`, `target`, `up`, `fovDeg`, `focusedCarIndex`）。
-   - 接入 `ExperimentalMultiBotsReplayController.ts` 与 `MatchGoalReplaySubController.ts`，统一通过 `getGoalReplayFrameOutput()` 输出标准化的 `GoalReplayStreamFrameOutput`。
-
-4. **自动化单测与架构门禁验证**
-   - 新增 `scripts/testMatchExhibitionUnified.ts`：`env -u NODE_OPTIONS node --experimental-strip-types scripts/testMatchExhibitionUnified.ts` -> `[testMatchExhibitionUnified] PASS`。
-   - `pnpm run check`（`radar` + `tsc --noEmit`）：1430/1430 TS 文件通过，0 循环依赖，0 越层引用，全绿通过。
+2. **能否跳过 Wave 2/3 直接 Octopus Merge？—— 不能，原因有三：**
+   - **存在 3 个跨分支重叠文件**，直接 `git merge -s octopus` 会冲突中止：
+     - `src/network/server/activities/ActivityKernel.ts`（同时被 `W1-03`、`W1-04`、`W1-05` 修改）
+     - `src/replay/FreeplayRewinderController.ts`（同时被 `W1-04`、`W1-09` 修改）
+     - `scripts/runMultiplayerSuiteTests.ts`（同时被 `W1-02`、`W1-06`、`W1-09` 修改）
+   - **协议尚未统一**：`W1-01`~`W1-08` 各自定义了临时 TS 接口（如 `WorkerChannel1StateFrame`、`TimelineFrameHeader`、`MatchExhibitionRosterManifest`、`freeplaySpectateTypes`、`trainingFpvDualVNextTypes`、`vnextHudCameraTypes`），彼此之间尚未接入统一的二进制 `WorldFrame` / `RosterManifest` Codec 与 `schemaHash` 校验。
+   - **按原定 Wave 2 -> Wave 3 -> Wave 4 推进最稳妥**：先合流干净底座 `integration/vnext-core`，再在各分支内反向对齐并消化 3 个重叠文件，最后 Octopus Merge 一次过门禁。
 
 ---
 
-## 二、Wave 2 协议汇总字段清单（W1-03 诉求）
+## 二、本次已完成的 Wave 2 工作（已推送远端）
 
-### 通道 1（高频 State 流）
-| 字段名 | 类型 / 字节建议 | 说明 |
-|---|---|---|
-| `metadataHash` | `uint32` (4B) | 由 `MatchExhibitionRosterManifest` 计算，用于 Client 检测中途换人 / Bot 替补 / 切模式并触发通道 2 补拉 |
-| `phase` | `uint8` / enum | 比赛阶段：`lobby \| prepare \| kickoff \| playing \| goal_scored \| replay \| paused \| ended \| podium` |
-| `playbackState` | `uint8` / enum | `playing \| paused`（Goal Replay 暂停时供音频子系统 1 帧静音） |
-| `clockSecondsRemaining` | `float32` / `int16` | 比赛倒计时秒数（含加时标记 `isOvertime`） |
-| `blueScore` / `orangeScore` | `uint8` + `uint8` | 蓝队 / 橙队比分 |
-| `focusedCarIndex` | `int8` | 当前相机聚焦车号（0~5） |
-| `cameraMode` | `uint8` (1bit) | `0 = director`（电影机位）/ `1 = pov`（第一/跟随视角） |
-| `cameraPose.eye` | `float32[3]` (12B) | Goal Replay 电影机位 / POV 相机位置（Unreal Units） |
-| `cameraPose.target` | `float32[3]` (12B) | Goal Replay 相机注视目标点 |
-| `cameraPose.fovDeg` | `float32` (4B) | 相机视场角（默认 Director FOV 或 POV 110°） |
-| `goalReplayProgress` | `uint16` / `float32` | Goal Replay 当前进度 `[0, 1]` 与 `slowMoFactor` |
+已在 `Antigravi-ty/RocketCompanion` 创建并推送（Verified Bot Commit `9b5d855`，GPG `VALID`）：
+- `origin/feat/protocol-schema-alignment`
+- `origin/integration/vnext-core`
 
-### 通道 2（低频 Metadata 清单：`RosterManifest`）
-| 字段名 | 类型 | 说明 |
-|---|---|---|
-| `manifestVersion` | `uint32` | 单调递增清单版本号 |
-| `metadataHash` | `uint32` | 清单内容 32-bit FNV-1a 校验哈希 |
-| `activityId` | `string` / enum | `'match' \| 'exp-multi-bots'` |
-| `arenaPreset` | `string` | 球场预设名 |
-| `matchDurationSeconds` | `uint16` | 比赛时长配置 |
-| `telestratorAllowed` | `boolean` | 是否允许画笔标注 |
-| `entries[0..5]` | `RosterManifestEntry[]` | 1~6 号车：`carIndex`, `keyNumber`, `team(0\|1)`, `teamSlotIndex`, `name`, `roleFlag('player'\|'bot'\|'ghost')`, `isBot`, `botType`, `visualId`, `hitboxId`, `colorSlot`, `colorHex`, `paintFinish`, `boostVisual`, `boostAudio`, `anthemId` |
+### 核心交付物
+1. **`src/network/protocol/VNextSchemaHash.ts`**
+   - 基于通道 1/2 二进制字段布局表自动计算 4 字节确定性 `schemaHash`：
+     - Channel 1 (`VNEXT_CHANNEL1_SCHEMA_HASH`): `0x49D215C8`
+     - Channel 2 (`VNEXT_CHANNEL2_SCHEMA_HASH`): `0x9063ED98`
+   - 两端字段只要差 1 bit，`decode` 第一行立即抛错拦截。
+2. **`src/network/protocol/VNextWorldFrameCodec.ts`**（通道 1 高频状态流）
+   - `DataView` 零分配编解码，统一涵盖：`schemaHash`、`txSeq`、`metadataHash`、`activityMode`、`playbackState`、`phase`、`simTick`、`replayFrameIndex`、`replayTotalFrames`、`clockSeconds`、`playbackSpeed`、`blueScore`/`orangeScore`、`focusedCarIndex`、`cameraMode`、`timestampMs`。
+   - 按位掩码可选携带：`fpvAuthority`（`authorityEpoch` / `activeInputPeerSlot` / `authorityMode`，供 W1-06）、`trainingHeader`（`shotIndex` / `shotResetSeq` 等，供 W1-06）、`cameraPose`（`eye` / `target` / `fovDeg`，供 W1-02/04/08），并内嵌复用 `GlobalPayloadCodec`（`PHYSICS` / `SIGNAL` / `ALL_RTT`）。
+3. **`src/network/protocol/VNextRosterManifestCodec.ts`**（通道 2 低频清单）
+   - 统一 `VNextRosterManifest` 编解码与确定性 32-bit FNV-1a `computeRosterMetadataHash()`，覆盖 1~6 号车外观/涂装/Boost/Anthem、`roleFlag: 'player' | 'bot' | 'ghost'`、`ghostOpacity`、`arenaPreset`、`telestratorAllowed` 与 `trainingMeta`。
+4. **`src/network/protocol/ReplicationBusProtocol.ts`**
+   - 补齐 `ACTIVITY_IDS.EXHIBITION = 'exp-multi-bots'` 及其默认 `ACTIVITY_DEFAULT_PACKET_FLAGS`。
+   - 新增 `decodeVNextChannelPacket()` 统一按 `schemaHash` 分发通道 1/2 数据包。
+5. **`scripts/testVNextProtocolAlignment.ts`**
+   - 验证 `schemaHash` 错位拦截、Channel 1/2 完整往返编解码、`metadataHash` 变更灵敏度与 `EXHIBITION` 活动 ID。
 
-### 通道 3（瞬时 Signal / Incident）
-| 信号 | 参数 | 说明 |
-|---|---|---|
-| `GOAL_REPLAY_WILL_START` | `scoringTeam`, `scorerCarIndex` | 进球回放即将开始 |
-| `GOAL_REPLAY_START` | `replayTicks`, `packedMeta` | 进球回放开始（携带得分队、进球者、球速） |
-| `GOAL_REPLAY_END` | `0`, `0` | 进球回放结束，切回 Kickoff 或 Podium |
-| `SCORE_UPDATED` / `ROUND_STARTED` | `blueScore`, `orangeScore` | 比分与回合同步 |
+### 验证结果
+- `node --experimental-strip-types scripts/testVNextProtocolAlignment.ts`：**PASS** (`Ch1=0x49D215C8, Ch2=0x9063ED98`)
+- `pnpm run check`（`radar` + `tsc --noEmit`）：**GREEN**（1431/1431 TS，0 错误，0 循环依赖，0 孤儿模块）
+
+---
+
+## 三、后续 Wave 3 & Wave 4 详细规划
+
+1. **Wave 3：各业务分支反向对齐 `origin/integration/vnext-core`**
+   - 9 条分支分别执行 `git merge origin/integration/vnext-core`：
+     - **W1-01 (`worker-authority-bus`)**：将 `WorkerChannel1StateFrame.payloadBytes` 与 `WAVE1_CHANNEL1_SCHEMA_HASH` 替换为 `VNextWorldFrameCodec` / `VNEXT_CHANNEL1_SCHEMA_HASH`。
+     - **W1-02 (`timeline-frame-buffer`)**：`TimelineFrameHeader` / `TimelineCameraPose` 对齐 `DecodedVNextWorldFrame` 字段。
+     - **W1-03 (`mode-match-exhibition`)** & **W1-04 (`mode-freeplay-spectate`)** & **W1-05 (`mode-replay-watch-together`)**：统一输出 `VNextRosterManifest`（复用 `computeRosterMetadataHash`）与 `VNextWorldFrameEncodeInput`。
+     - **W1-06 (`mode-training-fpv-dual`)**：`fpvAuthority` / `trainingHeader` / `trainingMeta` 接入 `VNextWorldFrameCodec` 与 `VNextRosterManifestCodec`。
+     - **W1-07 (`consumer-audio-arena`)** & **W1-08 (`consumer-hud-camera`)**：直接消费 `DecodedVNextWorldFrame` 与 `VNextRosterManifest`（删除各自临时 `RosterManifest` / `vnextHudCameraTypes` 重复定义）。
+     - **W1-09 (`bulk-asset-channel`)**：删除 `e697bca` 遗留的 `src/network/transport/webrtc/BulkAssetChannel.ts` 与 `bulkAssetAssemblyPipeline.ts` 死文件。
+   - **重叠文件收敛建议**：将 `ActivityKernel.ts`、`FreeplayRewinderController.ts`、`runMultiplayerSuiteTests.ts` 的 3 处增量修改在合流分支或指定先行分支中统一协调一次，避免 Octopus Merge 冲突。
+
+2. **Wave 4：Octopus Merge & 全量门禁**
+   - 执行 `git merge -s octopus` 合入全部 Wave 3 绿灯分支；
+   - 运行 `pnpm run check`、`RC_SUITE_WATCHDOG_MS=280000 pnpm run test:multiplayer-suite`、`pnpm run repro:dev-broadcast-v3`。

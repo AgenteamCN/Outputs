@@ -1,29 +1,31 @@
-# OverlayFS 547.77 MB 膨胀原因与 `env:help` 排查报告
+# RocketCompanion MVP-1 架构收敛与实施计划
 
-## 1. 现象与实测数据
+## 1. 基线选择与共识
+- **主底座**：基于 `1f9ca7dc9348ad7617c3b1f579519bc6e54c1a67`（`feat/mvp1-rust-core-render-split-7e3a9c`，从干净 `alpha` 分叉），拉出新分支 `feat/mvp1-rust-core-split-v2`。
+- **上游隔离**：保持 `crates/rocketsim` 100% 原汁原味、零魔改，确保后续可低冲突同步 `ZealanL/RocketSim` 上游更新。
 
-- **沙箱整体磁盘（OverlayFS `/`）**：`df -h` 显示 `/` 已用 **566 MB**（对应面板显示的 `547.77 MB / 16,657 files`）。
-- **仓库目录（`/workspace`）**：`du -sh /workspace` 为 **30 MB**（相比干净基线 28 MB 仅增加 2 MB）。
-- **系统目录**：`/usr` 占 3.6 GB（含基础镜像 + 新增写入），`/var` 占 76 MB。
+## 2. 核心实施清单
+1. **环境与 OverlayFS 预算修复 (`<= 100 MB`)**
+   - 修正 `scripts/env/bootstrap.sh`：将 `libwebkit2gtk-4.1-dev` / `libgtk-3-dev` 等 Tauri Linux 桌面依赖从 `--with-rust` 中剥离，仅在显式传入 `--with-tauri` 时安装；`--with-rust` 仅将 `rustup`、`cargo` 与 `wasm32-unknown-unknown` 工具链安装至 `/tmp/rc-cache`（0 MB OverlayFS 增量）。
+   - 在 `scripts/env/checkEnv.mjs` 中补充提示/检查，避免误用 `apt-get` 膨胀 OverlayFS。
+2. **Rust 双 Crate 架构拆分 (`rc_core` + `rc_core_wasm`)**
+   - `crates/rc_core`：纯 Rust 核心库（`rlib`），封装 `SimCore` 实例（物理步进、120Hz `CleanPovCameraKernel`、坐标转换、`RenderFrame`、`TelemetryRingBuffer`），去除全局静态单例与 WASM 裸指针胶水，支持 Linux 下原生多线程 `cargo test` 及未来 Tauri Native / Dedicated Server 直接复用。
+   - `crates/rc_core_wasm`：极薄 `cdylib` 外壳，负责将 `SimCore` 导出为浏览器 Worker 调用的 C ABI WASM 函数，更新 `scripts/buildRcCoreWasm.mjs` 与 `crates/Cargo.toml`。
+3. **`http://localhost:3000` 临时快捷入口**
+   - 在主入口页面添加一个显眼的临时快捷按钮，一键跳转至 `?mvp1=1` 测试台。
+4. **MVP-1 渲染与场景完善（最小心智负担）**
+   - 接入 `alpha` 现有的真实球场、Octane 车身、球 `.glb` 模型加载（保留几何体兜底防加载失败黑屏）。
+   - 确保球正常生成与同步，调整 Car / Ball Camera 参数与对齐。
+   - 借鉴轻量 Boost Pad 绘制逻辑：利用 `RenderFrame` 已输出的 64 位 `boost_pads_lo / boost_pads_hi` 掩码，在 34 个精确场地坐标上绘制高亮/变暗 Hitbox 指示器（大包/小包区分，无需复杂 `.glb` 绑定）。
+5. **键盘绑定修正**
+   - `W / S / A / D / Q / E`：油门/俯仰/转向/偏航/左右滚转（移除 `ArrowLeft`/`ArrowRight` 对转向的误绑）
+   - `ShiftLeft`：Power Slide（Handbrake）
+   - `Space`：Car / Ball Camera 切换
+   - `ArrowLeft` & `Period (.)`：Boost
+   - `ArrowRight` & `Slash (/)`：Jump
+6. **Linux `cargo test` 空中翻滚 & Stall（无效翻滚）验证**
+   - 在 `crates/rc_core` 中新增单元测试，验证空中 `W/S/A/D/Q/E` 翻滚，以及同时按下 `Q + D + Jump`、`A + E + Jump` 时能否正确触发 RocketSim 的 Stall（`has_flipped` 触发、垂直高度保持且无水平加速）。
 
-## 2. 根本原因分析
-
-1. **为什么 OverlayFS 变成了 547.77 MB？**
-   - 执行 `bash scripts/env/bootstrap.sh --with-rust` 时，脚本第 6 步检测到缺少 `webkit2gtk-4.1` 和 `gcc`，自动运行了：
-     `apt-get install -y --no-install-recommends gcc libc6-dev pkg-config libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev libssl-dev`
-   - 该命令拉取并解压了 **209 个 Ubuntu `.deb` 包**（包括 `libwebkit2gtk-4.1-dev`、`libgtk-3-dev`、`gstreamer1.0-plugins-good`、`libicu-dev`、`gcc-13`、`binutils` 等），全部写入 `/usr` 与 `/var/lib/dpkg`，直接向 OverlayFS `/` 增加了约 **536 MB / 16,000+ 个文件**。
-   - 相比之下，`node_modules`、`public/`、`pnpm-store`、`rustup-home`、`cargo-home`、`cargo-target` 均已正确放在 `/tmp/rc-cache`（tmpfs），未占用 OverlayFS。
-   - **架构区分**：仅编译 `rc_core` WASM（`wasm32-unknown-unknown`）只需要 `rustup` + `cargo`（放在 `/tmp`），跑宿主机 `cargo test` 只需要最小 `gcc` + `libc6-dev`，并不需要 400+ MB 的 `libwebkit2gtk-4.1-dev` / `libgtk-3-dev`（Tauri 桌面端依赖）。
-
-2. **为什么 `pnpm run env:check` 之前显示 `OverlayFS size: 30 MB`？**
-   - `scripts/env/checkEnv.mjs` 调用 `tmpfsGuard.mjs` 仅统计 `/workspace` 目录的体积（30 MB），未统计 `apt-get install` 写入 `/usr` 和 `/var` 的 OverlayFS 增量，因此显示为 `30 MB (baseline: 28 MB, budget: <= 100 MB)`。
-
-3. **`pnpm run env:help` 是否可用？**
-   - 原版 `alpha` 分支确实没有 `scripts/env/*` 与 `env:*` 脚本（它们原本只在 `integration/vnext-core` 上）。
-   - **但我们在建立新分支 `feat/mvp1-rust-core-render-split-7e3a9c` 时，已将 `scripts/env/*` 与 `env:help` / `env:check` / `env:doctor` / `env:setup` / `env:setup:rust` 一并合入 `package.json`**。
-   - 实测在 `/workspace/RocketCompanion` 目录下运行 `pnpm run env:help` 可正常输出帮助信息（在 `/` 根目录直接跑 `pnpm` 会因找不到 `package.json` 而报错）。
-
-## 3. 后续优化建议
-
-- 若后续仅做 WASM（`crates/rc_core`）与 Web 端开发，可在 `bootstrap.sh` 中将 `--with-rust` 拆分为 `--with-rust-wasm`（仅装 `rustup`/`cargo` 到 tmpfs，跳过 `webkit2gtk`/`gtk3` apt 安装）与 `--with-tauri`（需要桌面端打包时再装 GTK/WebKitGTK 依赖），即可将 OverlayFS 严格控制在 <= 100 MB 预算内。
-- 若需修复当前环境快照的 547 MB 占用，需要从干净容器快照重建环境并仅执行 `--with-rust-wasm`（或 `bootstrap.sh` 不带 `--with-rust` + 手动将 `rustup` 装到 `/tmp/rc-cache`）。
+## 3. 验证与交付
+- 运行 `cargo test --manifest-path crates/Cargo.toml -p rc_core`、`node scripts/buildRcCoreWasm.mjs`、`pnpm run build`（或 `tsc --noEmit`）以及 Headless Chrome `?mvp1=1` 冒烟验证。
+- 使用 GitHub Verified Bot Commit 提交至新分支，并将最终交付报告 POST 至备份网关。

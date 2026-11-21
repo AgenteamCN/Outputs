@@ -1,66 +1,74 @@
-# Wave 1 分支 `W1-07` (`feat/consumer-audio-arena`) 交付报告与协议字段清单
+# Wave 1 (`W1-08`: `feat/consumer-hud-camera`) 交付报告与字段清单
 
-- **分支**：`feat/consumer-audio-arena`（基于 `origin/z/agy/rc/multiplayer-recheck-base` `7c80b44`）
-- **最新提交**：`a12f21f` (`feat(audio,arena): consume playbackState silenceAll and RosterManifest rebuild (W1-07)`)
-- **状态**：已同步至 `origin/feat/consumer-audio-arena`，工作区干净，门禁与单元测试全绿。
-
----
-
-## 一、实现内容核验
-
-1. **音频消费端：`playbackState !== 'playing'` 即刻静音**
-   - `src/game/pipeline/FramePipeline.ts`：新增 `VNextPlaybackState = 'playing' | 'paused' | 'ended'`，在 `FrameContext` 与 `AudioStage.execute()` 中从 `runtime.playbackState ?? runtime.networkReconciler?.playbackState ?? runtime.match?.state?.playbackState` 透传 `playbackState`。
-   - `src/audio/RemoteEngineAudioLodController.ts`：新增 `silenceAll()`，清空 `_awakeRemoteIndices`、将所有 `engineSynths` 置为 `dormant = true`、调用 `synth.silence()` 并关闭 `spatialBus`。
-   - `src/game/subsystems/GameAudioSubsystem.ts`：新增 `silenceAll()` 统一关停 `engineLodController` 与 `gameAudio`；在 `update(context)` 入口处判定 `playbackState !== 'playing'` 时 1 帧内立即执行 `silenceAll()` 并更新 `lastPlaybackState` 与遥测状态，跳过后续空间音频与引擎合成更新。
-
-2. **Arena 消费端：`RosterManifest` 动态重建 1~6 车、配色、NameTag 与 `ghost` 材质预留**
-   - `src/entities/arena/arenaRosterManifestPipeline.ts`：实现 `applyRosterManifestToArena(arena, manifest, options)`：
-     - 基于 `metadataHash` 幂等短路（`arena.lastRosterMetadataHash === manifest.metadataHash` 且未设 `force` 时直接跳过）；
-     - 遍历 `manifest.cars`（1~6+ 槽位），调用 `vehicleRegistry.ensureCar(carIndex, team, visualId)` 动态创建或替换车身（Fennec/Merc/Octane 等）；
-     - 处理 `colorHex`（无自定义颜色时回退 `team` 阵营色）、`paintFinish`、`decalId`、`boostVisual`、`boostAudio`、`isBot`；
-     - 消费 `roleFlag: 'player' | 'bot' | 'ghost'`，当 `roleFlag === 'ghost'` 时通过 `vehicleRegistry.setCarGhostOpacity(carIndex, true, ghostOpacity ?? 0.55)` 套用半透明材质并在 `carRoot.userData.isGhost` / `arena.carRoleFlags` 中标记；
-     - 隐藏不在当前 `manifest.cars` 中的多余槽位，并输出 `NameTagCarEntry[]` 通过 `options.onUpdateNameTags` 同步 NameTag 与 `focusedCarIndex`。
-   - `src/entities/ArenaWorld.ts`：挂载 `carRoleFlags`、`lastRosterMetadataHash` 与 `applyRosterManifest(manifest, options)` 入口。
+- **分支**: `feat/consumer-hud-camera`
+- **基线**: `origin/z/agy/rc/multiplayer-recheck-base` (`7c80b445f2953076e5356320c6e91bc04da4bba8`)
+- **Verified Bot Commit**: `ca1c8012abf6b2385c1d28e6704009b0b83100e6` (`signature.isValid = true`, `state = VALID`)
+- **Commit URL**: https://github.com/Antigravi-ty/RocketCompanion/commit/ca1c8012abf6b2385c1d28e6704009b0b83100e6
 
 ---
 
-## 二、测试与门禁结果
+## 一、核心工程交付物
 
-- `pnpm run check`（`radar` + `tsc --noEmit`）：**PASS**（1429/1429 TS，0 循环依赖，0 越权向上导入，0 类型错误）
-- `npx tsx scripts/testConsumerAudioArena.ts`：**3/3 PASS**
-  - `[PASS] GameAudioSubsystem immediately silences all synths and gameAudio when playbackState !== playing`
-  - `[PASS] AudioStage propagates runtime.playbackState into FrameContext`
-  - `[PASS] applyRosterManifestToArena rebuilds 1-6 cars, colors, NameTags, ghost materials, and respects metadataHash`
+1. **临时 TS 消费契约 (`src/game/pipeline/stages/vnextHudCameraTypes.ts`)**
+   - 定义 `VNextRosterManifest`、`VNextRosterEntry`（含 `roleFlag: 'player' | 'bot' | 'ghost'`、`team: 0 | 1`）与 `VNextWorldFrameCameraAndHudHeader`（含 `cameraFocus`、`cameraPose`、`carTelemetry` 等），供 Wave 2 `feat/protocol-schema-alignment` 对齐二进制协议。
+
+2. **顶部 1~6 HUD 纯消费者 (`src/game/pipeline/stages/vnextHudRosterConsumer.ts`)**
+   - `buildHudFrameFromRosterManifest` 与 `pushVNextHudFrameToChannel` 零分配复用 `HudTransientFramePayload`：
+     - **彻底解耦 `playerCarIndex`**：阵营归属纯读 `RosterManifest.entries[i].team`（`0` 蓝左 1~3，`1` 橙右 4~6），仅当 `!isSpectatorSession` 且存在本地人类玩家 (`roleFlag === 'player' && isLocalPlayer`) 时才按本地玩家阵营翻转左右，观战 / Replay Watch Together / 纯 Bot 表演赛下 4/5/6 永不跳边。
+     - **焦点纯读 `cameraFocus.focusedCarIndex`**：`isFocusedPov` 与 `focusedSlotKey` 仅由 `cameraFocus.focusedCarIndex` 驱动；Goal Replay Director 模式下自动清空车号高亮 (`focusedSlotKey = null`)。
+     - **Ghost 预留位隔离**：`roleFlag === 'ghost'` 自动从 1~6 竞技 HUD 槽位中排除。
+   - 同步修复 `src/game/pipeline/stages/hudTransientFramePipeline.ts` 中 `updateSlotInPlace` 的 `entry.isSelf || ...` 双重高亮缺陷，以及 `src/game/pipeline/stages/TelemetryStage.ts` 在观战/同步回放模式下优先读取 `camera.focusedCarIndex` 并支持 vNext Fast Path。
+
+3. **Client Goal Replay 电影机位消费者 (`src/game/subsystems/vnextGoalReplayCameraConsumer.ts` & `GameCameraSubsystem.ts`)**
+   - 新增 `VNextGoalReplayCameraConsumer` 并接入 `GameCameraSubsystem.applyBroadcasterCameraFrame(frame)`：
+     - 当 `cameraFocus.isGoalReplayActive && cameraFocus.cameraMode === 'director'` 且 `cameraPose` 有效时，自动获取 `'vnext-broadcaster'` Director Override、同步 `fovDeg` 并直接应用 `setDirectorCameraPoseThreeJs(eye, target)`，Client 端零本地 Director 推算。
+     - 切回 `pov` / `wasmPov` / `rearView` 或退出 Goal Replay 时，自动释放 `'vnext-broadcaster'` 覆盖并同步 `focusedCarIndex`、`ballCam` 与 `hudStore`。
+     - 对 `txSeq` 乱序与非有限坐标 (`NaN`/`Infinity`) 做护栏拦截。
+
+4. **单元测试 (`scripts/tests/vnextHudCameraConsumer.test.ts`)**
+   - 覆盖 3v3 观战 1~6 切换不跳边、Goal Replay Director 清空焦点与 Ghost 排除、Broadcaster 电影机位应用与回退 POV，3/3 全部通过。
 
 ---
 
-## 三、Wave 2 协议对齐字段清单（`W1-07` 消费诉求）
+## 二、Wave 2 协议对齐字段清单（W1-08 诉求）
 
-供 `feat/protocol-schema-alignment` 在设计二进制 `WorldFrame` / `RosterManifest` / `Signal` 时对齐：
-
-### 1. 通道 1（高频 State 帧头 `WorldFrame`）
-| 字段名 | 类型 / 位宽建议 | 用途说明 |
+### 通道 1（高频 `WorldFrame` 帧头 & 相机/HUD 语义字段）
+| 字段名 | 类型 / 建议编码 | 用途 |
 |---|---|---|
-| `playbackState` | `uint8` / enum (`0=playing, 1=paused, 2=ended`) | 驱动 `AudioStage` -> `GameAudioSubsystem.update()`；非 `playing` 时 1 帧内 `silenceAll()` |
-| `metadataHash` | `uint32` (4B HEX) | 与本地 `arena.lastRosterMetadataHash` 比对，不一致时触发异步拉取 `RosterManifest` 并重建车身/NameTag |
-| `focusedCarIndex` | `uint8` (0~7) | 驱动主视角引擎音频路由（非空间直通 vs 3D 空间化）与 NameTag 焦点判定 |
+| `txSeq` | `uint32` | 单调发送序号，防乱序/回退覆盖相机 |
+| `metadataHash` | `uint32` (4B HEX) | 与本地 `RosterManifest` 对比，变更时触发通道 2 补拉 |
+| `phase` | `uint8` enum | 比赛阶段（含 `replay` / `goal` / `playing` / `paused` 等） |
+| `playbackState` | `uint8` enum | `playing` / `paused` / `rewinding` / `ended` |
+| `clockSeconds` | `float32` / `int16` | 比赛/加时时钟显示 |
+| `isOvertime` | `bit` (1b) | 加时标记 |
+| `blueScore` / `orangeScore` | `uint8` x 2 | 顶部记分板比分 |
+| `cameraFocus.focusedCarIndex` | `int8` (`-1` 表示无聚焦车辆) | 驱动顶部 1~6 HUD 焦点高亮与 Client POV 目标 |
+| `cameraFocus.cameraMode` | `uint8` enum (`pov` / `wasmPov` / `rearView` / `free` / `director` / `podium` / `editor`) | Client 相机模式仲裁 |
+| `cameraFocus.ballCam` | `bit` (1b) | Ball Cam 指示器与 POV 跟随状态 |
+| `cameraFocus.isGoalReplayActive` | `bit` (1b) | Goal Replay 状态机开关 |
+| `cameraFocus.replayCameraMode` | `bit` (`director` \| `pov`) | Goal Replay 内电影机位 / 球员 POV 切换 |
+| `cameraPose.eyeThreeJs` | `float32[3]` (12B，按 Bitmask 可选) | Broadcaster 下发的 Goal Replay 电影机位 / FreeCam 相机位置 |
+| `cameraPose.targetThreeJs` | `float32[3]` (12B，按 Bitmask 可选) | Broadcaster 下发的 Goal Replay 电影机位 / FreeCam 注视点 |
+| `cameraPose.fovDeg` | `float32` / `uint8` (可选) | Director / FreeCam 水平 FOV |
+| `carTelemetry[0..5]` | 每车 `boostAmount (uint8)` + `isDemolished (bit)` + `demoRespawnRemainingSec (float32/uint8)` + `replaySkipReady (bit)` | 1~6 HUD Boost 条、爆破倒计时与 Skip Replay 勾选标记 |
 
-### 2. 通道 2（低频清单 `RosterManifest`）
-| 字段名 | 类型 / 建议格式 | 用途说明 |
+### 通道 2（低频 `RosterManifest` 清单字段）
+| 字段名 | 类型 | 用途 |
 |---|---|---|
-| `metadataHash` | `uint32` (4B HEX) | 清单版本号，用于 `applyRosterManifestToArena` 幂等校验 |
-| `mode` | `string` / enum | 当前模式上下文（含 `Exhibition` 等） |
-| `focusedCarIndex` | `uint8` (optional) | 当前聚焦车号 |
-| `cars[].carIndex` | `uint8` (0~7) | 车辆槽位索引（支持 1~6 人局及最多 8 槽） |
-| `cars[].name` | `string` | NameTag 显示名称 |
-| `cars[].team` | `uint8` (`0 \| 1`) | 阵营（蓝/橙），用于默认涂装与 NameTag 阵营色 |
-| `cars[].visualId` | `string` / enum | 车身模型 ID（`fennec`、`octane`、`dominus`、`merc`、`breakout` 等） |
-| `cars[].colorHex` | `uint32` / `string` (optional) | 自定义车身颜色（缺省按 `team` 回退） |
-| `cars[].paintFinish` | `string` / enum (optional) | 漆面质感（`metallic` / `matte` / `null`） |
-| `cars[].decalId` | `string` (optional) | 贴花 ID |
-| `cars[].boostVisual` | `string` (optional) | 尾焰特效类型 |
-| `cars[].boostAudio` | `string` (optional) | 尾焰音效类型 |
-| `cars[].isBot` | `bool` (optional) | Bot 标识（驱动 Boost 粒子等 Bot 区分逻辑） |
-| `cars[].roleFlag` | `uint8` / enum (`0=player, 1=bot, 2=ghost`) | 角色标识；`ghost` 自动套用半透明材质并标记 `isGhost` |
-| `cars[].ghostOpacity` | `float32` / `uint8` (optional) | 幽灵车透明度（默认 `0.55`） |
-| `cars[].isLocalPlayer` | `bool` (optional) | 本地玩家标记 |
+| `metadataHash` | `uint32` (4B) | 清单版本哈希 |
+| `matchMode` | `string` / `uint8` enum | 模式标识（含 `exp-multi-bots`） |
+| `isSpectatorSession` | `boolean` | 标识当前是否为纯观战/Watch Together 会话（决定是否允许本地人类阵营翻转左右栏） |
+| `entries[].carIndex` | `uint8` (`0..5`) | 车辆物理槽位索引，关联通道 1 `cameraFocus.focusedCarIndex` 与 `carTelemetry` |
+| `entries[].name` | `string` | 1~6 HUD 球员/Bot 名称 |
+| `entries[].team` | `0 \| 1` (1b) | 权威阵营（`0=Blue`, `1=Orange`），彻底替代本地 `playerCarIndex` 推算 |
+| `entries[].roleFlag` | `'player' \| 'bot' \| 'ghost'` (2b) | 区分人类、Bot 与幽灵车（HUD 1~6 排除 `ghost`） |
+| `entries[].isBot` | `boolean` | Bot 标记（Goal Replay 自动跳过标记等） |
+| `entries[].isLocalPlayer` | `boolean` (可选) | 仅当本端真实操控该车时为 `true` |
+| `entries[].slotKey` | `1..6` (可选) | 显式 1~6 槽位序号（缺省按 `team` + `carIndex` 确定性分配） |
+
+---
+
+## 三、验证结果
+
+- `pnpm run check`（`radar` + `tsc --noEmit`）：**PASS**（`STATUS: GREEN -- 100% TS, tsc --noEmit clean, hard boundaries & volume caps verified`）
+- `env -u NODE_OPTIONS node --experimental-strip-types --test scripts/tests/vnextHudCameraConsumer.test.ts`：**3/3 PASS**

@@ -1,65 +1,31 @@
-# RocketCompanion MVP-1 实施交付报告
+# RocketCompanion MVP-1 Fixes Report
 
-## 分支与提交信息
-- **新分支**：`feat/mvp1-rust-core-split-v2`（基于 `1f9ca7dc9348ad7617c3b1f579519bc6e54c1a67`）
-- **Verified Bot Commit**：[`0deab37c9b218cdf43bd127f673d22d6cd2e2a52`](https://github.com/Antigravi-ty/RocketCompanion/commit/0deab37c9b218cdf43bd127f673d22d6cd2e2a52)（`VALID` 签名）
-- **前置计划备份**：[`623e96030f7778f3a7e0d3de2e56bad7a701de95`](https://github.com/AgenteamCN/Outputs/commit/623e96030f7778f3a7e0d3de2e56bad7a701de95)
-
----
-
-## 本次完成内容
-
-1. **环境脚本与 OverlayFS 预算修复 (`<= 100 MB`)**
-   - 修改 `scripts/env/bootstrap.sh`：将 Linux Tauri 桌面依赖（`libwebkit2gtk-4.1-dev`、`libgtk-3-dev` 等）隔离到 `--with-tauri`；默认 `--with-rust` 仅将 `rustup`、`cargo` 与 `wasm32-unknown-unknown` 安装至 `/tmp/rc-cache`（tmpfs）。
-   - 实测 `node scripts/env/checkEnv.mjs --quick`：`OverlayFS size: 30 MB (baseline: 30 MB, budget: <= 100 MB)`。
-
-2. **Rust 双 Crate 架构拆分 (`rc_core` + `rc_core_wasm`)**
-   - `crates/rc_core`（`rlib`）：纯 Rust 核心库，导出 `SimCore` 实例与 `CarControls`，去除全局静态单例与 WASM 裸指针胶水，方便 Linux 并发 `cargo test` 及后续 Tauri Native / Dedicated Server 直接复用。
-   - `crates/rc_core_wasm`（`cdylib`）：极薄 WASM C ABI 外壳，更新 `crates/Cargo.toml` 与 `scripts/buildRcCoreWasm.mjs`，重新编译生成 `src/mvp1/rc_core.wasm`。
-   - `crates/rocketsim` 保持 100% 原汁原味、零魔改。
-
-3. **Linux `cargo test` 空中翻滚 & Stall（无效翻滚）验证**
-   - 在 `crates/rc_core/src/lib.rs` 新增 `aerial_directional_flips_and_stalls_work_in_rocketsim`，加载 `public/arenamesh/mesh_*.cmf` 后验证：
-     - `W / S / A / D / Q / E` 空中翻滚均正常触发 `has_flipped` 与对应方向加速度；
-     - `Q + D + Jump` 与 `A + E + Jump` 均正确触发 RocketSim Stall（`has_flipped = true` 且水平速度增量 `< 50 uu/s`）。
-
-4. **MVP-1 按键绑定修正**
-   - 修改 `src/mvp1/InputController.ts` 与 `mvp1.html`：
-     - `W / S / A / D / Q / E`：油门/俯仰/转向/偏航/左右滚转（移除 `ArrowLeft`/`ArrowRight` 对转向的误绑）
-     - `ShiftLeft`：Power Slide（Handbrake）
-     - `Space`：Car / Ball Camera 切换
-     - `ArrowLeft` & `Period (.)`：Boost
-     - `ArrowRight` & `Slash (/)`：Jump
-     - `R`：Reset Kickoff，`T / F10`：Export Telemetry
-
-5. **真实场地 / 球模型与 Boost Pad Hitbox 绘制**
-   - 修改 `src/mvp1/ArenaRenderer.ts`：
-     - 接入 `loadDriftwoodsStadium()` 加载真实球场模型（保留线框场地兜底）；
-     - 接入 `loadBallAsset()` 加载经典球模型（保留几何体兜底）；
-     - 依据 `RenderFrame` 的 64 位 `boost_pads_lo / boost_pads_hi` 掩码，在 34 个 RocketSim Soccar 精确坐标上绘制大包（半径 `208`）/ 小包（半径 `144`）Hitbox 圆柱指示器，实时反映刷新/冷却状态。
-
-6. **`http://localhost:3000` 临时快捷入口**
-   - 在 `src/main.ts` 非 `?mvp1=1` 页面右下角注入临时悬浮按钮 `MVP-1 Rust Testbed →`，点击即可一键跳转 `?mvp1=1`。
+**Base Commit**: `0deab37c9b218cdf43bd127f673d22d6cd2e2a52` (`feat/mvp1-rust-core-split-v2`)  
+**Pushed Commit**: `3c5c0308380b2af772fd6745a58e9df1dc5c0df8` (`verified: true`, `web-flow`)  
+**Branch**: `feat/mvp1-rust-core-split-v2`
 
 ---
 
-## 本地启动与验证命令
+## 1. `localhost:3000` MVP-1 Testbed Quick Entry
+- **Root Cause**: `mountMvp1ShortcutButton()` had been added to `src/main.ts` (which serves `:3001` HTTPS and `:3003` HTTP), while `src/entry/EntryHubApp.tsx` (the launchpad served on `localhost:3000`) had no quick entry to `mvp1.html`.
+- **Fix**:
+  - Removed `mountMvp1ShortcutButton()` from `src/main.ts` (preserving `/?mvp1=1` direct boot support).
+  - Added `MVP-1 Rust Testbed (mvp1.html)` quick-launch buttons to `src/entry/EntryHubApp.tsx` on both Card 1 (`https://<host>:3001/mvp1.html`) and Card 3 (`http://<host>:3003/mvp1.html`).
 
-### 1. 切换分支并启动（Mac / 本地开发环境）
-```bash
-git fetch origin feat/mvp1-rust-core-split-v2
-git checkout feat/mvp1-rust-core-split-v2
-pnpm install
-pnpm run tauri:dev:tray
-```
-或者直接用网页开发服务器启动：
-```bash
-pnpm run dev
-```
-打开 `http://localhost:3000`，点击右下角 **`MVP-1 Rust Testbed →`**（或直接访问 `http://localhost:3000/?mvp1=1`）。
+## 2. `Q+D` / `A+E` Stall (无效翻滚)
+- **Root Cause**: In `crates/rocketsim/src/sim/car/base.rs` (`Car::update_double_jump_or_flip`), when `deadzone_dodge_dir` evaluated to `Vec3A::ZERO` (as in a `Q+D` or `A+E` stall where `yaw + roll == 0`), `self.state.flip_rel_torque` was not cleared. If the car had performed any prior directional flip, `flip_rel_torque` retained the old flip's torque and applied it during the subsequent stall.
+- **Fix**:
+  - Explicitly reset `self.state.flip_rel_torque = Vec3A::ZERO` when grounded (`is_on_ground`) and in the `else` branch when `deadzone_dodge_dir` is zero.
+  - Added regression test `stall_after_prior_flip_clears_flip_torque` in `crates/rc_core/src/lib.rs`.
+  - Rebuilt `src/mvp1/rc_core.wasm` via `pnpm run build:rc-core`.
 
-### 2. 已通过的自动化验证
-- `cargo test --manifest-path crates/Cargo.toml -p rc_core`：**4 passed, 0 failed**
-- `node scripts/buildRcCoreWasm.mjs`：**成功产出 `src/mvp1/rc_core.wasm`**
-- `pnpm exec tsc --noEmit`：**0 errors**
-- `node scripts/env/checkEnv.mjs --quick`：**OverlayFS 30 MB (`<= 100 MB`)**
+## 3. Boost Pads Partially Disappearing / Not Disappearing on Collect
+- **Root Cause**: `crates/rocketsim/src/sim/boost_pad/boost_pad_grid.rs` (`BoostPadGrid::new`) sorts all 34 Soccar boost pads by `(pos.y, pos.x)` (RLBot/RLGym ordering). However, `src/mvp1/ArenaRenderer.ts` constructed `boostPadMeshes` in `[28 small, 6 big]` unsorted order and checked `i >= 28` for big pads. Only the first 3 pads (`y = -4240`, `-4184`) happened to align by coincidence, causing all subsequent pads to map to the wrong bitmask index.
+- **Fix**:
+  - Sorted `STANDARD_BOOST_PADS` in `src/mvp1/ArenaRenderer.ts` by `(loc[1], loc[0])` to match `BoostPadGrid::new`, and used `STANDARD_BOOST_PADS[i].isBig` in `render()`.
+  - Added `soccar_boost_pads_are_sorted_by_y_then_x` test in `crates/rc_core/src/lib.rs`.
+
+## Verification
+- `pnpm run build:rc-core` — succeeded, updated `src/mvp1/rc_core.wasm`.
+- Node WASM harness on `src/mvp1/rc_core.wasm` — verified `Q+D` stall after a prior front-flip no longer applies stale flip torque.
+- `pnpm run check` (`radar` + `tsc --noEmit`) — `STATUS: GREEN`, 1397/1397 TS files, 0 errors.

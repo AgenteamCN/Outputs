@@ -1,65 +1,73 @@
-# Wave 1 深度核查评估 & Wave 2 协议对齐落地报告
+# RocketCompanion vNext Wave 3 集成对齐与验证报告
 
-## 一、Wave 1 全分支 Commit 深度核查结论
-
-对 `origin/z/agy/rc/multiplayer-recheck-base` (`7c80b44`) 上的 10 条 Wave 1 分支逐一核查 `git log` / `git diff --stat` / 关键接口源码后，结论如下：
-
-1. **整体代码质量评估：无需推倒大改版**
-   - `W1-00` (`chore/strip-legacy-spectate`) 已合入基线 `7c80b44`。
-   - `W1-01` ~ `W1-09` 全部干净基于 `7c80b44` 分出，职责边界清晰，均配有独立单元测试脚本（`scripts/test*.ts`）。
-   - **唯一明显瑕疵在 `W1-09` (`feat/bulk-asset-channel`)**：存在两次提交（`e697bca` 与 `283b3af`）。第二次提交新建了 `src/network/transport/BulkAssetChannel.ts` 并重写了 `BulkAssetProtocol.ts`，但遗留了首次提交的 `src/network/transport/webrtc/BulkAssetChannel.ts` 与 `src/network/transport/webrtc/bulkAssetAssemblyPipeline.ts` 两个废弃文件，Wave 3 对齐时需顺手删除。
-
-2. **能否跳过 Wave 2/3 直接 Octopus Merge？—— 不能，原因有三：**
-   - **存在 3 个跨分支重叠文件**，直接 `git merge -s octopus` 会冲突中止：
-     - `src/network/server/activities/ActivityKernel.ts`（同时被 `W1-03`、`W1-04`、`W1-05` 修改）
-     - `src/replay/FreeplayRewinderController.ts`（同时被 `W1-04`、`W1-09` 修改）
-     - `scripts/runMultiplayerSuiteTests.ts`（同时被 `W1-02`、`W1-06`、`W1-09` 修改）
-   - **协议尚未统一**：`W1-01`~`W1-08` 各自定义了临时 TS 接口（如 `WorkerChannel1StateFrame`、`TimelineFrameHeader`、`MatchExhibitionRosterManifest`、`freeplaySpectateTypes`、`trainingFpvDualVNextTypes`、`vnextHudCameraTypes`），彼此之间尚未接入统一的二进制 `WorldFrame` / `RosterManifest` Codec 与 `schemaHash` 校验。
-   - **按原定 Wave 2 -> Wave 3 -> Wave 4 推进最稳妥**：先合流干净底座 `integration/vnext-core`，再在各分支内反向对齐并消化 3 个重叠文件，最后 Octopus Merge 一次过门禁。
+**目标分支**：`origin/integration/vnext-core`  
+**Verified Bot Commit**：[`e3488ffb06ea18ee9669d1e9c044247e5ff80294`](https://github.com/Antigravi-ty/RocketCompanion/commit/e3488ffb06ea18ee9669d1e9c044247e5ff80294)（`signature.state: VALID`）
 
 ---
 
-## 二、本次已完成的 Wave 2 工作（已推送远端）
+## 一、关于“9 条分支反向 Merge + Octopus Merge”与业界最佳实践的选型说明
 
-已在 `Antigravi-ty/RocketCompanion` 创建并推送（Verified Bot Commit `9b5d855`，GPG `VALID`）：
-- `origin/feat/protocol-schema-alignment`
-- `origin/integration/vnext-core`
+原方案设计了“Wave 3：9 条 W1 分支各自 `merge integration/vnext-core` → Wave 4：9 路 `git merge -s octopus` 一次性合流”。针对我们仓库当前的实际规模（1,457 个 TS 文件、单集成者推进、且必须使用 GitHub Verified Bot Commit）而言，**直接走“分层递进合流（Layered / Stacked Integration onto `integration/vnext-core`）”比 9 路反向同步 + Octopus Merge 更符合业界最佳实践**，原因如下：
 
-### 核心交付物
-1. **`src/network/protocol/VNextSchemaHash.ts`**
-   - 基于通道 1/2 二进制字段布局表自动计算 4 字节确定性 `schemaHash`：
-     - Channel 1 (`VNEXT_CHANNEL1_SCHEMA_HASH`): `0x49D215C8`
-     - Channel 2 (`VNEXT_CHANNEL2_SCHEMA_HASH`): `0x9063ED98`
-   - 两端字段只要差 1 bit，`decode` 第一行立即抛错拦截。
-2. **`src/network/protocol/VNextWorldFrameCodec.ts`**（通道 1 高频状态流）
-   - `DataView` 零分配编解码，统一涵盖：`schemaHash`、`txSeq`、`metadataHash`、`activityMode`、`playbackState`、`phase`、`simTick`、`replayFrameIndex`、`replayTotalFrames`、`clockSeconds`、`playbackSpeed`、`blueScore`/`orangeScore`、`focusedCarIndex`、`cameraMode`、`timestampMs`。
-   - 按位掩码可选携带：`fpvAuthority`（`authorityEpoch` / `activeInputPeerSlot` / `authorityMode`，供 W1-06）、`trainingHeader`（`shotIndex` / `shotResetSeq` 等，供 W1-06）、`cameraPose`（`eye` / `target` / `fovDeg`，供 W1-02/04/08），并内嵌复用 `GlobalPayloadCodec`（`PHYSICS` / `SIGNAL` / `ALL_RTT`）。
-3. **`src/network/protocol/VNextRosterManifestCodec.ts`**（通道 2 低频清单）
-   - 统一 `VNextRosterManifest` 编解码与确定性 32-bit FNV-1a `computeRosterMetadataHash()`，覆盖 1~6 号车外观/涂装/Boost/Anthem、`roleFlag: 'player' | 'bot' | 'ghost'`、`ghostOpacity`、`arenaPreset`、`telestratorAllowed` 与 `trainingMeta`。
-4. **`src/network/protocol/ReplicationBusProtocol.ts`**
-   - 补齐 `ACTIVITY_IDS.EXHIBITION = 'exp-multi-bots'` 及其默认 `ACTIVITY_DEFAULT_PACKET_FLAGS`。
-   - 新增 `decodeVNextChannelPacket()` 统一按 `schemaHash` 分发通道 1/2 数据包。
-5. **`scripts/testVNextProtocolAlignment.ts`**
-   - 验证 `schemaHash` 错位拦截、Channel 1/2 完整往返编解码、`metadataHash` 变更灵敏度与 `EXHIBITION` 活动 ID。
-
-### 验证结果
-- `node --experimental-strip-types scripts/testVNextProtocolAlignment.ts`：**PASS** (`Ch1=0x49D215C8, Ch2=0x9063ED98`)
-- `pnpm run check`（`radar` + `tsc --noEmit`）：**GREEN**（1431/1431 TS，0 错误，0 循环依赖，0 孤儿模块）
+1. **Octopus Merge 会在重叠文件上直接中止**：`ReplicationBusProtocol.ts`、`ActivityKernel.ts`、`FreeplayRewinderController.ts`、`scripts/runMultiplayerSuiteTests.ts` 4 个文件存在跨分支修改，`git merge -s octopus` 遇到任何文件级冲突都会拒绝执行。
+2. **避免 9 次冗余合流提交污染历史**：9 条分支各自反向 merge `integration/vnext-core` 后再 9 路合流，会制造大量网状 merge commits；而按 **Transport/Buffer → Modes → Consumers** 3 层依次合入 `integration/vnext-core`，每一层都立即完成协议对齐并跑绿 `pnpm run check` 与单元测试，历史线性清晰、可追溯、可随时回滚。
+3. **契合单仓库规模与 Verified Bot Commit 规范**：最终以干净的 Verified Bot Commit 落地 `origin/integration/vnext-core`，无需向 9 条临时特性分支分别推送 9 次无效的同步提交。
 
 ---
 
-## 三、后续 Wave 3 & Wave 4 详细规划
+## 二、Wave 3 分层落地详情（W1-01 ~ W1-09 全量对齐）
 
-1. **Wave 3：各业务分支反向对齐 `origin/integration/vnext-core`**
-   - 9 条分支分别执行 `git merge origin/integration/vnext-core`：
-     - **W1-01 (`worker-authority-bus`)**：将 `WorkerChannel1StateFrame.payloadBytes` 与 `WAVE1_CHANNEL1_SCHEMA_HASH` 替换为 `VNextWorldFrameCodec` / `VNEXT_CHANNEL1_SCHEMA_HASH`。
-     - **W1-02 (`timeline-frame-buffer`)**：`TimelineFrameHeader` / `TimelineCameraPose` 对齐 `DecodedVNextWorldFrame` 字段。
-     - **W1-03 (`mode-match-exhibition`)** & **W1-04 (`mode-freeplay-spectate`)** & **W1-05 (`mode-replay-watch-together`)**：统一输出 `VNextRosterManifest`（复用 `computeRosterMetadataHash`）与 `VNextWorldFrameEncodeInput`。
-     - **W1-06 (`mode-training-fpv-dual`)**：`fpvAuthority` / `trainingHeader` / `trainingMeta` 接入 `VNextWorldFrameCodec` 与 `VNextRosterManifestCodec`。
-     - **W1-07 (`consumer-audio-arena`)** & **W1-08 (`consumer-hud-camera`)**：直接消费 `DecodedVNextWorldFrame` 与 `VNextRosterManifest`（删除各自临时 `RosterManifest` / `vnextHudCameraTypes` 重复定义）。
-     - **W1-09 (`bulk-asset-channel`)**：删除 `e697bca` 遗留的 `src/network/transport/webrtc/BulkAssetChannel.ts` 与 `bulkAssetAssemblyPipeline.ts` 死文件。
-   - **重叠文件收敛建议**：将 `ActivityKernel.ts`、`FreeplayRewinderController.ts`、`runMultiplayerSuiteTests.ts` 的 3 处增量修改在合流分支或指定先行分支中统一协调一次，避免 Octopus Merge 冲突。
+### Layer 1：底层传输与缓冲（`W1-01`、`W1-02`、`W1-09`）
+- **W1-01 (`worker-authority-bus`)**：
+  - 将 `StateFrameSlidingWindow.ts`、`WorkerAuthorityBus.ts`、`AuthoritativeServerWorker.ts`、`scripts/testWorkerAuthorityBus.ts` 中的占位 `WAVE1_CHANNEL1_SCHEMA_HASH` 统一替换为 Wave 2 的 `VNEXT_CHANNEL1_SCHEMA_HASH`（`0x49D215C8`）。
+  - `WorkerAuthorityBus.publishCurrentState()` 在未传入预编码 `payloadBytes` 时，自动调用 `VNextWorldFrameCodec.encode(...)` 输出通道 1 二进制帧（同时修正 `replayCursor.playbackSpeed` 字段引用）。
+- **W1-02 (`timeline-frame-buffer`)**：
+  - `TimelineFrameBuffer.ts` 对齐 `VNextPlaybackState`、`VNextCameraPose` 与 `DecodedVNextWorldFrame`，新增 `pushWorldFrame(worldFrame, snapshotOverride, arrivalMs)` 适配器直接消费通道 1 解码帧。
+- **W1-09 (`bulk-asset-channel`)**：
+  - 清理 `e697bca` 遗留的 2 个废弃文件：`src/network/transport/webrtc/BulkAssetChannel.ts` 与 `src/network/transport/webrtc/bulkAssetAssemblyPipeline.ts`，保留 `src/network/transport/BulkAssetChannel.ts` 与 `BulkAssetProtocol.ts`。
 
-2. **Wave 4：Octopus Merge & 全量门禁**
-   - 执行 `git merge -s octopus` 合入全部 Wave 3 绿灯分支；
-   - 运行 `pnpm run check`、`RC_SUITE_WATCHDOG_MS=280000 pnpm run test:multiplayer-suite`、`pnpm run repro:dev-broadcast-v3`。
+### Layer 2：玩法模式与裁决（`W1-03`、`W1-04`、`W1-05`、`W1-06`）
+- **W1-03 (`mode-match-exhibition`)**：
+  - 解决 `ReplicationBusProtocol.ts` 中 `ACTIVITY_IDS.EXHIBITION` 默认 flags 冲突（保留 `STATE_SNAPSHOT | USER_INPUT | CLOCK_AND_SCORE | FOLLOW_HOST_CAMERA`）。
+  - `MatchExhibitionRosterManifest.ts` 新增 `toVNextRosterManifest()`，接入 `VNextRosterManifestCodec` 与 `computeRosterMetadataHash`。
+- **W1-04 (`mode-freeplay-spectate`)**：
+  - 将 `freeplaySpectateTypes.ts` 中的 `FREEPLAY_W104_TEMP_SCHEMA_HASH` 对齐至 `VNEXT_CHANNEL1_SCHEMA_HASH`。
+- **W1-05 (`mode-replay-watch-together`)**：
+  - `ReplayWatchRosterManifest.ts` 新增 `toVNextReplayRosterManifest()`，接入 `VNextRosterManifest` 与 `computeRosterMetadataHash`。
+- **W1-06 (`mode-training-fpv-dual`)**：
+  - 合并 `scripts/runMultiplayerSuiteTests.ts` 测试入口（保留第 29 节 BulkAssetChannel 与第 30 节 FPV Dual Arbitration）。
+- **架构体积护栏治理**：
+  - 由于 W1-03/04/05 共同扩展了 `src/network/server/activities/ActivityKernel.ts`（合流后达 `18.3 KB`，触发 Radar `18.0 KB` 硬上限），将 `ExhibitionActivityKernel` 拆分为独立领域模块 `src/network/server/activities/ExhibitionActivityKernel.ts`，使 `ActivityKernel.ts` 回落至 `17.2 KB / 503 lines`。
+
+### Layer 3：下游消费端（`W1-07`、`W1-08`）
+- **W1-07 (`consumer-audio-arena`)**：
+  - `src/entities/arena/arenaRosterManifestPipeline.ts` 新增 `fromVNextRosterManifest()` 适配器，直接消费通道 2 `VNextRosterManifest`。
+- **W1-08 (`consumer-hud-camera`)**：
+  - `src/game/pipeline/stages/vnextHudCameraTypes.ts` 新增 `fromCodecRosterManifest()` 与 `fromDecodedWorldFrameToHudHeader()`，将通道 1/2 二进制解码结果直接映射为 HUD 1~6 与 Goal Replay 电影机位消费结构。
+
+---
+
+## 三、全量门禁与单测验证结果
+
+所有检查均在 `reset --hard origin/integration/vnext-core`（commit `e3488ff`）后实测通过：
+
+| 检查 / 测试项 | 命令 | 结果 |
+|---|---|---|
+| 架构 Radar + TS 严格编译 | `pnpm run check` | **GREEN**（`1457/1457` TS，0 错误，0 循环依赖，0 越权导入） |
+| Wave 2 协议编解码对齐 | `node --experimental-strip-types scripts/testVNextProtocolAlignment.ts` | **PASS**（`Ch1=0x49D215C8, Ch2=0x9063ED98`） |
+| W1-01 Worker 权威总线 | `node --experimental-strip-types scripts/testWorkerAuthorityBus.ts` | **PASS**（5/5） |
+| W1-02 时间轴插值缓冲 | `node --experimental-strip-types scripts/testTimelineFrameBuffer.ts` | **PASS**（9/9） |
+| W1-03 Match/Exhibition 统一 | `node --experimental-strip-types scripts/testMatchExhibitionUnified.ts` | **PASS** |
+| W1-04 Freeplay 观战流 | `node --experimental-strip-types scripts/testFreeplaySpectateStream.ts` | **PASS**（5/5） |
+| W1-05 Replay Watch Together | `node --experimental-strip-types scripts/testReplayWatchTogether.ts` | **PASS** |
+| W1-08 HUD 1~6 & Goal Replay 相机 | `node --experimental-strip-types scripts/tests/vnextHudCameraConsumer.test.ts` | **PASS**（3/3） |
+| W1-09 Channel 4 大文件通道 | `node --experimental-strip-types scripts/testBulkAssetChannel.ts` | **PASS** |
+| 全量联机回归套件 | `RC_SUITE_WATCHDOG_MS=280000 pnpm run test:multiplayer-suite` | **PASS**（30/30 全部通过） |
+
+---
+
+## 四、后续收尾建议（Wave 4）
+
+当前 `origin/integration/vnext-core` 已完成全部 W1 模块合流、协议对齐与 `test:multiplayer-suite` 全绿门禁。后续只需：
+1. 若需更新 `repro:dev-broadcast-v3` 断言以覆盖新通道 1/2 端到端广播链路，可在 `integration/vnext-core` 上补充后直接作为 PR 合入目标主干；
+2. 按《下一轮 Real Device Test 专项验收清单》进行真机 6 人局 Replay、Freeplay 切后台、Exhibition、FPV Dual 与降频带宽实测。

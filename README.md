@@ -1,25 +1,29 @@
-# RocketCompanion MVP-1 Fixes Summary
+# Task Completion Report — `Antigravi-ty/agyPreviewInstant` (`a2`)
 
-Branch: `feat/mvp1-rust-core-split-v2`
-Base commit: `0deab37c9b218cdf43bd127f673d22d6cd2e2a52`
-Latest verified commits:
-- `3c5c0308380b2af772fd6745a58e9df1dc5c0df8` — `fix(mvp1): move testbed entry to :3000 hub, fix stall torque & boost pad order`
-- `bfc8a8825076506e79cc9f98e1cf024ff5ac1ac4` — `feat(mvp1): add KBM mouse boost/jump bindings and JUMP/FLIP HUD flags`
+## Summary of Commits on `origin/a2`
+1. **`97f4eed`** — `fix(p2p): network allowlist rule detection, readiness check-valve, retry state, and PocketDeck input UI`
+2. **`23eab9c`** — `feat(p2p): rename dispatch_aistudio_task to dispatch_agent_task and add dispatch_llm_task`
+3. **`cf668e3`** — `feat(p2p,tray,safari): passive P2P sync, 2Hz/1Hz stream push, tray shortcuts, and Safari modes`
 
-## 1. `localhost:3000` MVP-1 Testbed Quick Entry
-- Removed the temporary floating `MVP-1 Rust Testbed →` button from `src/main.ts` (ports `3001` / `3003`).
-- Added the MVP-1 Testbed (`mvp1.html`) quick-entry UI on `localhost:3000` (`src/entry/EntryHubApp.tsx`).
+## Changes in `cf668e3`
+### 1. Passive P2P Mode & On-Demand Fetching
+- Removed the 4000ms `setInterval` polling loop in `apps/p2p-remote-controller/src/components/PocketDeckView.tsx`.
+- Host strips heavy `consoleLogs`, `timeline`, and `elements` from `pocket_deck_get_snapshot` and `pocket_deck_action` responses in `apps/p2p-remote-controller/src/hooks/useCellularP2pHost.ts`, and serves them on demand via `pocket_deck_get_console`, `pocket_deck_get_timeline`, `pocket_deck_get_elements`, and `pocket_deck_get_llm_output`.
+- Added manual `Fetch` button, `P2P`/`LAN`/`Cached` connection badge, `SF Mono` commit/layout typography, and `☰` menu dropdown (`Layout Mode` + `Update`) in `apps/p2p-remote-controller/src/components/PocketDeckHeader.tsx`.
+- Added `Mobile` / `All` window filter toggle (defaulting to mobile-opened windows) and `SF Mono` styling for model names, settings, and URLs in `apps/p2p-remote-controller/src/components/PocketDeckDirectTab.tsx` and `PocketDeckLlmControlTab.tsx`.
 
-## 2. `Q+D` / `A+E` Stall (无效翻滚)
-- Side-by-side comparison of `src/physics/core.wasm` (Alpha C++ RocketSim) vs `src/mvp1/rc_core.wasm` (Rust RocketSim):
-  - `crates/rocketsim/src/sim/car/base.rs` previously did not reset `self.state.flip_rel_torque` on ground or on a zero-dodge-dir stall (`Q+D` / `A+E`), causing stale flip torque from an earlier directional flip to persist into a subsequent stall. Resetting `flip_rel_torque = Vec3A::ZERO` on ground and on zero-dodge-dir stall (`3c5c030`) fixes this.
-  - Added Mouse Left (`boost`) and Mouse Right (`jump`, with canvas `contextmenu` prevented) in `src/mvp1/InputController.ts` to match standard RocketCompanion KBM bindings (`inputBindingValidators.ts`), and added `JUMP` / `FLIP` state flags to the MVP-1 HUD in `src/mvp1/Mvp1App.ts` (`bfc8a88`).
+### 2. PC-to-Phone Push & Transport-Aware 2Hz/1Hz Streaming
+- Added `CellularPushPayload` (`bridge_update`, `llm_stream_progress`) and `e2ee_push` signaling in `apps/p2p-remote-controller/src/types/cellularP2p.ts`, `useCellularP2pHost.ts`, and `useCellularP2pClient.ts`.
+- Added `extractGenerateContentStreamProgress()` in `apps/p2p-remote-controller/src/utils/generateContentStream.ts` (with unit tests in `generateContentStream.test.ts`) to separate `GenerateContent` thinking chunks (trailing `, 1]`) from answer chunks.
+- Added `useCellularHostPushSync` (`apps/p2p-remote-controller/src/hooks/useCellularHostPushSync.ts`) wired in `App.tsx`:
+  - Pushes Bridge approval/chat updates to connected cellular clients.
+  - Streams `GenerateContent` progress at **2 Hz** with `thinkingDelta` / `outputDelta` over `p2p_direct` (auto-collapsing thinking once output starts in `PocketDeckLlmControlTab.tsx`), and at **1 Hz** with `{ thinkingBytes, outputBytes, done }` only over `emqx_cn_relay` (on-demand `Fetch Output` button).
 
-## 3. Boost Pad Collection Visual Desync
-- `crates/rocketsim/src/sim/boost_pad/boost_pad_grid.rs` (`BoostPadGrid::new`) sorts all 34 pads ascending by `(pos.y, pos.x)`.
-- `src/mvp1/ArenaRenderer.ts` previously appended 28 small pads then 6 big pads unsorted, shifting indices for almost every pad after `y = -4096` so collecting one pad dimmed a different pad elsewhere on the field.
-- Sorted `STANDARD_BOOST_PADS` by `(y, x)` in `src/mvp1/ArenaRenderer.ts` to match `BoostPadGrid::new`.
+### 3. Tray Menu Shortcuts & Safari Window Modes
+- Updated `apps/p2p-remote-controller/src-tauri/src/lib.rs`: enabled `.show_menu_on_left_click(true)` and added `Shortcuts` submenu with `EMQX CN (Private)` and `EMQX Global (Private)`.
+- Updated `packages/macos-ax-helper/Sources/MacosAxHelper/SafariController.swift`, `JsonRpcServer.swift`, `apps/p2p-remote-controller/src-tauri/src/commands.rs`, and `apps/p2p-remote-controller/src/services/axService.ts` to support `mode` (`"normal"` | `"popup"` | `"private"`) and optional `width` / `height` bounds.
 
 ## Verification
-- `pnpm run check` (`radar` + `tsc --noEmit`): **PASS** (1397/1397 TS files, 0 errors).
-- `pnpm run env:check`: **PASS** (OverlayFS size: 30 MB / 100 MB budget).
+- `pnpm p2p:check` (`tsc --noEmit && eslint src`): **Passed** (0 errors, 0 warnings).
+- `pnpm --filter p2p-remote-controller test` (`vitest run`): **14 test files, 51 tests passed**.
+- Note: `src-tauri` (Rust) and `MacosAxHelper` (Swift) are not compiled in the Linux sandbox and should be built on macOS with `pnpm p2p:build:app`.

@@ -1,73 +1,81 @@
-# RocketCompanion vNext Wave 3 集成对齐与验证报告
+# P2P Remote Controller：EMQX 断连（1005）、自动重连与手机端离线判定修复报告
 
-**目标分支**：`origin/integration/vnext-core`  
-**Verified Bot Commit**：[`e3488ffb06ea18ee9669d1e9c044247e5ff80294`](https://github.com/Antigravi-ty/RocketCompanion/commit/e3488ffb06ea18ee9669d1e9c044247e5ff80294)（`signature.state: VALID`）
-
----
-
-## 一、关于“9 条分支反向 Merge + Octopus Merge”与业界最佳实践的选型说明
-
-原方案设计了“Wave 3：9 条 W1 分支各自 `merge integration/vnext-core` → Wave 4：9 路 `git merge -s octopus` 一次性合流”。针对我们仓库当前的实际规模（1,457 个 TS 文件、单集成者推进、且必须使用 GitHub Verified Bot Commit）而言，**直接走“分层递进合流（Layered / Stacked Integration onto `integration/vnext-core`）”比 9 路反向同步 + Octopus Merge 更符合业界最佳实践**，原因如下：
-
-1. **Octopus Merge 会在重叠文件上直接中止**：`ReplicationBusProtocol.ts`、`ActivityKernel.ts`、`FreeplayRewinderController.ts`、`scripts/runMultiplayerSuiteTests.ts` 4 个文件存在跨分支修改，`git merge -s octopus` 遇到任何文件级冲突都会拒绝执行。
-2. **避免 9 次冗余合流提交污染历史**：9 条分支各自反向 merge `integration/vnext-core` 后再 9 路合流，会制造大量网状 merge commits；而按 **Transport/Buffer → Modes → Consumers** 3 层依次合入 `integration/vnext-core`，每一层都立即完成协议对齐并跑绿 `pnpm run check` 与单元测试，历史线性清晰、可追溯、可随时回滚。
-3. **契合单仓库规模与 Verified Bot Commit 规范**：最终以干净的 Verified Bot Commit 落地 `origin/integration/vnext-core`，无需向 9 条临时特性分支分别推送 9 次无效的同步提交。
+**Commit**: `5ed3f5489386d5023505af1296ad6f1909d919ec`（分支 `a2`，`signature.isValid: true`）  
+**URL**: https://github.com/Antigravi-ty/agyPreviewInstant/commit/5ed3f5489386d5023505af1296ad6f1909d919ec
 
 ---
 
-## 二、Wave 3 分层落地详情（W1-01 ~ W1-09 全量对齐）
+## 一、`Closed (code 1005)` 是什么？为什么经常断连？
 
-### Layer 1：底层传输与缓冲（`W1-01`、`W1-02`、`W1-09`）
-- **W1-01 (`worker-authority-bus`)**：
-  - 将 `StateFrameSlidingWindow.ts`、`WorkerAuthorityBus.ts`、`AuthoritativeServerWorker.ts`、`scripts/testWorkerAuthorityBus.ts` 中的占位 `WAVE1_CHANNEL1_SCHEMA_HASH` 统一替换为 Wave 2 的 `VNEXT_CHANNEL1_SCHEMA_HASH`（`0x49D215C8`）。
-  - `WorkerAuthorityBus.publishCurrentState()` 在未传入预编码 `payloadBytes` 时，自动调用 `VNextWorldFrameCodec.encode(...)` 输出通道 1 二进制帧（同时修正 `replayCursor.playbackSpeed` 字段引用）。
-- **W1-02 (`timeline-frame-buffer`)**：
-  - `TimelineFrameBuffer.ts` 对齐 `VNextPlaybackState`、`VNextCameraPose` 与 `DecodedVNextWorldFrame`，新增 `pushWorldFrame(worldFrame, snapshotOverride, arrivalMs)` 适配器直接消费通道 1 解码帧。
-- **W1-09 (`bulk-asset-channel`)**：
-  - 清理 `e697bca` 遗留的 2 个废弃文件：`src/network/transport/webrtc/BulkAssetChannel.ts` 与 `src/network/transport/webrtc/bulkAssetAssemblyPipeline.ts`，保留 `src/network/transport/BulkAssetChannel.ts` 与 `BulkAssetProtocol.ts`。
-
-### Layer 2：玩法模式与裁决（`W1-03`、`W1-04`、`W1-05`、`W1-06`）
-- **W1-03 (`mode-match-exhibition`)**：
-  - 解决 `ReplicationBusProtocol.ts` 中 `ACTIVITY_IDS.EXHIBITION` 默认 flags 冲突（保留 `STATE_SNAPSHOT | USER_INPUT | CLOCK_AND_SCORE | FOLLOW_HOST_CAMERA`）。
-  - `MatchExhibitionRosterManifest.ts` 新增 `toVNextRosterManifest()`，接入 `VNextRosterManifestCodec` 与 `computeRosterMetadataHash`。
-- **W1-04 (`mode-freeplay-spectate`)**：
-  - 将 `freeplaySpectateTypes.ts` 中的 `FREEPLAY_W104_TEMP_SCHEMA_HASH` 对齐至 `VNEXT_CHANNEL1_SCHEMA_HASH`。
-- **W1-05 (`mode-replay-watch-together`)**：
-  - `ReplayWatchRosterManifest.ts` 新增 `toVNextReplayRosterManifest()`，接入 `VNextRosterManifest` 与 `computeRosterMetadataHash`。
-- **W1-06 (`mode-training-fpv-dual`)**：
-  - 合并 `scripts/runMultiplayerSuiteTests.ts` 测试入口（保留第 29 节 BulkAssetChannel 与第 30 节 FPV Dual Arbitration）。
-- **架构体积护栏治理**：
-  - 由于 W1-03/04/05 共同扩展了 `src/network/server/activities/ActivityKernel.ts`（合流后达 `18.3 KB`，触发 Radar `18.0 KB` 硬上限），将 `ExhibitionActivityKernel` 拆分为独立领域模块 `src/network/server/activities/ExhibitionActivityKernel.ts`，使 `ActivityKernel.ts` 回落至 `17.2 KB / 503 lines`。
-
-### Layer 3：下游消费端（`W1-07`、`W1-08`）
-- **W1-07 (`consumer-audio-arena`)**：
-  - `src/entities/arena/arenaRosterManifestPipeline.ts` 新增 `fromVNextRosterManifest()` 适配器，直接消费通道 2 `VNextRosterManifest`。
-- **W1-08 (`consumer-hud-camera`)**：
-  - `src/game/pipeline/stages/vnextHudCameraTypes.ts` 新增 `fromCodecRosterManifest()` 与 `fromDecodedWorldFrameToHudHeader()`，将通道 1/2 二进制解码结果直接映射为 HUD 1~6 与 Goal Replay 电影机位消费结构。
+1. **`1005`（`No Status Received`）的含义**：
+   - 根据 RFC 6455 WebSocket 协议，`1005` 不是服务端发来的具体错误码，而是客户端 WebView / 浏览器在 **底层 TCP/TLS 连接被直接断开、但没有收到对方发送带状态码的 WebSocket Close 帧** 时自动合成的关闭码。
+2. **结合你的日志时间线看根因**：
+   - 你的日志里出现了 `16:34:26 -> 17:02:47`（约 28 分钟）和 `17:02:48 -> 02:06:00`（约 9 小时）后触发 `Closed (code 1005)`。
+   - 主要原因有三个：
+     1. **macOS 休眠 / App Nap / 网络切换**：Mac 休眠或切换 Wi-Fi 后，JS 定时器暂停，EMQX 收不到 30s KeepAlive 心跳（`1.5 × 30s = 45s` 超时），EMQX 直接断开死链接；Mac 唤醒后 WebView 检测到 socket 已死，抛出 `code 1005`。
+     2. **网关 / 代理 / EMQX Serverless 空闲回收**：云端负载均衡或 NAT 网关在长连接静默/半开状态下静默丢弃 TCP 映射。
+     3. **旧代码缺少自动重连与心跳超时检测**：`apps/p2p-remote-controller/src/services/emqxClient.ts` 和 `useEmqxConnection.ts` 此前只在 `ws.onclose` 时打印 `DISCONNECTED: Closed (code 1005)`，**没有任何自动重连逻辑**，也没有检查 `PINGRESP` 是否按时返回。
 
 ---
 
-## 三、全量门禁与单测验证结果
+## 二、方案评估：“交错双通道（5 分钟双长连接）” vs “持久化会话 + 自动重连”
 
-所有检查均在 `reset --hard origin/integration/vnext-core`（commit `e3488ff`）后实测通过：
+你提到的思路是：**建立两条交错长连接（间隔 5 分钟）以防止断连漏消息**。从 MQTT 协议与实际网络工程来看，**不建议同时维持两条 WebSocket 长连接**，原因如下：
+- **无法防住同机休眠/断网**：`1005` 绝大多数来自本机休眠或 Wi-Fi 波动，两条连接在同一台 Mac 上会**同时断开**。
+- **双倍流量与配额消耗**：EMQX Serverless 按连接数、消息数和流量计费，双订阅会让所有下发消息、心跳包全部翻倍，且客户端必须对每条消息做去重。
 
-| 检查 / 测试项 | 命令 | 结果 |
-|---|---|---|
-| 架构 Radar + TS 严格编译 | `pnpm run check` | **GREEN**（`1457/1457` TS，0 错误，0 循环依赖，0 越权导入） |
-| Wave 2 协议编解码对齐 | `node --experimental-strip-types scripts/testVNextProtocolAlignment.ts` | **PASS**（`Ch1=0x49D215C8, Ch2=0x9063ED98`） |
-| W1-01 Worker 权威总线 | `node --experimental-strip-types scripts/testWorkerAuthorityBus.ts` | **PASS**（5/5） |
-| W1-02 时间轴插值缓冲 | `node --experimental-strip-types scripts/testTimelineFrameBuffer.ts` | **PASS**（9/9） |
-| W1-03 Match/Exhibition 统一 | `node --experimental-strip-types scripts/testMatchExhibitionUnified.ts` | **PASS** |
-| W1-04 Freeplay 观战流 | `node --experimental-strip-types scripts/testFreeplaySpectateStream.ts` | **PASS**（5/5） |
-| W1-05 Replay Watch Together | `node --experimental-strip-types scripts/testReplayWatchTogether.ts` | **PASS** |
-| W1-08 HUD 1~6 & Goal Replay 相机 | `node --experimental-strip-types scripts/tests/vnextHudCameraConsumer.test.ts` | **PASS**（3/3） |
-| W1-09 Channel 4 大文件通道 | `node --experimental-strip-types scripts/testBulkAssetChannel.ts` | **PASS** |
-| 全量联机回归套件 | `RC_SUITE_WATCHDOG_MS=280000 pnpm run test:multiplayer-suite` | **PASS**（30/30 全部通过） |
+**更好的原生 MQTT 替代方案（本次已直接落地）**：
+1. **固定实例 Client ID + `cleanSession: false`（MQTT 持久化会话）+ QoS 1**：
+   - 之前每次连接都调用 `generateRandomClientId()` 换新 ID 且 `cleanSession = true`，导致断连期间 EMQX 直接丢弃离线消息。
+   - 现在同一运行实例在自动重连时**复用同一个 `clientId`** 并设置 `cleanSession: false`（订阅 QoS 1）。只要不是人工主动断开，短暂掉线期间发布到 `cmd/#`、`chat/#` 的 QoS 1 消息会由 **EMQX Broker 自动暂存**，重连成功瞬间立即补发，**无需双通道也不会漏消息**。
+2. **自动重连 + 指数退避 + `PINGRESP` 看门狗 + 唤醒/联网事件监听**：
+   - 发送 `PINGREQ` 后若 25s 内未收到 `PINGRESP`，主动关闭僵尸 socket 触发重连。
+   - 监听浏览器 `online` 和 `visibilitychange` 事件，Mac 唤醒或网络恢复时**零等待立即重连**，否则按 `2s -> 4s -> 8s -> 15s` 退避重连。
 
 ---
 
-## 四、后续收尾建议（Wave 4）
+## 三、EMQX 点对点独立新账户推荐配置
 
-当前 `origin/integration/vnext-core` 已完成全部 W1 模块合流、协议对齐与 `test:multiplayer-suite` 全绿门禁。后续只需：
-1. 若需更新 `repro:dev-broadcast-v3` 断言以覆盖新通道 1/2 端到端广播链路，可在 `integration/vnext-core` 上补充后直接作为 PR 合入目标主干；
-2. 按《下一轮 Real Device Test 专项验收清单》进行真机 6 人局 Replay、Freeplay 切后台、Exhibition、FPV Dual 与降频带宽实测。
+为了把 `p2p-remote-controller` 的远程控制/P2P 信令与主应用的 Telemetry 彻底隔离，建议在 EMQX 控制台单独创建一个专用账户：
+
+- **推荐用户名（Username）**：`agy_p2p_bridge`（或 `p2p_remote_ctrl`）
+- **推荐 Topic 前缀（Topic Prefix）**：`agy_p2p_v1`（与客户端默认值一致，涵盖 `agy_p2p_v1/cmd/#`、`agy_p2p_v1/resp/#`、`agy_p2p_v1/chat/#`、`agy_p2p_v1/cellular/req/#`、`agy_p2p_v1/cellular/res/#`）
+- **推荐 ACL 权限模式（按顺序从上到下匹配，Allow + Deny 兜底）**：
+  1. **Allow** | Action: `Publish & Subscribe` (`All`) | Topic: `agy_p2p_v1/#`
+  2. **Deny** | Action: `Publish & Subscribe` (`All`) | Topic: `#`
+- **连接注意事项**：Mac 端与手机端共用该用户名即可，两端均使用随机生成的独立 `Client ID`（`p2p_mac_...` 与 `pocket_cell_...`），不会互踢；只需确保 EMQX 未限制单用户名最大连接数 <= 1。
+
+---
+
+## 四、本次代码修复与功能落地（已推送到 `a2`）
+
+### 1. EMQX 实时通信自动重连 & 持久化开关
+- **`EmqxBridgeConfig`**（`apps/p2p-remote-controller/src/types/emqxBridge.ts`、`utils/emqxBridgeUtils.ts`）：
+  - 新增 `autoReconnect: boolean`，**默认 `true`**，通过 `localStorage`（`p2p_emqx_bridge_config_v1`）持久化落盘。
+- **`EmqxWebSocketClient`**（`services/emqxClient.ts`）：
+  - 支持 `cleanSession` 参数，并新增 `PINGRESP` 看门狗（超时主动 `4000: PINGRESP timeout` 关闭僵尸连接）。
+- **`useEmqxConnection`**（`hooks/useEmqxConnection.ts`）：
+  - 区分手动断开与异常断连；异常断连且 `autoReconnect === true` 时，复用同实例 `clientId` + `cleanSession: false` 自动指数退避重连，并监听 `online` / `visibilitychange` 快速恢复。
+- **UI Toggle Switch**：
+  - 在 `EmqxBridgePanel.tsx` 顶部状态栏和 `EmqxBridgeSettingsCard.tsx` 设置卡片中均添加了 **Auto-Reconnect** 开关。
+
+### 2. 手机端（Cellular P2P）主机在线判定 & 自动重连
+- **修复“主机不在线却误显示走 EMQX Relay”的问题**（`utils/cellularP2pConfig.ts`、`hooks/useCellularP2pClient.ts`）：
+  - 新增 `resolveCellularFallbackOutcome` 纯函数与 `hostRespondedRef` 状态追踪。
+  - 手机端收到来自主机的 `webrtc_answer`、`webrtc_ice (from: "host")`、`e2ee_rpc_res` 或 DataChannel 打开时，才标记 `hostResponded = true`；在 `force_relay_only` 模式下也会先发送加密 `ping` 验证主机存活。
+  - 超时（5.5s）后若 `!hostResponded`，**不再切换为 `emqx_cn_relay`**，而是保持 `disconnected` 并明确提示：
+    `Host offline (no response from host via EMQX)`。
+  - 仅当 **主机有回应（在线）但 WebRTC DataChannel 无法建立（NAT/网络状况限制）** 时：
+    - `auto` 模式回退到 `emqx_cn_relay`（提示 `Host online — EMQX CN E2EE Relay active (P2P NAT fallback)`）；
+    - `force_p2p_only` 模式保持 `disconnected`（提示 `Host online, but P2P Direct failed (network/NAT; Relay disabled)`）。
+- **手机端持久化 Auto-Reconnect 开关**：
+  - `MobileCellularSavedAuth` 新增 `autoReconnect`（默认 `true`，落盘到 `p2p_cellular_mobile_auth_v1`）。
+  - 在 `PocketDeckOutputsTab.tsx` 添加 **Auto-Reconnect** 开关；仅在已建立连接后意外掉线时触发自动重连（主机本来就离线时不空转重连）。
+
+---
+
+## 五、验证结果
+
+- `pnpm --filter p2p-remote-controller check`（`tsc --noEmit && eslint src`）：通过（0 errors）
+- `pnpm --filter p2p-remote-controller test`（`vitest run`）：**12 个测试文件、47 个测试用例全部通过**（含新增 `emqxBridgeUtils.test.ts` 持久化测试与 `cellularP2pConfig.test.ts` 主机离线/Relay 判定测试）
+- `pnpm --filter p2p-remote-controller build`（`tsc && vite build`）：构建成功

@@ -10,6 +10,11 @@
 - `[DONE]` **Human Instruction (`human_instruction.md`)**: Finalized bidirectional guide covering parallel-mode high-frequency messaging, soft `"说完了"` / `"over"` turn-taking, interleaving factual questions, and explicit control signals.
 - `[DONE]` **Compaction & Disk Persistence (`compaction_persistence.md`)**: Finalized Agent-only raw buffer with pruning, semantic topic filenames, JSON metadata filtering, and disk stitching for super-large reports.
 - `[DONE]` **Pocket Deck Top-Right Menu & OTA Version Check Scan (`pocket_deck_ota_menu_scan.md`)**: Located root cause in `PocketDeckHeader.tsx` & `PocketDeckView.tsx` (menu button only toggles local state; `activeSnapshot.commitId` only updates on initial P2P connect or manual `Fetch`) and documented fix direction (no repo code modified per user instruction).
+- `[DONE]` **Web Audio Notification Sound & Auditioning Tools (`web_audio_sound_tools.md`)**: Documented zero-file `AudioContext` synthesis in `notificationSounds.ts` and recorded ZzFX / Jsfxr / Tone.js for future sound auditioning.
+- `[OPEN]` **Future Roadmap & Open Items (`future_roadmap_and_open_items.md`)**: Tracked AI Studio `Inject Live Chat` AX path bug and Unified Main Tray + Dedicated AGY Terminal (Multi-Tab PTY) for upcoming discussion.
+- `[IN_PROGRESS]` **Unified Tray, AGY Terminal, Quick Git, Sing-box & Standalone Live Chat App (`unified_tray_terminal_and_control_plane.md`)**: Captured architectural vision for fault-isolated Control Plane (standalone EMQX Live Chat app), Quick Git update/rollback commands, and Sing-box integration.
+- `[OPEN]` **Wide-Screen Layout, Font Scaling & Remote Hotkey (`ui_layout_and_remote_hotkey.md`)**: Recorded 16:9/3:2 Mobile Viewport layout & distance font-size ideas; verified `MacosAxHelper` currently lacks hotkey posting and documented `CGEventPost` + `kCGEventFlagsChanged` feasibility.
+- `[DONE - Scan]` **Pocket Deck Chat Auto-Scroll & Stick-to-Bottom Toggle (`pocket_deck_chat_autoscroll_scan.md`)**: Located missing new-message scroll effect, missing `onScroll` handler, and one-shot `<ArrowDown />` button in `PocketDeckView.tsx`; documented exact state machine.
 
 ---
 
@@ -21,8 +26,8 @@
 Live Chat Protocol (Always Active):
 1. Start & Channel Isolation: Call GET "https://agentlivechatchannel.maboco-mark.workers.dev/help" with headers "Content-Type: application/json" and "x-agy-request-id: <x-agy-request-id from user prompt>" (using curl or explicit User-Agent) to obtain your isolated `channel` and protocol.
 2. Send & Verify: Send chat via POST /chat/send with {"channel":"<ch>","text":"..."} and verify pubackedCount === 1 (retry once if 0).
-3. Continuous Poll & Anti-Premature-Exit: After every reply or step, immediately wait via POST /chat/poll with {"channel":"<ch>","stream":true}. Filter out noisy network metadata (connackCode, pingCount, elapsedMs) so only message text/timestamp enters context. NEVER exit Live Chat on sub-task completion, polite acknowledgments ("ok", "好的", "收到", "谢谢"), or unpunctuated short voice messages. On 408 WAIT_TIMEOUT, retry up to 3 CONSECUTIVE times (resetting the timeout counter to 0 on every user reply; only checkpoint & wrap up after 3 consecutive timeouts with no user response). Exit ONLY when the user explicitly issues an end-session command (e.g. "结束会话", "end live chat", "exit chat").
-4. Parallel Tool Calls: NEVER call /chat/send and /chat/poll in the same parallel batch (always send -> verify pubackedCount === 1 -> then poll). You MAY run /chat/poll in parallel with read-only tasks (code search, file reads, env checks); explicitly announce in chat when parallel scanning starts ("you can send messages anytime") and when it finishes.
+3. Continuous Poll & Anti-Premature-Exit: At the end of every reply, alignment checkpoint, or completed task phase, immediately wait via POST /chat/poll with {"channel":"<ch>","stream":true}. (During active multi-step execution, you MAY send non-blocking progress updates via /chat/send and immediately proceed to the next step without waiting for /chat/poll.) Filter out noisy network metadata (connackCode, pingCount, elapsedMs) so only message text/timestamp enters context. NEVER exit Live Chat on sub-task completion, polite acknowledgments ("ok", "好的", "收到", "谢谢"), or unpunctuated short voice messages. On 408 WAIT_TIMEOUT, retry up to 3 CONSECUTIVE times (resetting the timeout counter to 0 on every user reply; only checkpoint & wrap up after 3 consecutive timeouts with no user response). Exit ONLY when the user explicitly issues an end-session command (e.g. "结束会话", "end live chat", "exit chat").
+4. Parallel Tool Calls: NEVER call /chat/send and /chat/poll in the same parallel batch (always send -> verify pubackedCount === 1 -> then poll). You MAY run /chat/poll in parallel with long read-only tasks (code search, file reads, env checks), but do NOT pair a 270s /chat/poll with a fast 2-second check if you intend to immediately report the result; explicitly announce in chat when parallel scanning starts ("you can send messages anytime") and when it finishes.
 5. Voice-Input Tolerance & Turn-Taking: Expect unstable voice dictation (homophones, typos, missing punctuation). Infer intent from context and confirm ambiguous identifiers rather than guessing or aborting. Allow interleaving/bursts: wait for soft end-of-burst cues ("说完了" / "over") during multi-part thoughts, while answering self-contained factual questions immediately.
 6. Disk Persistence & Compaction Recovery: Continuously persist raw user requirements and categorized semantic topic files (with [DONE]/[OPEN] status, outside the tracked repo, e.g. `/workspace/.live_chat/`). If context compaction occurs, immediately restore state from those semantic files, briefly notify the user in chat that compaction occurred and state was restored, then continue /chat/poll.
 7. Alignment & Git Safety: Always align in chat and announce briefly before modifying code; push code only via Verified Bot Commit (never local git push).
@@ -120,3 +125,118 @@ Unlike single-prompt tasks, Live Chat sessions generate **most of their concrete
 - Add an `onOpenMenu` (or `onCheckHostVersion`) callback prop to `PocketDeckHeader` invoked when `menuOpen` transitions from `false` -> `true`.
 - In `PocketDeckView`, when `!embedded && !wsConnected && p2pConnected`, trigger `fetchP2pSnapshot()` (or a lightweight version/manifest query) on menu open so `activeSnapshot.commitId` and `hasHostUpdate` refresh immediately.
 - Optional: debounce/throttle menu-open checks (e.g. 3–5s) to avoid redundant P2P RPC traffic on rapid toggles.
+
+---
+
+# Pocket Deck Chat Auto-Scroll & Stick-to-Bottom Toggle Scan
+
+## Problem Statement
+On mobile Pocket Deck (`PocketDeckView.tsx`), incoming messages do not auto-scroll to the bottom, and the `<ArrowDown />` ("Scroll to bottom") button is only a one-shot scroll rather than a coupled auto-follow toggle.
+
+## Code Location & Root Cause (`apps/p2p-remote-controller/src/components/PocketDeckView.tsx`)
+1. **Missing new-message auto-scroll effect**:
+   - Currently `scrollContainerRef.current.scrollTop = scrollHeight` only runs when switching into `mode === "bridge"` (lines 192–200) or when the textarea height changes while already near bottom (lines 204–224). There is **no effect** triggered by incoming `chatMessages` updates.
+2. **One-shot `<ArrowDown />` button (lines 974–986)**:
+   - Clicking `<ArrowDown />` only calls `el.scrollTo({ top: el.scrollHeight, behavior: "smooth" })` and does not track or toggle a `stickToBottom` state.
+3. **Missing `onScroll` listener on `scrollContainerRef` (line 885)**:
+   - Manual scroll-up cannot disengage auto-follow because `scrollContainerRef` has no `onScroll` handler.
+
+## Expected State Machine (For Future Implementation)
+- Introduce `stickToBottom` state (default `true`, visually indicated on `<ArrowDown />` or active/inactive state).
+- **On incoming messages**: if `stickToBottom === true`, scroll `scrollContainerRef` to bottom.
+- **On manual scroll (`onScroll`)**: if user scrolls up away from bottom (`scrollHeight - scrollTop - clientHeight > threshold`), set `stickToBottom = false`.
+- **On clicking `<ArrowDown />`**: scroll to bottom and set `stickToBottom = true`.
+- **On sending a chat message**: set `stickToBottom = true` and scroll to bottom.
+
+---
+
+# Web Audio Notification Sound Architecture & Synthesis Tools
+
+## 1. Current Implementation (`apps/p2p-remote-controller/src/utils/notificationSounds.ts`)
+- Zero external audio files (`.mp3` / `.wav`); synthesized in real time via Web Audio API (`AudioContext` + `OscillatorNode` + `GainNode` + `DynamicsCompressorNode`).
+- Presets:
+  - `chime` (Soft Chime C5-E5): dual `sine` waves (`523.25 Hz` -> `659.25 Hz`, 0.11s offset)
+  - `ping` (Crystal Ping): `triangle` wave (`880 Hz`)
+  - `marimba`: triple `triangle` arpeggio (`523.25` -> `659.25` -> `783.99 Hz`)
+  - `alert` (Double Alert): dual `sine` waves (`783.99 Hz` x2)
+- Previewable in `EmqxBridgeSettingsCard.tsx` (`Notification Sound & Boost`).
+
+## 2. Zero-File / Low-Effort Sound Synthesis Tools (For Future Auditioning)
+- **ZzFX** (`https://killedbyapixel.github.io/ZzFX/`): Interactive web auditioning & random generator; exports a single tiny array of parameters (tens of bytes) to reproduce any sound.
+- **Jsfxr** (`https://sfxr.me/`): Classic browser-based sound generator with presets and minimal JS export.
+- **Tone.js** (`https://tonejs.github.io/`): Richer Web Audio synth presets (e.g., PolySynth, PluckSynth, FMSynth with filters/reverb) with interactive docs.
+
+---
+
+# Unified Tray + AGY Terminal + Standalone EMQX Live Chat Control Plane
+
+## 1. Core Architectural Vision
+Separate the **Control Plane** (always-on, stable) from **Managed Target Apps / Repos** (`agyPreviewInstant`, `p2p-remote-controller`, `Sing-box`, etc.), so that a broken `git checkout` or crash in any managed app never takes down remote communication or recovery capabilities.
+
+## 2. Key Subsystems
+1. **Standalone EMQX Live Chat Application**:
+   - Extract the now-stable EMQX Live Chat into its own standalone `.app` bundle with auto-reconnect to EMQX Live.
+   - Built-in management capabilities: dispatch commands to inspect error logs, trigger repo `checkout` / updates, or roll back a broken commit even when target apps fail to launch.
+   - Fault isolation: updating `p2p-remote-controller` only restarts `p2p-remote-controller`; updating `agyPreviewInstant` only restarts `agyPreviewInstant`; the Live Chat Control Plane stays untouched.
+2. **Unified Main Tray + Dedicated AGY Terminal (Multi-Tab PTY)**:
+   - **Process Tree & Tray Design Options (No Circular Launch)**:
+     - *Option 1 (Tray Built into `AGY Terminal.app` — Single Root)*: `AGY Terminal.app` hosts the system tray + multi-tab PTY UI (window can close to tray). Clicking a project in the tray opens a PTY Tab inside `AGY Terminal` to run `tauri dev` (`flock` dedup by `identifier`). Only one `.app` needs macOS AX permission.
+     - *Option 2 (`Global Remote Controller.app` + `AGY Terminal.app` Split — Max Fault Isolation)*: `Global Remote Controller.app` hosts Tray + EMQX Live Chat + Sing-box + Quick Git, and commands `AGY Terminal.app` via local IPC to open PTY Tabs for `tauri dev`. Even if `AGY Terminal` crashes or breaks during UI edits, the Control Plane stays online (requires one-time AX grant on both `.app` bundles).
+   - **Security & Permission Isolation**: Because every `tauri dev` child process stays inside `AGY Terminal.app`'s process tree, all dev apps cleanly inherit `AGY Terminal.app`'s macOS AX permission without granting broad AX permissions to the global system `Terminal.app`.
+   - **Quick Git / Remote Commit Sync**:
+     - Remote `checkout` / update / rollback commands (no local commit push needed).
+     - **Commit Graph Visualization (Mobile & Remote)**: Display branch topology (divergent branches from parallel Agents, octopus merges, commit parents) so mobile/remote users can see the exact graph structure before checking out a commit rather than only seeing a bare commit hash.
+3. **Remote Co-Debugging & Direct Log Inspection (Cloud Linux Agent <-> Local macOS)**:
+   - **Rationale**: Cloud Linux sandboxes cannot realistically simulate macOS (TCC/AX, Safari, WebView, Swift helpers). Instead of asking the Human to manually copy-paste logs, the Agent should directly issue remote commands to read `AGY Terminal` PTY output or target log files.
+4. **Controller Split Analysis (`Safari Remote Controller` vs `Global Remote Controller`)**:
+   - **Option A (Two Apps / Fault-Isolated)**: Keep `Global Remote Controller` (hosting EMQX Live Chat, AGY Terminal control, Quick Git, Sing-box, and log reader) as a minimal, rarely-changed Control-Plane `.app`, and separate `Safari Remote Controller` (Safari AX/JS/Net Recorder) as a managed target app. If a Safari-controller edit breaks build/startup, the Global Controller remains online to read build logs and roll back via Quick Git.
+   - **Option B (Single App)**: Lower packaging overhead, but a broken UI/build in Safari features could take down the Live Chat / Terminal controller too.
+5. **Sing-box (`sing-box`) Network Service Integration**:
+   - Integrate `sing-box` lifecycle management directly into the same unified tray / terminal control plane.
+6. **Log Capture & Tray Execution Model**:
+   - **Terminal Logs vs. Web Console (Do NOT rely on AX for logs)**:
+     - *Terminal Logs*: Since `AGY Terminal` owns the `portable-pty` master fd in Rust, tee `stdout`/`stderr` directly into a ring buffer / log file—100% lossless and far more reliable than macOS AX screen scraping.
+     - *Web Console*: macOS AX cannot reliably read internal JS `console.log`/`error` stacks; use lightweight frontend console hooks or `execute_javascript` forwarding over IPC/EMQX.
+   - **Tray Launch Strategy (Hybrid)**:
+     - *Via AGY Terminal PTY Tab* (for interactive/dev processes like `agy:dev`, `p2p:dev`): preserves full TTY (colors, interactive keys), lets humans inspect/take over anytime, and inherits `AGY Terminal.app` AX permissions.
+     - *Via Direct Background Spawn* (for daemons & one-shot CLI like `sing-box`, `git checkout`, `git log`): lightweight, zero UI clutter, stdout/stderr piped to log buffer.
+
+---
+
+# UI Layout, Remote Hotkey & LAN Synced Dictation
+
+## 1. `[OPEN]` Wide-Screen PC Layout for Mobile Viewport (16:9 / 3:2)
+- Current vertical stacking underutilizes horizontal space on PC 16:9 / 3:2 screens, while naive horizontal layout feels awkward.
+- Needs a dedicated responsive multi-pane / adaptive layout design later.
+
+## 2. `[DROPPED]` Global Distance-Reading Font Scaling on PC
+- User decided against forcing large-font distance reading on PC screens—reading directly on the phone (Pocket Deck) is superior.
+
+## 3. `[OPEN - High Value, LAN-Only]` Remote Mac Dictation Hotkey + Real-Time Synced Input Box
+- **User Scenario**: When on LAN (at home/office, away from the desk), use the phone (Pocket Deck) to read output, while triggering the superior **Mac dictation engine** remotely instead of using iOS dictation.
+- **Scope**: **LAN-only** (not supported over remote P2P/EMQX relay, avoiding EMQX quota waste on keystroke-level sync).
+- **Two Coupled Features**:
+  1. **Remote Hotkey Trigger (`CGEventPost`)**: Phone taps a button -> LAN WS -> PC Host focuses the target input box and triggers `MacosAxHelper` (`send_hotkey` via `CGEventPost` + `kCGEventFlagsChanged` for `Control + Command`).
+  2. **Real-Time Synced Input Box**: Text dictated into the Mac input box syncs live over LAN WebSocket back to the phone's input box, where the user can review/edit and tap Send.
+- **Feasibility Evaluation**:
+  - **Latency & Cost**: LAN WS has <5ms latency and zero EMQX quota cost, ideal for real-time `onChange` text mirroring.
+  - **Focus Guarantee (No external AX traversal needed)**: Since the synced input lives inside our own Tauri app (`p2p-remote-controller`), do NOT rely on external macOS AX tree traversal to locate it. Instead: (1) Rust `app.webview_windows()` calls `show()` + `set_focus()` to bring the app window to OS foreground; (2) Frontend focuses the input via React `ref.current?.focus()` on event; (3) optionally add `data-ui-action` / `aria-label` so Self UI scanner can also index it; (4) then invoke `CGEventPost` to start Mac dictation.
+  - **Permission**: `CGEventPost` reuses the existing macOS Accessibility (AX) permission.
+
+---
+
+# Future Roadmap & Open Items
+
+## 1. `[OPEN]` AI Studio `Inject Live Chat` Auto-Injection Path Bug
+- **Symptom**: Clicking `Inject Live Chat` in `SafariControlStrip` fails when performing macOS AX injection against a real AI Studio window (AX path misaligned and missing complete Automation trajectory).
+- **Next Step**: Run `scan_window` on a live AI Studio Safari window to verify exact AX `role`/`title` paths and fix the injection sequence.
+- **Current Workaround**: Copy/paste the instruction manually from the bottom of the Self UI tab.
+
+## 2. `[OPEN]` Unified Main Tray + Dedicated AGY Terminal (Multi-Tab PTY)
+- **Goal**: Build a lightweight unified system tray + multi-tab pseudo-terminal app (Rust `portable-pty` + `xterm.js`), packaged as a fixed `.app` bundle with one-time macOS Accessibility (AX) permission.
+- **Mechanism**: Dev child processes launched from this terminal automatically inherit macOS AX permissions, deduplicate via `flock` (keyed by `identifier`), and sync the managed process whitelist to P2P Remote Controller via Rust IPC.
+- **Status**: Expanded in `unified_tray_terminal_and_control_plane.md`.
+
+## 3. `[OPEN]` Live Chat Worker `POST /chat/send_and_poll` Endpoint
+- **Idea**: Add an optional combined `POST /chat/send_and_poll` endpoint to `agentlivechatchannel` Worker to cut standard conversational turns from 2 tool calls to 1.
+- **Coexistence Rule**: Keep standalone `/chat/send` (fire-and-forget progress updates during active coding without blocking 4m30s) and standalone `/chat/poll` (silent listen & `408` retries).

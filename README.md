@@ -1,33 +1,23 @@
-# Deferred / Future Backlog Report (后续待办清单)
+# Live Chat Communication Cadence (`ack-before-work`) Retrospective
 
-> Generated at end of Live Chat session (2026-11-23). Items listed here were explicitly deferred and **not** implemented in this session.
+## 1. Problem Observed
+During rapid Live Chat iteration, when Chief went straight into multi-step background execution (cloning repos, reviewing sub-agent diffs, running `tsc`/`vitest`/`cargo check`, pushing GraphQL commits) without sending a brief notice first, the user experienced 30–120 seconds of silence and repeatedly wondered whether their client had disconnected (*"我是不是又掉线了？"*).
 
-## 1. Remaining Monorepo Absorptions (逐个吸收 + 逐个真机验证)
-- **P2PBrowser**: Absorb into `apps/p2p-browser` with dedicated Vite port `1424`, verify `cargo check` + local SOCKS5 listen in sandbox, then Mac real-device WebView/proxy verification.
-- **SingboxGUIV0**: Absorb into `apps/singbox-gui` with dedicated Vite port `1425`; requires `sing-box` binary path resolution and root/TUN/Network Extension permission handling on Mac.
-- **Mac Real-Device Verification**: User to verify newly absorbed `apps/quick-git` (`1423`) and updated `Unified Tray` (`Runner Apps Dir` config, native `●/○` submenu, `ax-terminal` auto-launch) on Mac.
+## 2. Root Cause
+- In synchronous HTTP/MQTT Live Chat, the user has no visibility into tool calls happening inside the agent sandbox.
+- Any silent gap >15–20 seconds feels indistinguishable from a dropped WebSocket (`Close code 1005`) or crashed worker.
+- Additionally, splitting `send` and `poll` into two separate tool calls introduced extra round-trip latency between replying and resuming listening.
 
-## 2. `Unified Tray` & `p2p-remote-controller` Follow-ups
-- Migrate `Shortcuts` (`EMQX CN (Private)` / `EMQX Global (Private)`) from legacy `p2p-remote-controller` tray into `Unified Tray` or main UI if still needed.
-- Finalize any UX polish for `Runner Apps Dir` first-run onboarding on Mac.
+## 3. Rules & Patterns Adopted
+1. **Mandatory `ack-before-work` Rule**:
+   - **Always send a brief 1–2 line notice BEFORE** starting any multi-step background action (diff review, test/build suite, GraphQL merge, or long report generation), stating what is being done and roughly how long it will take.
+   - **Skip extra interim ACKs** only for fast (<3s) read-only checks or direct Q&A.
+2. **Single-Call `POST /chat/send_and_poll`**:
+   - Combined reply + listen into one atomic `send_and_poll` call (`--max-time 150`, `stream: true`, `NotificationTimeoutSeconds: 170`), eliminating the unmonitored gap after sending a message.
+3. **Context Compaction Transparency & Disk Persistence**:
+   - Persisted key decisions and open backlogs to `/workspace/.chat/backlog_notes.md`.
+   - Explicitly informed the user in Live Chat immediately after context compaction occurred, preventing silent drift.
 
-## 3. `agyWorker` & Live Chat Infrastructure
-- **GitHub Token Proxy & Cascading Revocation**: Implement `POST /github/token` proxy with DO tracking, cascading `DELETE /installation/token` on sub-agent revocation, and irreversible salted-hash sub-channels (resolving the 6 open `[?]` design questions from earlier report `2dc9d7f`).
-- **MQTT `/chat/send` Reliability**: Fix 5s timeout false-positive `ok: true` when `pubackedCount === 0` (report `820b2e1`).
-- **EMQX Active Dead-Socket Probe**: Add active `PINGREQ -> PINGRESP` deadline probe (e.g. 5s timeout + immediate reconnect) or Dual EMQX failover to eliminate silent `Close code 1005` drops.
-- **External Cloud `.chat` Persistence**: Move `.chat/*` session memory to an agent-accessible external cloud store so sandbox `/workspace` resets never wipe conversation history.
-
-## 4. Multi-Agent Coordination & Governance
-- Finalize multi-agent naming conventions (`atlas`, `orion`, `vega`, `nova` vs `atlas-1`/`atlas-2`).
-- Implement branch-locking / file-ownership rules for concurrent sub-agents.
-- Define cross-sub-agent communication policy (direct vs hub-and-spoke through Chief, channel ACL boundaries).
-
-## 5. Product & Feature Backlog
-- **PC Wide-Screen (16:9 / 3:2) + Chief-Pushed Todo Board**: Responsive wide-screen layout paired with a Chief-pushed Todo/Backlog pane (completed items use `strikethrough` first and are only deleted after explicit user confirmation).
-- **AI Studio `Inject Live Chat` AX Path Calibration**: Live Safari `scan_window` calibration.
-- **Standalone EMQX Live Chat `.app`**: Fault-isolated control plane (reserved `emqx-live-chat` slot already added in `Unified Tray`).
-- **LAN-Only Remote Mac Dictation Hotkey**: `CGEventPost` + real-time synced input box.
-- **Cross-Platform Expansion**: 5-in-1 monorepo + Windows CI + macOS->Windows H.265 ROI + custom MITM.
-
-## 6. Operational Guardrail
-- **Repo Redirect Check**: If a GitHub repository redirect is detected during `git clone`, the agent should immediately question/remind the user to verify that their `user initial input` points to the updated repository URL.
+## 4. Recommendations for Future Instructions
+- **System / Agent Instruction**: Codify `ack-before-work` as a hard pre-condition before any tool chain expected to exceed ~10 seconds, and standardize `send_and_poll` as the default turn-closing call.
+- **Human Instruction**: Encourage users to end multi-part voice dictation with an explicit completion cue (e.g., *"说完了"*) when batching thoughts, and reassure them that brief `"去跑检查，1分钟回"` messages mean the agent is actively working, not idle.

@@ -1,92 +1,66 @@
-# Detailed Bug Report: `Antigravi-ty/agyWorker` (`/chat/send` False-Positive `ok: true` on 5s Timeout & `MQTT_SOCKET_CLOSED`)
+# Architecture Proposal: Sub-Agent Token Proxy, Cascading GitHub Revocation & Irreversible Sub-Channel Isolation
 
-- **Repository**: `Antigravi-ty/agyWorker` (`main` @ `d29118e`)
-- **File**: `workers/agentlivechatchannel/src/worker.mjs`
-- **Severity**: Medium (silent message drop if caller only checks `ok: true`)
-
----
-
-## 1. Observed Symptoms in Live Chat
-
-1. **`POST /chat/send` 5s Timeout with False `ok: true`**:
-   ```json
-   {
-     "ok": true,
-     "timedOut": true,
-     "connackCode": null,
-     "subacked": false,
-     "pubackedCount": 0,
-     "pingCount": 0,
-     "elapsedMs": 5000,
-     "received": []
-   }
-   ```
-   The TLS/MQTT handshake to EMQX exceeded 5000ms, so `CONNACK` never arrived and the message was **never published** (`pubackedCount: 0`), yet the Worker returned **HTTP 200 with `ok: true`**.
-2. **`POST /chat/poll` `MQTT_SOCKET_CLOSED`**:
-   ```json
-   {
-     "type": "result",
-     "ok": false,
-     "errorCode": "MQTT_SOCKET_CLOSED",
-     "timedOut": false,
-     "connackCode": null,
-     "subacked": false,
-     "pubackedCount": 0,
-     "pingCount": 1,
-     "elapsedMs": 13563
-   }
-   ```
-   The underlying `cloudflare:sockets` TCP stream to EMQX closed early (~13.5s in), forcing the caller to reconnect `chat/poll`.
+- **Target Repo**: `Antigravi-ty/agyWorker` (`workers/agentlivechatchannel`) + `getgithubapptoken` Worker
+- **Status**: Design Proposal & Open Questions (for review)
 
 ---
 
-## 2. Root Cause Analysis in `worker.mjs`
+## 1. Problem Statement
 
-### Bug A: `runMqttSession` returns `ok: true` even when `publishMessages` failed (`pubackedCount === 0`)
-- **Location**: `workers/agentlivechatchannel/src/worker.mjs`, lines `512–522`:
-  ```js
-  return {
-    ok: !socketClosedEarly || received.length > 0,
-    ...(socketClosedEarly && received.length === 0 ? { errorCode: "MQTT_SOCKET_CLOSED" } : {}),
-    timedOut,
-    connackCode,
-    subacked,
-    pubackedCount: pubacked.length,
-    pingCount,
-    elapsedMs: Date.now() - startedAt,
-    received,
-  };
+1. **Over-privileged GitHub Token Issuance**:
+   - Currently, sub-agents receive Chief's admin `x-agy-request-id` in their Initial Input solely to call `https://getgithubapptoken.maboco-mark.workers.dev/`.
+   - If a sub-agent is compromised, misbehaves, or is revoked via `POST /agents/revoke`, its 1-hour `ghs_...` GitHub App installation token remains valid and untraceable.
+2. **Sub-Channel Collision & Predictability**:
+   - Reusing static channel names like `ch_code_a2_worker1` across sessions/days risks collisions with stale/zombie agents waking up late.
+   - Using predictable prefixes derived directly from the Chief <-> Human channel without a secret/salt could risk leaking or guessing the parent channel.
+
+---
+
+## 2. Proposed Architecture
+
+### A. Worker Proxy for GitHub App Tokens + DO Tracking + Cascading Revocation
+1. **New Endpoint on `agentlivechatchannel`**: `POST /github/token`
+   - **Auth**: Accepts any valid, non-revoked `x-agy-request-id` (`agy_sub_...` or admin).
+   - **Flow**:
+     1. Worker validates `identity` via DO `/auth` (rejects `401` if revoked).
+     2. Worker calls `getgithubapptoken.maboco-mark.workers.dev/` using a Worker-only secret (`env.GITHUB_TOKEN_GATEWAY_SECRET` or `env.ADMIN_REQUEST_ID`) — **sub-agents never see Chief's admin ID**.
+     3. Worker records `(id, agent_id, sub_token, ghs_token, expires_at, revoked)` into a new DO SQLite table `github_tokens` (expires_at = `now + 3600s` or parsed from GitHub response).
+     4. Worker returns `{ ok: true, token: ghs_token, expiresAt }` (or raw text if `?raw=1`).
+2. **Cascading Revocation on `POST /agents/revoke`**:
+   - When an admin revokes a sub-agent (`token` or `agentId`):
+     1. Mark the agent `revoked = 1` in `agents`.
+     2. Query all non-revoked, non-expired `ghs_token` rows for that `token` / `agent_id` in `github_tokens`.
+     3. For each active `ghs_token`, call:
+        ```http
+        DELETE https://api.github.com/installation/token
+        Authorization: Bearer <ghs_token>
+        User-Agent: agyWorker
+        ```
+     4. Mark those rows `revoked = 1` and return `{ ok: true, revokedGithubTokens: count }`.
+
+### B. Irreversible Hash-Derived Sub-Channel IDs
+- **Formula**:
   ```
-- **Why it happens**:
-  - `ok` only checks `!socketClosedEarly || received.length > 0`.
-  - When `timedOut === true` and `socketClosedEarly === false`, `ok` evaluates to `true` even if `publishMessages.length > 0` and `pubacked.length === 0` (or `connackCode === null`).
-  - Any client/agent that checks `if (res.ok)` without also asserting `res.pubackedCount > 0` will silently lose outbound messages!
-
-### Bug B: Tight 5000ms `waitMs` on `/chat/send` and `/chat/send_and_poll` without retry
-- **Location**:
-  - `/chat/send`: lines `1107–1109` (`waitMs: 5000, pollIntervalMs: 5000`)
-  - `/chat/send_and_poll`: lines `1228–1229` (`waitMs: 5000, pollIntervalMs: 5000`)
-- **Why it happens**:
-  - Each `/chat/send` opens a fresh ephemeral `cleanSession: true` TCP+TLS+MQTT connection to EMQX.
-  - Under transient EMQX or Cloudflare edge latency, TLS + `CONNACK` + `PUBACK` can exceed 5000ms, hitting `waitMs` before `CONNACK` arrives.
-
-### Observation C: `MQTT_SOCKET_CLOSED` on `/chat/poll`
-- **Location**: line `514` (`errorCode: "MQTT_SOCKET_CLOSED"`).
-- **Why it happens**:
-  - EMQX or Cloudflare Workers' `cloudflare:sockets` occasionally closes an idle/long-lived TCP socket before `waitMs` (`270000ms`).
-  - Returning `ok: false` + `errorCode: "MQTT_SOCKET_CLOSED"` is actually **correct** here, and callers should immediately re-issue `POST /chat/poll`.
+  channel = "ch_sub_" + SHA256(chiefChannel + ":" + agentId + ":" + randomSalt128bit).slice(0, 10)
+  ```
+- **Properties**:
+  1. **One-way (Irreversible)**: Even if a sub-agent knows `ch_sub_<10hex>` and its own `agentId`, it cannot reverse-engineer `chiefChannel` (`ch_dc28ee43`) without `chiefChannel` and `randomSalt128bit`.
+  2. **Zero Cross-Session Collision**: Every session / agent spawn uses a fresh `randomSalt128bit`, guaranteeing zero overlap with yesterday's or zombie agents' channels.
+  3. **DO Enforcement**: `agents.allowedChannels` strictly binds the sub-agent to `[ch_sub_<10hex>]`, so it can never subscribe or publish to `ch_dc28ee43`.
 
 ---
 
-## 3. Recommended Fixes
+## 3. Open Questions & Edge Cases to Confirm (?)
 
-1. **Fix `ok` & `errorCode` in `runMqttSession` when publishing**:
-   - If `publishMessages.length > 0 && pubacked.length < publishMessages.length`:
-     - Set `ok: false`
-     - Set `errorCode: connackCode === null ? "MQTT_CONNECT_TIMEOUT" : "MQTT_PUBLISH_TIMEOUT"` (and return HTTP `502` or `504` or `ok: false` consistently).
-2. **Increase `/chat/send` `waitMs` & add 1 lightweight internal retry**:
-   - Bump `waitMs` on `/chat/send` (and the publish phase of `/chat/send_and_poll`) from `5000` to `10000` (or `12000`).
-   - Optionally retry once inside `/chat/send` if `connackCode === null` (safe because `CONNACK` never happened, so the message could not have been published twice).
-3. **Caller-side best practice (already applied by Chief Agent)**:
-   - Always assert `ok === true && pubackedCount > 0` on `/chat/send` and retry on `pubackedCount === 0`.
-   - Immediately reconnect `/chat/poll` on `MQTT_SOCKET_CLOSED`.
+1. **[?] `getgithubapptoken` Worker Auth**:
+   - Currently `getgithubapptoken` authenticates via `x-agy-request-id`. Should `agentlivechatchannel` hold Chief's `x-agy-request-id` as a Wrangler Secret, OR should `getgithubapptoken` accept a dedicated Worker-to-Worker shared secret (`X-Worker-Proxy-Secret`) so Chief's ID isn't overloaded?
+2. **[?] GitHub Token Repository & Permission Scoping**:
+   - Does `getgithubapptoken` currently support passing `?repositories=agyDevKit` or `permissions` in the request body? If yes, DO `agents` table could also store `allowedRepos` so a sub-agent working on `agyDevKit` cannot even touch `agyWorker` or `Outputs`!
+3. **[?] Token Caching vs. Fresh Issue per Call**:
+   - Should `POST /github/token` issue a fresh `ghs_...` every time (simpler, but more rows to `DELETE` on revoke), or reuse the latest cached `ghs_...` for that `agent_id` if remaining TTL > 10 minutes (fewer GitHub API calls + faster revocation)?
+4. **[?] `DELETE /installation/token` Timeout & Error Handling**:
+   - During `POST /agents/revoke`, if GitHub API is slow or a token already expired (`401`), the Worker should treat `401`/`404` as already-revoked and use `Promise.allSettled` with a short timeout (e.g. 3s) so `/agents/revoke` never blocks.
+5. **[?] Storing `ghs_...` in DO SQLite**:
+   - Should `github_tokens` store the `ghs_...` plaintext (needed to call `DELETE /installation/token`) encrypted with a Worker AES-GCM key (`env.TOKEN_ENC_KEY`) or is DO's isolated per-account storage sufficient since it's never returned to list endpoints?
+6. **[?] Should Sub-Agent Branch Restrictions Be Enforced at GitHub Proxy Level?**:
+   - Currently `allowedBranches` (`["a2-*"]`) is declarative/advisory in `agyWorker`. Note that GitHub App installation tokens cannot restrict by branch name natively, so branch isolation still relies on Chief review + GitHub branch protection rules on `a2`/`main`.

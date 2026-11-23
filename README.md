@@ -1,23 +1,39 @@
-# Live Chat Communication Cadence (`ack-before-work`) Retrospective
+# Session Completion Report (完工报告)
 
-## 1. Problem Observed
-During rapid Live Chat iteration, when Chief went straight into multi-step background execution (cloning repos, reviewing sub-agent diffs, running `tsc`/`vitest`/`cargo check`, pushing GraphQL commits) without sending a brief notice first, the user experienced 30–120 seconds of silence and repeatedly wondered whether their client had disconnected (*"我是不是又掉线了？"*).
+> Branch: `a2` | Verified Bot Commits | All Sandbox Checks Green
 
-## 2. Root Cause
-- In synchronous HTTP/MQTT Live Chat, the user has no visibility into tool calls happening inside the agent sandbox.
-- Any silent gap >15–20 seconds feels indistinguishable from a dropped WebSocket (`Close code 1005`) or crashed worker.
-- Additionally, splitting `send` and `poll` into two separate tool calls introduced extra round-trip latency between replying and resuming listening.
+## 1. Completed Deliverables on `a2`
+1. **`Unified Tray` Presets & Disabled State (`f24fb09`, via `atlas`)**
+   - Added optional `disabled?: boolean` and `disabledReason?: string` to `PresetWorkload` (`packages/control-protocol`).
+   - Replaced `pocket-deck-dev` with `agy-preview-instant` (`pnpm agy:dev`).
+   - Added reserved `emqx-live-chat` (`disabled: true`) and marked `rocket-companion` (`disabled: true`), with red status indicator, reason banner, disabled controls, and `Start All` skip logic.
+   - Read-only scanned `apps/p2p-remote-controller/src-tauri/src/lib.rs` (confirmed zero global shortcuts registered).
 
-## 3. Rules & Patterns Adopted
-1. **Mandatory `ack-before-work` Rule**:
-   - **Always send a brief 1–2 line notice BEFORE** starting any multi-step background action (diff review, test/build suite, GraphQL merge, or long report generation), stating what is being done and roughly how long it will take.
-   - **Skip extra interim ACKs** only for fast (<3s) read-only checks or direct Q&A.
-2. **Single-Call `POST /chat/send_and_poll`**:
-   - Combined reply + listen into one atomic `send_and_poll` call (`--max-time 150`, `stream: true`, `NotificationTimeoutSeconds: 170`), eliminating the unmonitored gap after sending a message.
-3. **Context Compaction Transparency & Disk Persistence**:
-   - Persisted key decisions and open backlogs to `/workspace/.chat/backlog_notes.md`.
-   - Explicitly informed the user in Live Chat immediately after context compaction occurred, preventing silent drift.
+2. **`Unified Tray` Native Menu, Dynamic Submenu, Runner Path Config & Legacy Tray Removal (`d24b48c`)**
+   - **Native Tray Menu (`apps/unified-tray/src-tauri/src/main.rs`)**:
+     - Displays `●` (active) / `○` (stopped) status dot per preset, updated on action and via 3s background refresh loop.
+     - Dynamic 2-state `Submenu`: when stopped (`○`) shows **`Start`** only; when running (`●`) shows **`Stop (SIGINT)`** and **`Force Stop`** only. Disabled presets render as disabled items.
+   - **Runner App Path Resolution (`apps/unified-tray/src-tauri/src/ipc_client.rs` & `App.tsx`)**:
+     - Removed hardcoded personal volume path from git so no local machine path is leaked in the repository.
+     - Resolution order: `AGY_APPS_DIR` env var -> persisted `apps_dir.txt` in `default_state_dir()` -> `/Applications` -> `~/Applications` -> `open -n -a "<App Name>"`.
+     - Added `tray_get_apps_dir` / `tray_set_apps_dir` Tauri commands and a compact **`Runner Apps Dir`** input + `Save Path` bar in `Unified Tray` UI for one-time local configuration.
+   - **Auto-Launch `ax-terminal`**:
+     - `Unified Tray` attempts best-effort background `ensure_runner_online(RunnerDomain::AxTerminal)` on startup, and `tray_start_preset` / `tray_restart_preset` auto-launch the target domain runner if offline.
+   - **Legacy Tray Disabled (`apps/p2p-remote-controller/src-tauri/src/lib.rs`)**:
+     - Disabled `build_tray(app)?` in `setup()` to prevent duplicate tray icons while keeping source & icons intact.
 
-## 4. Recommendations for Future Instructions
-- **System / Agent Instruction**: Codify `ack-before-work` as a hard pre-condition before any tool chain expected to exceed ~10 seconds, and standardize `send_and_poll` as the default turn-closing call.
-- **Human Instruction**: Encourage users to end multi-part voice dictation with an explicit completion cue (e.g., *"说完了"*) when batching thoughts, and reassure them that brief `"去跑检查，1分钟回"` messages mean the agent is actively working, not idle.
+3. **`QuickGitV0` Absorbed into Monorepo (`933c815`, via `atlas`)**
+   - Absorbed `QuickGitV0` into `apps/quick-git/` with package name `quick-git` (matching `Unified Tray` preset `pnpm --filter quick-git tauri dev`).
+   - Configured Vite dev server on dedicated port **`1423`** (`127.0.0.1:1423`) to avoid collisions with `1420` / `1421` / `1422`.
+
+## 2. Final Verification Results (All Passed)
+- `pnpm --filter quick-git typecheck`: **PASS**
+- `pnpm --filter quick-git build`: **PASS**
+- `cargo check --manifest-path apps/quick-git/src-tauri/Cargo.toml`: **PASS**
+- `npx tsc --noEmit` (root): **PASS**
+- `pnpm test` (root): **PASS** (3 files / 19 tests)
+- `pnpm --filter @antigravity/control-protocol test`: **PASS** (1 file / 3 tests)
+- `pnpm --filter @antigravity/unified-tray build`: **PASS**
+- `pnpm --filter @antigravity/unified-tray test`: **PASS** (1 file / 2 tests)
+- `cargo check --manifest-path apps/unified-tray/src-tauri/Cargo.toml`: **PASS**
+- `pnpm run env:check`: **PASS** (OverlayFS 14 MB / 100 MB budget; Cargo `target/` clean in `/tmp`)

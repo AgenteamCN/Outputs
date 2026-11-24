@@ -1,4 +1,47 @@
-=== completed.md ===
+# agyDevKit #1 ~ #70 待办完成情况阶段报告
+Generated: 2026-11-24T15:21:00Z
+Repo: `Antigravi-ty/agyDevKit` (`a2` HEAD: `d89e03e`) | `Antigravi-ty/agyWorker` (`main` HEAD: `3939f3a`, live version `84902513`)
+
+## 1. 总体进度统计
+- 总计追踪项：**#1 ~ #70**（其中 `#63` 已由 Mark 取消，实际有效 **69 项**）
+- **已完成并合入 `a2` / 部署上线：`60 项` (~87%)**
+- **剩余待办 / 进行中：`9 项`**
+
+## 2. 已完成里程碑摘要（按模块）
+- **核心架构与 Monorepo (#5, #17, #25, #39 部分)**:
+  - 拆分独立 `apps/emqx-live-chat` 与 `apps/p2p-remote-controller`，共享 `@agy/emqx-chat-core`
+  - 统一状态目录迁至 `.agy-state/`（macOS `sun_path <= 104B` 自动回退 `/tmp/`）
+  - `#25` 多端旧版协议兼容矩阵 (`normalizePocketDeckSnapshot` / `protocolCompat.test.ts`)
+  - `#39` 已吸收 `apps/p2p-browser` 与 `apps/singbox-gui`（含 `#24` 50万行 / 64MB `LogRingBuffer`）
+- **Live Chat & 多端协同 (#3, #7, #9, #13, #14, #18, #23, #26, #27, #29, #36, #37, #46, #54, #55, #58, #59, #60, #64, #65, #67, #68, #69)**:
+  - 严格 `ackedSentAt` 逐条消息状态、0.1s 精度 `Thinking...` 等宽计时气泡
+  - 智能滚动 (`Smart Scroll`) + `Quote` 140字截断预览 + `↑ Back to Quote` 锚点
+  - PC 16:9 三栏布局（`>=1080px`）+ 可折叠 `ActiveTodoPanel` + 移动端 `TODO <N>` 弹窗
+  - WebRTC P2P 二进制 `ArrayBuffer` OTA（`AGOT` 帧、自动降包 `16KB->8KB->4KB`、8KB JSON 回退）
+  - 全局 300 条消息阈值 + DO `/channel/backup` + `backup_verified` 自动清零
+- **Unified Tray & Mac 原生工具链 (#6, #8, #10, #11, #12, #15, #19, #20, #22, #41, #47, #48, #49, #50, #51, #52, #56, #57, #61, #62, #66, #70, task_bravo_021)**:
+  - 5 状态原生托盘菜单（Stopped / Starting / Foreground / Background / Crashed）+ `Stop (SIGINT)` / `Force Stop`
+  - 三端（`p2p-remote-controller` / `singbox-gui` / `p2p-browser`）`AGY_TRAY_MANAGED=1` 关闭隐藏到托盘 & Dock 重开
+  - `git_watchdog.rs`：Git Pull / `HEAD` 变更后 45 秒健康检查与自动 `git reset --hard` 回滚看门狗
+  - `Tray & Terminal` ANSI 虚拟滚动日志、`seq` 去重、`Clear View` 游标、`reattach.rs` PID 保活重连
+- **Cloudflare Worker (`agyWorker`) (#16, #30, #31, #33, #34, #40 部分, #53, #58)**:
+  - 多频道 `/chat/poll`、`working`/`standby` 在线状态 + `includeMySubAgents`
+  - DO SQLite `/channel/backup` + `backup_verified` EMQX 广播修复（已部署 `84902513`）
+  - `todoSync` 透传支持
+
+## 3. 剩余 9 项待办
+1. **#21** `Singbox GUI` 双内核无感热切换（*已派发给 Bravo `task_bravo_022`*）
+2. **#35** iOS APNs Push Notification Worker + 统一收拢 `getgithubapptoken` / `agentoutputposter` 到 `agyWorker`
+3. **#38** `sing-box` 无证书观测 + 凭据脱敏器 + Agent 自动生成分流/去追踪规则
+4. **#39（剩余）** `UIStorybook` 吸收进 `apps/`
+5. **#40（剩余）** `agyWorker` `/chat/send` `connackCode === null` 自动重试一次 + EMQX `PINGREQ` 死连接探测 + `POST /cmd` `working` 心跳
+6. **#42** AI Studio `Inject Live Chat` AX 路径标定（需 Mac 真机 `scan_window`）
+7. **#43** 独立 `EMQX Live Chat.app` 桌面壳
+8. **#44** 局域网远程 Mac 语音听写快捷键（`CGEventPost` + 实时输入框同步）
+9. **#66（剩余）** 全仓重复/未复用实现扫描（*已派发给 Alpha `task_alpha_058`*，同步排查 TODO 布局）
+
+---
+## 附录 A：已完成归档明细 (`completed.md`)
 # Completed & Archived Tasks
 
 > Moved out of active TODO (`backlog.md`) to keep the active list clean and scannable while preserving auditability.
@@ -71,97 +114,48 @@
 - **[4-State Presence & Offline Retention]** (`e7302d2` on `a2`): 4-state `Working (Not listening)` support + never auto-hide `>1h` offline agents.
 - **[CDP Layout Audit]** (`2f9a681` on `a2`): Headless Chrome CDP zero-screenshot geometry audit script `scripts/env/verify-layout.mjs` (0 overlap/overflow at `375x812` & `1920x1080`).
 - **[#59] Quote 140-char truncation + normal scroll-to-bottom on send + `↑ Back to Quote` anchor button** (`74f46c4` on `a2`)
+- **[#58 Frontend/Core] Global 300-msg `backupEventId` + `unbackedCount` + `backup_verified` reset** (`task_alpha_033` merged to `a2`)
+- **[#60] `Thinking...` / `Working` 0.1s precision elapsed timer (`0m 01.3s`, 100ms refresh)** (`task_alpha_034` merged to `a2`)
+- **[#62] `--with-rust` tmpfs `libc6-dev` / `linux-libc-dev` / Tauri sysroot headers** (`task_alpha_035` merged to `a2`; `p2p-remote-controller` `cargo check` passes in Linux sandbox)
+- **[Parser Bugfix] Restored 8 dropped `RemoteCommandRequest` fields (`x`, `y`, `width`, `height`, `targetId`, `label`, `includeHidden`, `model`) + `params`/`meta` passthrough** (`task_alpha_036` merged to `a2`)
+- **[#25] Multi-device legacy protocol compatibility & `normalizePocketDeckSnapshot` across all LAN/WS/HTTP/Tauri paths** (`task_alpha_037` merged to `a2`)
+- **[#64] `INBOUND · thinking` bubble (`SF Mono` timer), centered `.spin` fix, removed bottom `Replied` bar & fixed stuck `OUTBOUND` pending spinner** (`task_alpha_038` merged to `a2`)
+- **[#65] Mobile `AgentBoardBar` `TODO <N>` uncompleted count badge + `TODOs` modal drawer + `todoSnapshots` LAN/EMQX sync** (`task_alpha_039` merged to `a2`)
+- **[#68 & #67] HMOS landscape `safe-area-inset-right` + `@media (hover: hover)` touch hover fix & remote Approve desktop focus-steal guard** (`task_alpha_040` merged to `a2`)
 
-=== backlog.md ===
-# Active Task Backlog (TODO)
+- **task_bravo_003** (`a9c6cfd`, `2026-11-24T11:44:02Z`): `Unified Tray` `p2p:dev:watch` + `devWatch.ts` + `#56` OTA `ENRICHED_PATH` & 20-log retention (merged `a2-bravo` `7142c5d` -> `a2`).
+- **task_alpha_041** (`226ead3`, `2026-11-24T11:45:13Z`): `#69` strict `ackedSentAt` independent per-message spinner + `get_bridge_diagnostics` read-only `/cmd` (merged `a2-alpha` `e0fe221` -> `a2`).
+- **task_bravo_004** (`c1bff9b` merged into `a2`, `2026-11-24T11:47:08Z`): `#51` Dock/window close icon revert fix, `#52` `TrayIconState` + menu dedup, `#70` `TerminalLogViewer` `requestAnimationFrame` scrollHeight + 8px spacer, `#61` `Unified Tray` 1-click `Git Pull` & `Rollback (HEAD@{1})`.
+- **task_alpha_042** (`7e4348a` merged into `a2`, `2026-11-24T11:49:09Z`): Fixed silent drop of non-string DataChannel frames (`decodeDataChannelPayload`) + `dc.readyState === "open"` fallback in `useCellularP2pHost.ts`, exported `addConsoleLog` and instrumented `[P2P-OTA]`, `[P2P-DC]`, `[P2P-RPC]`, `[P2P-Relay]`, `[P2P-WebRTC]`.
+- **task_bravo_005** (`11ca4ad9` merged into `a2`, `2026-11-24T11:52:20Z`): `#66` `open_safari_windows` reusing idle `Open New` windows + dedup scan; `#48` `CreateInteraction` -> `CreatePrompt` -> `GetInteractionStream` capture & `pageUrl` upgrade.
+- **task_alpha_043** (`fad331c` merged into `a2`, `2026-11-24T11:53:13Z`): `useNetworkRecorderPolling.ts` exponential backoff cooldown (`15s->120s`) on AX RPC timeout + skip background poll when no non-selected windows have `recording` enabled + unit tests.
+- **task_alpha_044** (`9b10cea` merged into `a2`, `2026-11-24T11:57:28Z`): `#54` Smart Scroll + `Jump to latest` pill + `#59` `Quote` 140-char truncation & `↑ Back to Quote` anchor in `EmqxChatSection.tsx` + interactive jsdom tests.
+- **task_bravo_006** (`54c19e4` merged into `a2`, `2026-11-24T11:57:59Z`): `#6` AGY Terminal auto-reporting `.app` parent dir to `~/.agy-state/apps_dir.txt`; `#19` dynamic `Regular`/`Accessory` Dock icon policy; `#11` `Unified Tray` `Tray & Terminal` log/status tab.
+- **task_bravo_007** (`d4b4bf2` merged into `a2`, `2026-11-24T12:00:52Z`): `#49` Copy Logs & `suppressAxNoise` verified; `#50` `ErrorBoundary` + `vite:preloadError` verified; `#57` strict `seq` dedup + `clearedAfterSeq` `minSeq` cursor extended to `Tray & Terminal` system logs tab.
+- **task_alpha_045** (`71509b9` merged into `a2`, `2026-11-24T12:01:38Z`): WebRTC DataChannel `16KB` chunking/reassembly (`cellularDataChannelChunking.ts`) + `<= 48 KB` cellular snapshot cap for legacy `3f1558d` compatibility + `pc.sctp?.maxMessageSize` logging + 158/158 vitest passing.
+- **task_alpha_046** (`9add55a` merged into `a2`, `2026-11-24T12:06:24Z`): `#46` multi-client `approving` sync + `pruneStaleApprovals` clearing stuck spinners on WS/P2P/EMQX reconnect or PC `commitId` change (`AGENTS.md` untouched).
+- **task_bravo_008** (`bdb96b1` merged into `a2`, `2026-11-24T12:06:42Z`): Fixed missing `agentStatus` prop wiring in `EmqxBridgePanel` & `PocketDeckView`, added `[AgentStatus]` console debug logs, and added PC + HMOS `INBOUND · thinking` jsdom simulation tests (160/160 passing).
+- **task_bravo_009** (`8e85add` merged into `a2`, `2026-11-24T12:08:34Z`): `#12` Unified Tray native menu tri-state indicators + `Stop (SIGINT)` / `Force Stop` submenus + `CloseRequested` Dock visibility; `#20` ANSI SGR/CSI/OSC span rendering & virtualized scrolling verified.
+- **task_alpha_047** (`d72ec9b` merged into `a2`, `2026-11-24T12:09:38Z`): `#36` PC 16:9 widescreen `>=1280px` 3-column layout + independent `ActiveTodoPanel` live `todo_sync` column (161/161 tests passing).
+- **task_bravo_010** (`9e864df` merged into `a2`, `2026-11-24T12:10:37Z`): `#37` `QuickGitGraphView.tsx` SVG swimlane connectors (`merge_right`/`merge_left`), commit nodes, `HEAD`/`origin/*` ref pills, and `QuickGitGraphView.test.tsx` (163/163 passing).
+- **task_bravo_011** (`5c68c04` merged into `a2`, `2026-11-24T12:15:56Z`): `#22` Unified Tray `reattach.rs` PID/preset persistence in `~/.agy-state/`, alive-PID re-attachment, IPC socket retry, and `cargo test` + `cargo check` passing.
+- **task_alpha_048** (`015169f` merged into `a2`, `2026-11-24T12:16:58Z`): `#41` Unified Tray Shortcuts (`PocketDeck`, `EMQX CN`, `EMQX Global`) + `tray_pick_apps_dir` folder picker; `#8` `+ New Tab` custom command launcher (16/16 vitest + `cargo check` passing).
+- **task_bravo_012** (`09459a7` merged into `a2`, `2026-11-24T12:18:41Z`): Mobile lock-screen P2P disconnect detection (`pc.oniceconnectionstatechange`, `pagehide` suspect marking, `shouldReconnectOnForegroundResume()` on `visibilitychange(visible)`/`pageshow`/`online`, 5 unit tests, 170/170 passing).
+- **task_alpha_049** (`9e25674` merged into `a2` at `85fde67`): Removed `.badge`/`.timeline-badge` pill background from `INBOUND` & `Thinking...` indicators and updated monospace font stack (`"SF Mono", "JetBrains Mono", ui-monospace, ...`).
+- **task_bravo_013** (`d1da3c8` merged into `a2` at `754ede7`): Capped `OTA_CHUNK_SIZE = 8192` in `p2pOtaService.ts` for legacy WebRTC compatibility + added `recentP2pLogs` in `get_bridge_diagnostics` (172/172 passing).
+- **task_alpha_050** (`db58322` merged into `a2` at `8864d88`): Telegram-style dismissible Quote preview bar above composer, isolated inner-container `↑ Back to Quote` scroll (`scrollContainerToChildElement`), and `pending` reply stability on consecutive sends (`@agy/emqx-chat-core` 26/26, `p2p-remote-controller` 173/173, `emqx-live-chat` 13/13).
+- **task_bravo_014** (`ce224be` merged into `a2` at `d37bb7c`): WebRTC P2P binary `ArrayBuffer` OTA chunking (`AGOT` frame codec, `pc.sctp?.maxMessageSize`-aware `16KB` initial chunk, `dc.send`/ACK/`bufferedAmount` failure detection, `16KB -> 8KB -> 4KB` half-packet retry, and automatic `8KB` JSON `ota_chunk` fallback; 48 files / 178 tests passing).
+- **task_alpha_051** (`370cc19` merged into `a2` at `4ed1db3`): Lowered 3-column `.main-grid` breakpoint to `1080px` and added collapsible `ActiveTodoPanel` (44px narrow rail on `>=1080px` / compact 1-line bar on `<1080px`, auto-collapsing when 0 TODOs, auto-expanding when items arrive; 48 files / 179 tests passing).
+- **task_bravo_015** (`b6c5858` merged into `a2` at `3228ad8`): Added paired DataChannel E2E binary OTA tests (`p2pOtaE2e.test.ts`: 16KB AGOT chunking, 16KB->8KB->4KB half-packet retry, 8KB JSON fallback), extended `pocket_footer` horizontal safe-area insets on mobile landscape, and polished `QuickGitGraphView` narrow-screen wrapping (49 files / 181 tests passing).
+- **task_alpha_052** (`1d4728c` merged into `a2` at `986d77d`): Made `emqx-live-chat` `TodoSyncPanel` collapsible (auto-collapse on 0 items, 48px narrow rail on `>=1024px`) and verified `INBOUND · thinking` clean typography parity (`tsc`, 13/13 tests, `vite build` passing).
+- **task_bravo_016** (`d844b46` merged into `a2` at `f135294`): Added `Hide [AgentStatus]` (default checked) and `Hide [P2P-*]` checkboxes in `DebugConsoleTabs.tsx` with `localStorage` persistence in `logExport.ts` (49 files / 183 tests passing).
+- **task_alpha_054** (`64f16a0` merged into `a2` at `63b2bdd`): `#39` Absorbed `Antigravi-ty/P2PBrowser` (`a1`) into `apps/p2p-browser` (Vite `1420`, pnpm workspace, `tsc`, `vite build`, and `cargo check` passing).
+- **task_bravo_017** (`1a6f7bf` merged into `a2` at `415ccec`): Replaced `🟢`/`🟡`/`🔴`/`⚪` emojis in `apps/unified-tray/src-tauri/src/main.rs:544-548` with aligned non-emoji symbols (`●`/`◐`/`×`/`○`), and `#39` absorbed `Antigravi-ty/SingboxGUIV0` (`main`) into `apps/singbox-gui` (reassigned Vite/Tauri dev port `1422 -> 1424`, `tsc`, `vite build`, and `cargo check` passing).
+- **task_bravo_018** (`1b5244c` merged into `a2` at `bafe826`): `#24` Implemented `LogRingBuffer` (up to 500,000 lines / 64 MB cap) in `apps/singbox-gui` Rust backend (`singbox.rs`) + virtualized `ConsoleRealtimeLogPanel` with retention selector (5/5 Rust tests, `cargo check`, `tsc`, and `vite build` passing).
+- **task_alpha_055+056** (`5d64fdd` merged into `a2` at `0cdd05e`): Kept `"SF Mono", "JetBrains Mono", ui-monospace` + `tabular-nums` on `thinking` timer span while reusing normal inbound bubble sizing/padding, `var(--text-muted)` color, and `<Loader2 size="1em" />` across `EmqxChatSection.tsx`, `PocketDeckBridgeTab.tsx`, and `ChatStreamPanel.tsx` (`p2p-remote-controller` 183/183, `emqx-live-chat` 13/13).
+- **task_bravo_019+020** (`438b974` merged into `a2` at `3f1cfa4`): `#12` Implemented 5-state `Unified Tray` menu (`  ` Stopped, `-` Starting/Stopping, `✓` Running foreground, `○` Running background -> unhide & focus, `×` Crashed) + `Stop (SIGINT)` / `Force Stop` submenus + macOS `CloseRequested` hide-on-close in `p2p-remote-controller` (`unified-tray` 6/6 Rust tests + `cargo check` passing).
+- **task_alpha_057** (`c08870a` merged into `a2` at `b5e6c53`): Added `AGY_TRAY_MANAGED=1` `CloseRequested` hide + `ExitRequested` keep-alive + macOS `RunEvent::Reopen` restore across `p2p-remote-controller`, `singbox-gui`, and `p2p-browser` (all 3 `cargo check`s passing).
 
-> Completed items have been archived to `/workspace/.chat/completed.md`.
+### task_bravo_021 (`9840c4c` -> `d89e03e`)
+- Unified Tray (`apps/unified-tray`): added `git_watchdog.rs` + `main.rs` integration for `last_good_commit.txt`, Git Pull / `HEAD` change detection, 45s health-check grace window, and automatic `git reset --hard <prev_good_commit>` rollback on crash or Rust/Vite compile failure.
 
-## High Priority / Architecture
-- **[#14] Worker 送达回执 & Agent Thinking 状态指示** (`agyWorker` + 前端)
-
-## TS / Web / Scripts (Offloadable to Sub-Agents)
-- **[#25] 多端版本协议兼容与双线验证** (iOS `3f1558d` / Pad `b8195354` / PC 最新)
-
-## Rust / Mac Native (Requires `--with-rust` or Mac Local Build)
-- **[#6] `AGY Terminal` 自动上报自身 `.app` 目录给 `Unified Tray` (`apps_dir` 零配置)**
-- **[#8] `Unified Tray` 增加自定义命令 / 交互式 New Tab** (仅限本地 UI 手动新建)
-- **[#11] `Unified Tray` 增加自身及 `AGY Terminal` 日志/状态监听 Tab**
-- **[#12] `Unified Tray` 顶部原生托盘菜单三态指示 & 点击交互优化** (普通 `MenuItem` + 彩色状态图标 + `Stop (SIGINT) ▸` / `Force Stop ▸` + 红叉隐藏窗口)
-- **[#17] 统一状态目录迁移：从 `~/.agy-devkit` 迁至 Terminal `.app` 同级 `.agy-state/`** (macOS `sun_path` <= 104B fallback `/tmp/` + `>= 90B` 警告)
-- **[#19] `AGY Terminal` 首次拉起 `Unified Tray` 时 Dock 图标动态显隐**
-- **[#20] `Unified Tray` 终端日志渲染优化** (ANSI 颜色 + 行号 + 虚拟滚动)
-- **[#21] `Singbox GUI` 双内核无感热切换 (Dual-Core Graceful Handover)**
-- **[#22] `Unified Tray` 无感热重启 / 升级不掉线（Runner 保活重连）**
-- **[#24] `Singbox GUI` 超大日志保留（50 万行 / 按字节尺寸）与网络诊断安全接管**
-
-## Worker / Multi-Client / UX Additions
-- **[#35] iOS APNs Push Notification Worker** (及统一收拢 `getgithubapptoken` / `agentoutputposter` / `push` 到 `agyWorker` monorepo)
-- **[#36] PC 16:9 宽屏左中右多栏布局 + 独立 Active TODO 实时同步栏** (`todo_sync` over EMQX)
-- **[#37] 移动端 `quick_git` 分支连线图可视化** (将 `log_graph` 渲染为手机友好的分支/Merge 泳道图)
-- **[#38] `sing-box` 无证书观测 + 凭据脱敏器 + Agent 自动生成分流/去追踪规则** (MITM/Rewrite 延后)
-
-## Recovered from `AgenteamCN/Outputs` (`84ddb0f`)
-- **[#39] Monorepo 吸收剩余仓库**: `P2PBrowser` (`apps/p2p-browser`, Vite `1424`)、`SingboxGUIV0` (`apps/singbox-gui`, Vite `1425`)、`UIStorybook` (`apps/`)
-- **[#40] `agyWorker` 可靠性与安全增强**: `/chat/send` `pubackedCount === 0` 假阳性修复 (`820b2e1`) + EMQX 主动 `PINGREQ` 死连接探测 (`Close 1005`) + GitHub Token 代理与子 Agent 级联吊销 (`2dc9d7f`)
-- **[#41] `Unified Tray` 迁入旧托盘 `Shortcuts` (EMQX CN/Global) & `Runner Apps Dir` 引导抛光**
-- **[#42] AI Studio `Inject Live Chat` AX 路径标定** (需 Mac 真机 `scan_window`)
-- **[#43] 独立 `EMQX Live Chat.app` 桌面壳** (PWA 已在 `apps/emqx-live-chat`，Tray 已预留 `.app` 位)
-- **[#44] 局域网远程 Mac 语音听写快捷键** (`CGEventPost` + 实时输入框同步)
-
-## Newly Reported Items (Live Chat 2026-11-24)
-- **[#46] Approve 多端协同旋转状态同步 (`approving`)**: 移动端点击 Approve 且 PC 端收到后，PC 端广播 `approving` 状态，使所有已连接的 Pocket Deck 客户端同步显示旋转加载指示器。
-- **[#47] `open_safari_windows` 隐形窗口安全/可观测修复 + `dispatch_aistudio_task` 静默空操作修复**: `open_safari_windows` 打开的窗口必须立即注册到 `managed` 列表（无需手动开启 `Include All Safari Windows`）；`dispatch_aistudio_task` 在返回 `ok` 前必须校验提示词已实际粘贴并发送。
-- **[#48] `agy-preview-instant` 严重 Bug 修复与重命名**: 待 Mark 补充具体 Bug 详情与新名称。
-- **[#49] `Unified Tray` 日志区增加 Copy 按钮 + `p2p-remote-controller` 增加屏蔽 `ax helper` 噪声日志开关**
-- **[#50] `p2p-remote-controller` 顶层 React ErrorBoundary + `vite:preloadError` 自动刷新兜底** (防止 `quick_git pull_ff` 大批量热更新时白屏)
-- **[#51] `Unified Tray` 关闭/隐藏窗口时图标退化成默认执行图标** (展开时正常，关闭/隐藏时丢失自定义 icon)
-- **[#52] `Unified Tray` 托盘图标时有时无 / 自动消失** (`NSStatusItem` / `TrayIcon` 生命周期排查)
-- **[#53] `agyWorker` `agent_presence` 增加 `working` 状态 + `/chat/poll` `includeMySubAgents: true` 自动展开子频道**
-- **[#54] 聊天阅读位置保持 (Smart Scroll) + 消息头 `Quote` 引用追加按钮** (往上翻历史回复时不强行滚到底部，不与系统长按选字冲突)
-- **[#55] 聊天三态动效抛光**：去掉状态条冗余 `#channel · chief`；用户消息在送达前最后一行转圈 -> `delivered` 停止转圈并显示转圈 `Thinking...` -> 回复到达后 `Thinking...` 消失
-- **[#56] OTA Build 每次独立日志留存 + `commands.rs` `ENRICHED_PATH`**: `build_and_read_ota_dist` 使用 `ENRICHED_PATH` 执行 `pnpm exec vite build`，并将每次构建 stdout/stderr/耗时写入 `.agy-state/logs/ota-build-<ts>-<commit>.log`（保留最近 20 次）
-- **[#57] `Unified Tray` 日志按 `seq` 严格去重 + `Clear View` `minSeq` 游标过滤** (解决 ring buffer 重复追加导致行号重复/卡顿)
-- **[#58] 消息达到 200/300 条时自动触发 DO `/channel/backup` 检查点** (Worker DO 端已上线，待补自动触发/前端同步)
-- **[#59] `Quote` 120-160字摘要截断 + `↑ Back to Quote` 锚点按钮** (发送后正常回底部，发送键上方显示 `↑ Back to Quote`，发下一条无 Quote 消息后自动清除)
-- **[#60] `Thinking...` / `Working` 计时器精确到小数点后一位** (`Thinking... 0m 01.3s` 格式，100ms 刷新精度)
-- **[#61] `Unified Tray` 一键 `Git Pull` & `Rollback (HEAD@{1})` 按钮 + 合入前 `cargo check` 门禁** (防止 `quick_git pull_ff` 拉到 Rust 编译失败提交后 `p2p-remote-controller` 失联无法远程自救)
-
-=== subagent_prompts.md ===
-# Sub-Agent Prompt Templates & Notes (from User, 2026-11-24T04:43:55Z)
-
-## User's Architectural Direction for Sub-Agents
-- Sub-agents are dispatched by **User** (from prompt generated by Chief Agent), NOT directly by Chief via HTTP.
-- Auth headers (`agy_sub_...` in old templates) are stale/known in Durable Objects and need to be **revoked & newly signed**.
-- Assigned sub-agent channels should be **derived from current channel** (e.g. hashed from `ch_b308b620` so Chief can derive where the sub-agent is, while the sub-agent cannot derive Chief's channel).
-- Task dispatch should go through **EMQX dynamic dispatch** (sub-agent checks in / reports online, Chief assigns task, sub-agent acks & reports progress/offline status), rather than competing over a Durable Object task board.
-- `initial user request` / default input for sub-agents needs updating: **Chief is the "user" for the sub-agent**, just as Human is the "user" for Chief.
-- Worker deployment API token will be provided later to persist and iterate on the worker.
-
-## Legacy Template 1: `atlas`
-- Auth: `x-agy-request-id: agy_sub_0a5ca6ef-7427-498f-a602-e1b605dead39` (to be revoked/rotated)
-- Channel: `ch_sub_3458d88135`
-- Key features: `GET /channel/state`, `POST /chat/send` with `"drainInbox": true`, `PATCH /channel/state` (`update_status`, `in_review`, `resultCommitSha`, `resultSummary`), 45m standby (`10 * 4.5m` timeouts + 3 more + check `sessionStatus === "shutdown"`).
-
-## Legacy Template 2: `coder_1`
-- Auth: `x-agy-request-id: agy_sub_9a8195b9-bc3c-4296-b959-49cedf5edd35` (to be revoked/rotated)
-- Channel: `ch_code_a2_worker1`
-- Same `drainInbox` + `channel/state` + 45m standby pattern.
-
-## Legacy System Instruction (`fix.sh`)
-- `https://envinit.maboco-mark.workers.dev/` (deprecated; env init now built into each repo via `scripts/env/bootstrap.sh` / `doctor.mjs`).
-- Useful rules retained: `replace_file_content` over `write_to_file`, never dump raw `git show`/`git diff` on whole dir, extract to `/tmp/branches/` for `diff -u`, never print large Base64 in tool args/stdout during GraphQL `createCommitOnBranch`.
-
-=== emqx_split_blueprint.md ===
-# EMQX Live Chat vs p2p-remote-controller Split Blueprint (#5)
-
-> Audited by `Alpha` on `origin/a2` (`86ec113`).
-
-- **Shared Pure-TS Package (`packages/emqx-chat-core`, zero Tauri/DOM deps)**:
-  - Types: `BridgeChatMessage`, `EmqxConnectionState`, `E2eeMode`, `PocketDirectChatConfig`, `AgentBoardSnapshot`.
-  - Transport/Crypto/Utils: `emqxClient.ts`, `emqxMessageParser.ts` (chat/status), `emqxBridgeUtils.ts` (`computeChatMessageId`, `mergeAndSortChatMessages`, `updateSendTargetForChannelSelection`), `agentBoard.ts`, `pollCountdown.ts`, `chatMessageCollapse.ts`, E2EE decrypt/encrypt.
-- **Standalone `apps/emqx-live-chat` (Chat-only PWA/Web)**:
-  - Hooks/UI: `usePocketDirectChat.ts` (with injectable storage/sound adapters), `usePollCountdown.ts`, `EmqxChatSection.tsx`, `AgentBoardBar.tsx`, `PocketDirectChatSettingsCard.tsx`.
-- **Control Plane `apps/p2p-remote-controller` (Tauri Host + Pocket Deck)**:
-  - Keeps `src-tauri/` (`lan_server.rs`, `commands.rs`, `ax_helper`), `axService.ts`, `emqxCommandRouter.ts`, `emqxCommandHandlers.ts`, `aiStudio*`, `useEmqxApprovalsAndChat.ts`, `usePocketDeckBridge.ts`, `usePocketDeckRemoteSync.ts`, `useLanAutoProbe.ts`, `useCellularP2p*`, `EmqxPendingApprovalsSection.tsx`, `PocketDeckView.tsx`.
-- **Avoiding Fake Splits**: Extract `packages/emqx-chat-core` as a workspace package FIRST so `computeChatMessageId`, E2EE, and `BridgeChatMessage` never drift; keep `RemoteCommandRequest`/`emqxCommandRouter` strictly in `p2p-remote-controller`.

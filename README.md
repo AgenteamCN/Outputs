@@ -1,60 +1,37 @@
-# agyWorker 频道漂移检测与并发时序打标技术方案（无 PII 版）
+# 下一轮开局模板与基础设施速查（脱敏版）
 
-## 1. 背景与现象
+## 1. 通用 Initial Input 模板（直接复制开下一轮）
+```yaml
+# 1. Auth Configuration
+auth:
+  curl -s -H "x-agy-request-id: <YOUR_AUTH_UUID>" "https://getgithubapptoken.maboco-mark.workers.dev/"
 
-### 1.1 频道 ID 漏传 / 漂移（`channelId` Drift / Omission）
-- **现象**：在多频道协作中，Agent 在调用 `/chat/send`、`/chat/poll` 或 `/cmd` 时，偶发出现以下情况：
-  1. 漏传 `channelId`，导致消息发往默认频道而非目标会话频道；
-  2. `poll` 时传入的 `channelIds` 列表漏掉了活跃的用户频道；
-  3. 上下文压缩恢复后使用了错误的 `channelId`。
-- **后果**：Agent 无法感知自己未监听到用户所在频道，用户也无法判断 Agent 正在监听哪个频道，造成双向失联假象。
+# 2. Commit Preference
+commit_preference:
+  author_type: "bot"
+  verified_signature: true
+  Co-authored-by: Mark <29165094+MaBoCoMark@users.noreply.github.com>
+  required_instruction: |
+    1. Token: Run auth curl before pushing/fetching private repos.
+    2. Verified Bot Commit ONLY (never `git push` local commits):
+       Use GraphQL `createCommitOnBranch` or REST `git/trees` -> `git/commits` -> `git/refs/heads/<branch>`,
+       and `POST /repos/<owner>/<repo>/merges` for Verified Bot Merge.
+```
+- 主仓库：`https://github.com/Antigravi-ty/agyDevKit`（目标分支 `a2`）
+- Worker 仓库：`https://github.com/Antigravi-ty/agyWorker`（目标分支 `main`）
+- 环境恢复：`node scripts/env/doctor.mjs --auto-restore` + `pnpm run env:check`（<= 100 MB）
+- Live Chat：使用 `curl` 访问 `https://agentlivechatchannel.maboco-mark.workers.dev`（禁 `urllib`），开启 Partner 分包 + 交叉评审 + Secretary `[challenge]` 质疑模式。
+- 本轮主要目标：`<在此填写下一轮具体 Workflow 或产品优化目标>`
 
-### 1.2 并发消息因果时序模糊（Pre-Reply / Concurrent Message）
-- **现象**：
-  - `t=1s`：Agent 发送消息 A；
-  - `t=2s`：用户回复消息 B，Agent 收到后开始思考/执行工具（`t=2s..10s`）；
-  - `t=7s`：Agent 尚未进入下一次 `poll`，用户补充发送消息 C（`sentAt = 7s`）；
-  - `t=10s`：Agent 思考完毕，发出针对消息 B 的回复 D（`sentAt = 10s`）；
-  - `t=11s`：Agent 调用 `/chat/poll` 拉取到消息 C（`sentAt = 7s`）。
-- **问题**：消息 C（`7s`）是在回复 D（`10s`）发出**之前**就已发出的，并非针对回复 D 的 `User Response`。若仅按拉取顺序处理，Agent 或用户容易误判因果关系。
-
----
-
-## 2. 技术方案设计
-
-### 2.1 `previousChannelId` 漂移与漏监听检测
-- **标识键设计**：
-  - 主键采用 `(requestId, agentId)`（来自请求头 `x-agy-request-id` 与请求体 `agentId`），在 Worker Durable Object / 内存会话状态中持久化：
-    - `previousChannelId`：该 `(requestId, agentId)` 最近一次发送/操作的主频道；
-    - `recentActiveChannels`：该会话近期有消息往来的频道集合（含最新 `sentAt`）。
-  - **关于出口 IP**：云端沙箱/容器可能存在共享 NAT 出口 IP 或快照重启后切换出口 IP 的情况，因此**不建议单独依赖 IP 作为唯一主键**，可将出口 IP（`CF-Connecting-IP`）仅作为辅助观测字段（可在后续 Agent Playground 实测出口 IP 稳定性与拿到的请求头数据后再评估权重）。
-- **非阻塞告警机制（Non-blocking Warning）**：
-  - 当 `/chat/send`、`/chat/poll` 或 `/cmd` 出现以下情况时，Worker 正常执行但额外在响应 JSON 中附带 `channelWarning` 与 `previousChannelId`：
-    1. 漏传 `channelId`；
-    2. 传入的 `channelId` 与 `previousChannelId` 不一致（发生频道切换/漂移）；
-    3. `/chat/poll` 的 `channelIds` 漏掉了 `recentActiveChannels` 中近期有未读/活跃记录的用户频道。
-  - 示例响应字段：
-    ```json
-    {
-      "ok": true,
-      "previousChannelId": "ch_example_user",
-      "channelWarning": "channelId omitted or differs from previousChannelId (ch_example_user)"
-    }
-    ```
-
-### 2.2 `lastAgentSentAt` 因果时序打标（`timingRelation`）
-- **状态记录**：
-  - Worker 在每次 `/chat/send` 或 `/chat/send_and_poll` 成功发送时，按 `(requestId, agentId, channelId)` 记录 `lastAgentSentAt`。
-- **拉取标注**：
-  - 在 `/chat/poll` 与 `/chat/send_and_poll` 返回 `received` 列表前：
-    1. 先按消息 `sentAt` 升序排列（`seq` / `receivedAt` 兜底），并附带 `oldestSentAt` / `newestSentAt` 摘要；
-    2. 对非本 Agent 发出的每条消息，比较 `msg.sentAt` 与 `lastAgentSentAt`：
-       - `msg.sentAt < lastAgentSentAt` -> 标注 `timingRelation: "sent_before_last_reply"`（并发/发前追加消息，**非**对上一条回复的回应）；
-       - `msg.sentAt >= lastAgentSentAt` -> 标注 `timingRelation: "sent_after_last_reply"`（上一条回复发出后的新消息）。
-    3. 附带统计字段 `preReplyCount`，提醒 Agent 若仍在等待用户针对上一条回复的回应，应继续 `poll`。
-
----
-
-## 3. 后续验证计划（Agent Playground 实测）
-1. 在独立测试环境（Agent Playground）中验证沙箱连续请求时的 `CF-Connecting-IP` 变化频率与可用元数据；
-2. 验证 `channelWarning` 与 `timingRelation` 在高并发/断连重放场景下的准确率与零误报率。
+## 2. 基础设施与踩坑速查（已验证规则）
+1. **Live Chat 接口规范**：
+   - 发送：`POST /chat/send`，正文用 `"text"`（不要用 `"message"`）。
+   - 拉取：`POST /chat/poll`，多频道用 `"channelIds"`（不要用已弃用的 `"channels"`）。
+   - 备份：`POST /channel/backup` 必须传 `"payload"`，随后用返回的 `sha256` 调用 `POST /channel/backup/verify`。
+   - 私有指令包下载：`GET /channel/backup?channelId=<CHANNEL_ID>&kind=instructions_bundle`（需带 `x-agy-request-id`，内容在 `.checkpoint.payload`）。
+2. **Git 与分支权限**：
+   - 主分支 `a2` / `main` 要求 Verified Bot Commit/Merge（带 GPG 签名），普通 `git push` 会被拒或无签名。
+   - Partner 各自在独立功能分支开发、跑通 2x 门禁（`tsc`、`vitest`、`cargo test --locked`、`check:gates`、`env:check`），由独立 Reviewer 交叉评审通过后，再由 Chief 执行 Verified Bot Merge。
+3. **沙盒能力边界（能做 vs 不能做）**：
+   - **云端能做**：全量 TypeScript / Vitest / Rust `cargo test --locked` 编译与单测、静态门禁（`check:gates`）、OverlayFS 检查、脚本契约测试、HMOS 离线签名/ArkTS 逻辑校验与包打包。
+   - **云端不能做（需回本地实测）**：macOS 真机 `osascript` Touch ID 弹窗与 `utun` 创建、Windows 实机 `bootstrap.ps1` / UAC Admin 提权 / UIA 操作、HMOS 真机 `hdc` 安装与推送验证。

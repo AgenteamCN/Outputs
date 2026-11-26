@@ -1,37 +1,19 @@
-# GitHub App 细粒度权限隔离与私有仓库主分支保护（Verified Commit 锁）可行性调研报告
+# HiveMQ Cloud vs EMQX Cloud（Chief <-> Human 专用高可靠通道）可行性调研报告
 
-## 1. 核心结论
-1. **GitHub 原生 Branch Protection / Rulesets（在当前免费组织私有仓库下）**：**不可行**（GitHub Free 组织的私有仓库不支持启用 Branch Protection 与 Repository Rulesets，API 实测返回 HTTP 403）。
-2. **GitHub App 原生 Token 权限隔离**：**不支持按分支隔离**，GitHub App Installation Token 最小粒度为「仓库级（Repository-scoped）」。
-3. **零额外付费的推荐落地方案**：**在 `agyWorker` 服务端实现 GitHub Commit Proxy（`POST /agents/github-commit`）**，即可在不升级 GitHub 付费套餐的前提下，实现**按分支隔离（禁止 Partner 直写 `a2`/`main`）+ 强制 Verified Bot Commit**。
+## 1. 关键发现：HiveMQ Cloud Serverless 已停止新建并将于 2026-12-31 退场
+- 根据 HiveMQ 官方文档，**HiveMQ Cloud Serverless（免费版与按量付费版）将于 2026 年 12 月 31 日正式停止服务（EOL）**，且目前已禁止创建新的 Serverless 集群。
+- 替代方案 **HiveMQ Cloud Starter** 为独立集群，**没有永久免费额度**（仅 $100 试用金，约 12 天 24x7 运行，随后 **$0.34/小时 ≈ $245/月** + $0.80/百万条消息），且**无中国大陆节点**。
+- 结论：**不可采用 HiveMQ Cloud Serverless**，也不建议为 2~10 条 `chief <-> human` 连接支付 ~$245/月切换 HiveMQ Starter。
 
----
+## 2. 对比矩阵
+| 维度 | EMQX Cloud Serverless（当前） | HiveMQ Cloud Serverless | HiveMQ Cloud Starter（替代） |
+|---|---|---|---|
+| 状态 | 活跃 | 2026-12-31 EOL（不可新建） | 活跃（独立集群） |
+| 免费额度 | 每月 100 万 session-min + 1 GB 流量 | 已停止新建 | 无永久免费（~$245/月起） |
+| 协议与端口 | MQTT 3.1/5.0, TLS `8883`, WSS `8084` | MQTT 3.1.1/5.0, TLS `8883`, WSS `8884` | MQTT 3.1.1/5.0, TLS `8883`, WSS `8884` |
+| 闲置断连 | 共享负载均衡约 ~285s 切断 | 多租户 Serverless | 独立 Broker 无共享 LB 285s 切断 |
+| 大陆延迟 | 支持中国大陆低延迟节点 | 无大陆节点 | 无大陆节点 |
 
-## 2. 实测 API 证据（只读查询 `Antigravi-ty/agyDevKit` 与 `Antigravi-ty/agyWorker`）
-- **仓库可见性与所属组织**：两个仓库均为 Organization `Antigravi-ty` 下的 `private` 仓库。
-- **Repository Rulesets 检查**（`GET /repos/Antigravi-ty/agyDevKit/rulesets` 与 `GET /repos/.../rules/branches/{a2|main}`）：
-  - 返回 `HTTP 403`：`"Upgrade to GitHub Pro or make this repository public to enable this feature."`
-- **Branch Protection 检查**（`GET /repos/.../branches/{a2|main}/protection`）：
-  - 返回 `HTTP 403`：`"Resource not accessible by integration"`（同时受限于免费组织私有仓限制及当前 App 未授予 `administration: write`）。
-- **Installation Token 权限粒度检查**（`GET /installation/repositories`）：
-  - 当前 App 授权覆盖 35 个仓库，签发出的 `ghs_...` token 携带仓库级 `contents: write` 权限。只要持有该 raw token，客户端理论上可以向该仓库任意分支（包括 `a2`/`main`）发起提交或合并，无法仅靠 GitHub App token 本身禁止推送主分支。
-
----
-
-## 3. 两种可行改造方案对比
-
-### 方案 A：GitHub 原生方案（需付费升级，成本较高）
-1. 将组织 `Antigravi-ty` 升级至 GitHub Team / Enterprise 付费计划（解锁私有库 Rulesets / Branch Protection）。
-2. 拆分为两个独立 GitHub App：`Partner App`（仅用于开发分支）与 `Chief/Merge App`（专门用于合并）。
-3. 在 `a2` / `main` 上配置 Ruleset：开启 `Require signed commits` + `Restrict updates`（仅 Bypass list 中的 `Chief/Merge App` 可更新主分支）。
-
-### 方案 B：agyWorker 服务端代理方案（零额外付费、立即可落地，强烈推荐）
-1. **收敛 Partner 的 raw GitHub Token**：
-   - `POST /agents/github-token` 对 Partner 仅返回只读 token（或不再直接下发具备写权限的 raw `ghs_...` token）。
-2. **新增 `POST /agents/github-commit` 代理接口（Worker 侧代签）**：
-   - Partner 在本地完成修改与 2x 门禁测试后，将待提交的文件变更（或 diff/tree）与目标分支名发给 Worker `POST /agents/github-commit`；
-   - Worker 严格校验调用方身份的 `allowedBranches`（例如仅放行 `a2-*`、`feat/*`、`fix/*`，**硬拒绝直写 `a2` 和 `main`**）；
-   - 校验通过后，由 Worker 使用服务端持有的 App Token 调用 GitHub GraphQL `createCommitOnBranch`，自动生成带 GPG 签名的 **Verified Bot Commit** 并返回 commit SHA。
-3. **主分支合并门禁（Chief 专属）**：
-   - `POST /repos/<owner>/<repo>/merges` 或等效合并接口仅限 `chief`（`isAdmin: true`）调用；
-   - 合并前检查源分支最新 commit 满足 `signature.verified == true` 且已记录独立 Cross-Review PASS。
+## 3. 推荐方案
+1. **方案 A（当前零成本，推荐）**：继续使用 EMQX Cloud Serverless，结合已合入的 **#169（15s keepalive + `lan_server.rs` 规范 Close 帧）** 与 `agyWorker` DO SQLite 环形缓冲游标重放，已可平稳应对 ~285s 共享负载均衡断连。
+2. **方案 B（低成本独立 Broker，~$5–15/月）**：若未来确实需要完全消除 285s 共享负载均衡切断，建议在轻量 VPS / Cloud Run 自建 **EMQX / Mosquitto / HiveMQ Enterprise Lab（25 连接免费许可）**，而非每月 $245 的 HiveMQ Cloud Starter。
